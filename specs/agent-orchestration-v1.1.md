@@ -106,7 +106,7 @@ CREATE TABLE workers (
   id TEXT PRIMARY KEY,
   bundle_id TEXT NOT NULL REFERENCES bundles(id),
   task_index INTEGER NOT NULL,
-  state TEXT NOT NULL,             -- pending|running|complete|failed|killed
+  state TEXT NOT NULL,             -- pending|running|paused|complete|failed|killed|connection_lost
   pid INTEGER,
   started_at INTEGER,
   last_heartbeat INTEGER,
@@ -172,9 +172,37 @@ Large fields are JSON because their internal schema will evolve. SQLite's JSON1 
 
 The DAG executor adds further tables (`dag_nodes`, `dag_edges`, `node_state_history`, `dag_expansions`, `approval_requests`, `artifact_refs`) covering DAG state, transition history, expansion provenance, the unified approval-request lifecycle, and the executor's view of artifact publication. Those are specified in the DAG executor section; the artifact metadata schema backing `artifact_refs` is specified in the Artifact Protocol section.
 
-**Bundle state machine.** The bundle state machine is fully specified in Bundle lifecycle: execution and integration. In summary: twelve states (`proposed`, `in_review`, `approved`, `in_progress`, `paused`, `redirecting`, `verifying`, `complete`, `parked`, `failed`, `rejected`, `aborted`) with 25 legal transitions. Transitions are guarded; illegal transitions are rejected by the orchestrator and return errors to whoever requested them. Every transition writes to `audit_log` and (if human-driven) to `approval_decisions`. The mid-flight steering states (`paused`, `redirecting`) and the parked terminal state were added during the bundle lifecycle design pass; the original sketch had only eight states.
+**Bundle state machine.** The full state machine is specified in Bundle lifecycle: execution and integration. The SQLite schema above enumerates all twelve valid values for `bundles.state`. The state machine enforces 25 legal transitions, enumerated in a transition table (each row: `from_state`, `trigger`, `to_state`, `actor`, `side_effects`). Transitions are guarded; any attempt to execute an illegal transition raises `IllegalTransitionError` with the current state, attempted transition, and reason. The error serializes as a JSON-RPC error with code `-32001`. Every transition writes an `audit_log` row and, when triggered by a human reviewer, an `approval_decisions` row. The twelve states are:
 
-**Crash recovery.** On orchestrator startup, the policy is kill-all rather than try-to-resume in-flight workers. Reconstructing live worker connections and reattaching to running subprocesses is genuinely hard to get right and the failure modes are nasty. Restarts of a stable service should be rare (deploys, kernel upgrades), and the cost of redoing in-flight bundle work is bounded. On startup the orchestrator scans for workers in state `running`, marks them failed with reason `orchestrator_crash`, transitions affected bundles accordingly, replays unread approval decisions from external surfaces (GitHub Issues comments, MCP-side decisions that hadn't been ACKed), and then opens the webhook endpoint and MCP socket. Bundles in `verifying` re-trigger verification, since verification is idempotent by design. The full reconciliation sequence (kill-all, reconcile node states, apply retry policies, replay approval decisions, re-trigger bundle reconciliation, open surfaces) is specified in the DAG executor section.
+| State | Enum value | Terminal | Description |
+|-------|-----------|----------|-------------|
+| `PROPOSED` | `"proposed"` | no | Bundler produced a proposal; awaiting pre-execution review |
+| `IN_REVIEW` | `"in_review"` | no | Pre-execution review tracks running |
+| `APPROVED` | `"approved"` | no | Bundle passed review and approval; awaiting execution |
+| `IN_PROGRESS` | `"in_progress"` | no | DAG executor driving worker tasks |
+| `PAUSED` | `"paused"` | no | Execution halted; workers idle, state preserved |
+| `REDIRECTING` | `"redirecting"` | no | Paused bundle being re-planned; transient |
+| `VERIFYING` | `"verifying"` | no | All workers complete; QA agent running post-execution verification |
+| `COMPLETE` | `"complete"` | yes | Shipped successfully |
+| `PARKED` | `"parked"` | yes | Work completed but not merged; preserved |
+| `FAILED` | `"failed"` | yes | Execution or verification failed; partial state preserved |
+| `REJECTED` | `"rejected"` | yes | Rejected during review; no execution |
+| `ABORTED` | `"aborted"` | yes | Reviewer killed bundle mid-flight; partial state preserved |
+
+Terminal states (`complete`, `parked`, `failed`, `rejected`, `aborted`) permit no further transitions. The five non-terminal, non-transient states (`proposed`, `in_review`, `approved`, `in_progress`, `paused`) plus the transient `redirecting` and the `verifying` state form the active lifecycle. Mid-flight steering states (`paused`, `redirecting`) were added during the bundle lifecycle design pass.
+
+**Crash recovery.** On orchestrator startup, the policy is **kill-all**: no attempt is made to resume in-flight workers. Reconstructing live worker connections and reattaching to running subprocesses is hard to get right and the failure modes are untestable at full coverage. The six-step reconciliation sequence is:
+
+1. **Kill-all workers.** Scan `workers` for rows in state `running` or `paused`; mark each `failed` with `exit_reason = 'orchestrator_crash'`.
+2. **Reconcile node states to worker states.** For each `dag_nodes` row in state `running`, if its worker is now `failed`, transition the node to `failed` with `failure_reason = 'worker_killed_on_crash'`.
+3. **Apply retry policies.** For each node transitioned to `failed` in step 2, evaluate its `retry_policy`. If retries remain, transition to `pending` and let the scheduler re-consider.
+4. **Replay unread approval decisions.** For each `approval_requests` row in state `pending`, check secondary surfaces (GitHub Issues comments, MCP-side decision log) for decisions posted while the orchestrator was down.
+5. **Re-trigger bundle reconciliation.** Bundles in `verifying` re-trigger verification (idempotent by design). Bundles in `in_progress` re-tick: the scheduler computes the ready set from current node states.
+6. **Open surfaces.** Webhook endpoint and MCP socket accept traffic.
+
+The full reconciliation protocol with edge cases (worker completing during crash, aggregator cancellation in-flight) is specified in the DAG executor section under Checkpointing and crash recovery.
+
+Phase 1 note: in Phase 1 (kernel-mode without bundler, MCP, or GitHub Issues), Step 1's paused-worker branch is a no-op (no Phase 1 code path produces `paused` workers), and Step 4 (replay unread approval decisions) is a no-op (the `approval_requests` table is unused). The implementing agent writes the reconciliation logic for all steps; the Phase 1 execution path never hits the paused or approval-replay branches.
 
 ## Worker runner abstraction
 
@@ -198,9 +226,11 @@ A few k8s-specific concerns are out of scope for the v1.1 implementation but are
 
 **Concurrency.** Four parallel workers maximum, enforced by an orchestrator semaphore. Real parallelism: Ollama Cloud handles inference scale-out, so there is no local GPU contention. Worker resource overhead (4 GB RAM × 4 workers = 16 GB) leaves comfortable headroom on the 30 GB box for orchestrator, host OS, build caches, and slack.
 
-**Per-worker resource limits**, configurable per worker class via the capability manifest, with these defaults: 4 GB RAM, 2 CPU, 10 GB disk. There is no global wall-clock kill in v1.1; that policy was originally specified but replaced with heartbeat-based liveness plus learned p95 timeouts per worker class, because Ollama Cloud iteration latency is meaningfully slower than frontier-API iteration latency and a single global timeout proved hard to set right. Provisional first-run timeout defaults are 2 hours for small tasks, 4 hours for medium, 8 hours for large. These are explicitly provisional and need to survive first contact with real workloads before being ratified.
+**Per-worker resource limits**, configurable per worker class via the capability manifest, with these defaults [PROVISIONAL: sized to the 30 GB dev box, need validation against real worker memory profiles]: 4 GB RAM, 2 CPU, 10 GB disk. There is no global wall-clock kill in v1.1; that policy was originally specified but replaced with heartbeat-based liveness plus learned p95 timeouts per worker class, because Ollama Cloud iteration latency is meaningfully slower than frontier-API iteration latency and a single global timeout proved hard to set right. [PROVISIONAL] First-run timeout defaults are 2 hours for small tasks, 4 hours for medium, 8 hours for large. These must survive first contact with real workloads before being ratified.
 
-**Heartbeats** are emitted on every state transition, with a maximum interval of 60 minutes. Each heartbeat includes a `phase` field with values like `thinking`, `tool-call`, `writing-code`, `running-tests`, or `idle`, so that "slow but alive" is distinguishable from "wedged." A worker that crosses 2× its expected timeout surfaces as a capability-board entry suggesting model upgrade or task decomposition, rather than being auto-killed.
+**Heartbeats** are emitted on every state transition, with a maximum interval of 60 minutes [PROVISIONAL: needs empirical validation against observed Ollama Cloud iteration latency; the 60-minute value may be too long for fast tasks and too short for models with multi-minute think phases]. Each heartbeat includes a `phase` field with values `starting`, `thinking`, `tool-call`, `writing-code`, `running-tests`, or `idle`. The `starting` value is the canonical first heartbeat emitted after worker spawn, before the worker begins meaningful work; it signals that the worker process is alive and the RPC connection is established. All other values describe the worker's current activity, so that "slow but alive" is distinguishable from "wedged." A worker that crosses 2x its expected timeout surfaces as a capability-board entry suggesting model upgrade or task decomposition, rather than being auto-killed.
+
+**Heartbeat-driven worker state updates.** On receiving a `worker.heartbeat` notification, the orchestrator always updates `workers.last_heartbeat` to the current timestamp. On the first heartbeat received from a worker in `pending` state, the orchestrator additionally transitions `workers.state` from `pending → running`. This is the mechanism by which a newly-spawned worker signals that it is alive and has established its RPC connection. Subsequent heartbeats from a worker already in `running`, `paused`, or `connection_lost` state update only `last_heartbeat`. A heartbeat from a worker in a terminal state (`complete`, `failed`, `killed`) is logged as a warning and ignored for state-update purposes.
 
 **Filesystem layout.** The bundle's feature branch is checked out into the runner workspace. Each worker gets its own git worktree on a sub-branch of the feature branch, which is what the per-worker-tree-per-worker-branch decision means in concrete terms. Workers read the entire repo but write only within their assigned subdirectory; this is enforced by orchestrator review of commits, not by filesystem permissions, because tying it to file permissions is too brittle. Persistent caches mount from the host: language package caches (`~/.npm`, `~/.cache/pip`, `~/go/pkg`, `~/.cargo`), Docker layer cache, build artifacts where safe.
 
@@ -240,8 +270,8 @@ The architecture supports per-worker-class agent overrides; the schema slot exis
     "base_url": "https://ollama.com/api",
     "rate_limits": "learn-empirically",
     "unreachability_policy": {
-      "health_check_interval_seconds": 30,
-      "grace_window_minutes": 5,
+      "health_check_interval_seconds": 30,        // [PROVISIONAL]
+      "grace_window_minutes": 5,                   // [PROVISIONAL]
       "on_grace_expiry": "fail-with-retry"
     }
   }
@@ -252,11 +282,11 @@ The reasoning behind the choices: deepseek-v4-pro for bundler, planner, and crit
 
 **Rate limits** are learned empirically. Workers emit `rate-limit-observed` signals (with `retry-after` header where present) into `worker-report.json`. The orchestrator aggregates these into `memory/capabilities/rate-limit-observations.jsonl` and adapts spawn rate when patterns emerge. No hard-coded ceilings in v1.
 
-**Ollama Cloud unreachability.** Every 30 seconds, the orchestrator runs a cheap health check against a known endpoint. On failure: pause new worker spawns, mark in-flight workers as `paused-external-dependency`, allow a 5-minute grace window for transient blips. On grace expiry: fail in-flight workers gracefully with auto-retry on the same task once reachability returns. System status surfaces in the orchestrator dashboard and CLI. Clean failure semantics, no zombie workers consuming runner slots while waiting.
+**Ollama Cloud unreachability.** Every 30 seconds [PROVISIONAL], the orchestrator runs a cheap health check against a known endpoint. On failure: pause new worker spawns, mark in-flight workers as `paused-external-dependency`, allow a 5-minute grace window [PROVISIONAL] for transient blips. On grace expiry: fail in-flight workers gracefully with auto-retry on the same task once reachability returns. System status surfaces in the orchestrator dashboard and CLI. Clean failure semantics, no zombie workers consuming runner slots while waiting.
 
 **Network egress** from the worker container is mediated by the host-side egress proxy. Hostname-based grants (rather than CIDRs) are first-class in the manifest, and the proxy does the L7 lookup. The host's own firewall is operator-maintained and not duplicated inside containers.
 
-**Secrets.** GitHub Actions secrets for v1, scoped per repo, mounted into worker containers as environment variables only when the worker class declares the capability. An audit log entry records every secret name (not value) accessed per worker per task, in `memory/audit/credential-use.jsonl`. The longer-term intent is to migrate from env-var delivery to RPC-fetched short-lived credentials (`secrets.fetch(name)` over the worker RPC), so secrets live only in worker memory for the duration of the operation that needs them, but that protocol is deferred.
+**Secrets.** GitHub Actions secrets for v1, scoped per repo, mounted into worker containers as environment variables only when the worker class declares the capability. An audit log entry records every secret name (not value) accessed per worker per task, in `memory/audit/credential-use.jsonl`. The longer-term intent is to migrate from env-var delivery to RPC-fetched short-lived credentials (`secrets.fetch(name)` over the worker RPC). The `secrets.fetch` RPC method and its audit trail are fully specified in the Artifact Protocol section. The `env` and `file` delivery mechanisms remain as fallbacks for legacy tools.
 
 ## Worker RPC protocol
 
@@ -268,27 +298,332 @@ Workers communicate with the orchestrator over a bidirectional RPC channel. Bidi
 
 **Method namespacing.** Methods are organized by family: `worker.*`, `cap.*`, `artifact.*`, `secrets.*`, etc. This lets new method families be added without name collisions.
 
+**Call vs. notification classification.** JSON-RPC 2.0 distinguishes calls (which carry an `id` and require a response) from notifications (no `id`, no response). Worker-to-orchestrator notifications: `worker.heartbeat`, `worker.log`, `worker.progress_report`. All other worker-to-orchestrator methods are calls. All orchestrator-to-worker methods are calls (they require acknowledgment).
+
 **Worker-to-orchestrator methods:**
 
-- `worker.heartbeat(progress_message)`: notification, no response.
-- `worker.log(level, message, structured_data?)`: notification.
-- `cap.request(scope, rationale)` returns `{granted, capability_id?, denied_reason?}`: synchronous; blocks the worker until human or auto decision.
-- `cap.check(op_descriptor)` returns `{allowed, capability_id?}`: fast path for already-granted capabilities.
-- `worker.progress_report(stage, percent, message)`: notification, structured progress.
-- `artifact.request(source_worker_id, path)` returns `{artifact_data}`: superseded by `artifact.publish` and `artifact.fetch`; see Artifact Protocol.
-- `worker.request_human_input(question, context)` returns `{response}`: escape hatch, surfaces via the approval channel.
-- `worker.final_report(outcome, files_changed, tests_run, ...)`: terminal call before clean exit.
+**`worker.heartbeat`** — Notification only. No response expected.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.heartbeat",
+  "params": {
+    "phase": "starting" | "thinking" | "tool-call" | "writing-code" | "running-tests" | "idle",
+    "progress": "<human-readable summary>",
+    "current_step": "<string or null>",
+    "estimated_completion_seconds": <int or null>
+  }
+}
+```
+
+**`worker.log`** — Notification only. No response expected.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.log",
+  "params": {
+    "level": "debug" | "info" | "warn" | "error",
+    "message": "<string>",
+    "structured_data": { ... } | null
+  }
+}
+```
+
+**`cap.request`** — Synchronous call. Blocks the worker until human or auto decision.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "cap.request",
+  "params": {
+    "scope_json": { ... },            // capability manifest fragment
+    "rationale": "<why this capability is needed>",
+    "urgency": "blocking" | "degrading" | "friction"
+  },
+  "id": <int>
+}
+
+Response (granted):
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "granted": true,
+    "capability_id": "<ulid>",
+    "expires_at": <unix_timestamp or null>
+  },
+  "id": <int>
+}
+
+Response (denied):
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "granted": false,
+    "denied_reason": "<human-readable explanation>"
+  },
+  "id": <int>
+}
+```
+
+**`cap.check`** — Fast path for already-granted capabilities. Returns synchronously.
+
+`op_descriptor` format: `<category>.<operation>[:<resource>]` where category is one of `filesystem`, `network`, `process`, `secrets`, `rpc`, `resources`. The resource segment is optional and category-dependent.
+
+Examples:
+- `filesystem.write:/work/src/main.py` — check write permission for a specific path
+- `filesystem.read:/work/src/config` — check read permission for a path
+- `network.egress:api.github.com:443` — check egress to a host:port
+- `process.exec:/usr/bin/git` — check binary execution permission
+- `rpc.method:artifact.publish` — check RPC method invocation permission
+- `rpc.artifact_access.read:bundle:test-results:*` — check artifact read pattern
+
+The dispatcher parses the category prefix, extracts the operation and resource, and dispatches to the appropriate category-specific capability check against the worker's manifest.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "cap.check",
+  "params": {
+    "op_descriptor": "<category>.<operation>[:<resource>]"
+  },
+  "id": <int>
+}
+
+Response:
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "allowed": true | false,
+    "capability_id": "<ulid or null>"
+  },
+  "id": <int>
+}
+```
+
+**`worker.progress_report`** — Notification only. Structured progress update.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.progress_report",
+  "params": {
+    "stage": "<string>",
+    "percent": 0-100,
+    "message": "<human-readable string>"
+  }
+}
+```
+
+**`artifact.request`** — Superseded by `artifact.publish` and `artifact.fetch`. Retained as a protocol-reserved stub that returns `-32000 method_not_implemented`. See Artifact Protocol.
+
+**`worker.request_human_input`** — Escape hatch; surfaces via the approval channel.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.request_human_input",
+  "params": {
+    "question": "<string>",
+    "context": "<string>",
+    "options": ["<string>", ...] | null
+  },
+  "id": <int>
+}
+
+Response:
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "response": "<human-provided string>",
+    "responded_at": <unix_timestamp>,
+    "responded_by": "<identity string>"
+  },
+  "id": <int>
+}
+```
+
+In v1.1 this method returns `-32000 method_not_implemented`. It is protocol-reserved for a future version where the human-input path is built.
+
+**`worker.final_report`** — Terminal call before worker exit. Initiates worker teardown.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.final_report",
+  "params": {
+    "outcome": "success" | "failure" | "paused" | "timeout",
+    "files_changed": ["<path>", ...],
+    "tests_run": <int>,
+    "tests_passed": <int>,
+    "tests_failed": <int>,
+    "artifacts_produced": [<descriptor>, ...],
+    "errors": ["<string>", ...],
+    "summary": "<human-readable string>"
+  },
+  "id": <int>
+}
+
+Response:
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "acknowledged": true
+  },
+  "id": <int>
+}
+```
 
 **Orchestrator-to-worker methods:**
 
-- `worker.pause()`: worker checkpoints and stops; ack required.
-- `worker.resume()`: worker continues.
-- `worker.cancel(reason)`: worker cleans up and exits, with grace period before SIGTERM.
-- `worker.query_status()` returns the worker's self-reported state.
-- `worker.inject_context(data)`: push new info to a worker mid-task (for example, "the spec changed").
-- `worker.prepare_handoff(target_worker_id, artifact_descriptor)`: superseded by `artifact.publish`; see Artifact Protocol.
+**`worker.pause`** — Request worker to checkpoint and stop. Worker must acknowledge.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.pause",
+  "params": {
+    "reason": "<string>"
+  },
+  "id": <int>
+}
+
+Response:
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "acknowledged": true,
+    "current_phase": "<phase string>"
+  },
+  "id": <int>
+}
+```
+
+**`worker.resume`** — Request worker to continue from paused state.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.resume",
+  "params": {
+    "note": "<string or null>"
+  },
+  "id": <int>
+}
+
+Response:
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "acknowledged": true,
+    "note": "<string or null>"
+  },
+  "id": <int>
+}
+```
+
+**`worker.cancel`** — Request worker to clean up and exit.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.cancel",
+  "params": {
+    "reason": "<string>",
+    "grace_seconds": 30
+  },
+  "id": <int>
+}
+
+Response:
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "acknowledged": true
+  },
+  "id": <int>
+}
+```
+
+After the grace period the worker receives SIGTERM, then SIGKILL after 10 additional seconds.
+
+**`worker.query_status`** — Request worker's self-reported state.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.query_status",
+  "id": <int>
+}
+
+Response:
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "phase": "<string>",
+    "current_step": "<string or null>",
+    "progress_percent": 0-100,
+    "uptime_seconds": <int>
+  },
+  "id": <int>
+}
+```
+
+**`worker.inject_context`** — Push new information to a worker mid-task.
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "worker.inject_context",
+  "params": {
+    "data": { ... },
+    "reason": "<string>"
+  },
+  "id": <int>
+}
+
+Response:
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "acknowledged": true
+  },
+  "id": <int>
+}
+```
+
+**`worker.prepare_handoff`** — Superseded by `artifact.publish`. Retained as a protocol-reserved stub that returns `-32000 method_not_implemented`. See Artifact Protocol.
 
 **Connection-loss semantics.** If the worker's connection drops, the orchestrator marks the worker `connection_lost` and gives it a grace period to reconnect (workers can reuse their token within the grace window). After the grace period, the worker process is killed. This handles transient hiccups without making lost-connection equal lost-work for short interruptions. On Kubernetes, the orchestrator additionally watches pod events from the API server so it learns about evictions promptly rather than waiting for connection timeout.
+
+**RPC-level error codes.** These apply across all methods in addition to method-specific errors:
+
+| Code | Name | Meaning |
+|------|------|---------|
+| `-32000` | `method_not_implemented` | Method is protocol-reserved but not yet implemented |
+| `-32001` | `capability_denied` | Worker's manifest does not grant this method |
+| `-32011` | `worker_not_found` | Worker ID from connection binding does not match a known worker |
+| `-32012` | `token_expired` | One-time token already used or grace period expired |
+| `-32013` | `bundle_not_active` | Worker's bundle is in a terminal state; method rejected |
+| `-32600` | `invalid_request` | JSON-RPC message is not a valid Request object |
+| `-32601` | `method_not_found` | Method name does not exist |
+| `-32602` | `invalid_params` | Required params missing or malformed |
+| `-32603` | `internal_error` | Unexpected orchestrator-side failure |
+
+**RPC dispatcher capability check.** Every method call (both directions) is validated against the worker's manifest. For worker-to-orchestrator calls: the worker's `rpc.methods` grant must include the called method name or a wildcard pattern covering it (`"worker.*"` matches `worker.heartbeat`). For orchestrator-to-worker calls: the worker's manifest is checked at connection setup to determine which methods the orchestrator may call on this worker; a worker that does not grant `worker.pause` cannot be paused. Capability check failures return `-32001 capability_denied`.
 
 Methods like `worker.request_human_input` are protocol-reserved in v1 even though their implementation is stubbed (they return "not implemented"). This avoids a protocol version bump when those features are actually built. `artifact.request` and `worker.prepare_handoff` were previously protocol-reserved stubs but are now superseded by the fully specified `artifact.publish`, `artifact.fetch`, and `artifact.list` methods; see Artifact Protocol.
 
@@ -387,7 +722,7 @@ secrets:
     rationale: "<why>"
 ```
 
-Secrets are named, never inlined; the manifest references a secret by name, and the orchestrator resolves the value at worker spawn time from its own secret store. The manifest never contains plaintext. Delivery mechanism is declared: `env` for legacy tools that read environment variables, `file` for tools that read credentials from disk, `rpc` for tools that ask the orchestrator over RPC. The `rpc` option is best for dynamic short-lived credentials (the worker calls `secrets.fetch(name)`, the orchestrator audits the fetch, and the secret only lives in worker memory for the duration of the operation), but the protocol semantics for `secrets.fetch` are deferred. `purpose` is enumerated so a reviewer can see "this task gets a `github_auth` secret" and immediately understand the implication; `custom` is an escape hatch and should be rare.
+Secrets are named, never inlined; the manifest references a secret by name, and the orchestrator resolves the value at worker spawn time from its own secret store. The manifest never contains plaintext. Delivery mechanism is declared: `env` for legacy tools that read environment variables, `file` for tools that read credentials from disk, `rpc` for tools that ask the orchestrator over RPC. The `rpc` option is best for dynamic short-lived credentials (the worker calls `secrets.fetch(name)`, the orchestrator audits the fetch, and the secret only lives in worker memory for the duration of the operation). The `secrets.fetch` RPC method, its capability binding, and its audit trail are fully specified in the Artifact Protocol section. `purpose` is enumerated so a reviewer can see "this task gets a `github_auth` secret" and immediately understand the implication; `custom` is an escape hatch and should be rare.
 
 **RPC grants.**
 
@@ -423,13 +758,69 @@ resources:
 
 Resource limits are part of the manifest because they affect blast radius (a worker that runs for 24 hours has bigger blast radius than one that runs for 5 minutes) and should be reviewed alongside other capabilities. LLM token budget is a first-class resource and is enforced by the orchestrator at `llm.*` RPC time. Wall-time is enforced by the runner (a wrapping timeout locally; `activeDeadlineSeconds` on a k8s Job).
 
-**Composition rules.** The bundle has its own manifest; tasks within it have task manifests. Three rules are enforced:
+**Composition rules.** The bundle has its own manifest; tasks within it have task manifests. Three rules are enforced.
 
-1. **Task grants must be a subset of bundle grants.** A task cannot request more than its bundle was approved for. Subset checking is per-category: filesystem subset means task paths are within bundle paths (with recursive flags handled correctly); network subset means task destinations are within bundle destinations; etc.
-2. **The bundle is the human-approval unit.** Reviewers approve bundle manifests. Task manifests within an approved bundle do not need separate approval, since they're already bounded by the bundle grant.
-3. **Expansion requests carry their own manifest.** When a worker requests sub-task spawning, the request includes the proposed task manifest. If it's a subset of the bundle manifest, auto-approve (the bundle already covered this). If not subset, escalate to human.
+**Rule 1: Task grants must be a subset of bundle grants.** A task cannot request more than its bundle was approved for. Subset checking is per-category and algorithmic.
 
-Rule 3 is the load-bearing one for dynamic expansion: workers can spawn sub-tasks without human-in-loop as long as they stay within the bundle's pre-approved envelope. Most expansions will, because well-decomposed bundles describe the full envelope up front.
+**Rule 2: The bundle is the human-approval unit.** Reviewers approve bundle manifests. Task manifests within an approved bundle do not need separate approval.
+
+**Rule 3: Expansion requests carry their own manifest.** When a worker requests sub-task spawning, the request includes the proposed task manifest. If it's a subset of the bundle manifest, auto-approve. If not subset, escalate to human.
+
+**Subset-checking algorithm, per category:**
+
+```python
+def is_subset(task_manifest: CapabilityManifest, bundle_manifest: CapabilityManifest) -> tuple[bool, str]:
+    """Returns (is_subset, failure_reason)."""
+    if not filesystem_is_subset(task_manifest.filesystem, bundle_manifest.filesystem):
+        return (False, "filesystem grant exceeds bundle scope")
+    if not network_is_subset(task_manifest.network, bundle_manifest.network):
+        return (False, "network grant exceeds bundle scope")
+    if not process_is_subset(task_manifest.process, bundle_manifest.process):
+        return (False, "process grant exceeds bundle scope")
+    if not secrets_is_subset(task_manifest.secrets, bundle_manifest.secrets):
+        return (False, "secrets grant exceeds bundle scope")
+    if not rpc_is_subset(task_manifest.rpc, bundle_manifest.rpc):
+        return (False, "rpc grant exceeds bundle scope")
+    if not resources_is_subset(task_manifest.resources, bundle_manifest.resources):
+        return (False, "resources grant exceeds bundle scope")
+    return (True, "")
+```
+
+**Filesystem subset rules:**
+- For each entry in task `reads`: there must exist a bundle `reads` entry where `task.path` starts with `bundle.path` (or is equal), and if `task.recursive = true`, `bundle.recursive` must also be `true`.
+- For each entry in task `writes`: same path-containment check as reads, using bundle `writes` entries.
+- Task `working_tree.write_scope` must be `path_restricted` if bundle's is `path_restricted`; task `restricted_paths` must be a subset of bundle `restricted_paths`.
+
+**Network subset rules:**
+- For each entry in task `egress`: there must exist a bundle `egress` entry where `task.destination` is contained in `bundle.destination` (hostname exact match or CIDR containment), `task.ports` is a subset of `bundle.ports`, and `task.protocol` equals `bundle.protocol` or `bundle.protocol` is less restrictive (e.g., bundle allows `tcp`, task asks for `http`; `tcp` subsumes `http` due to protocol layering: `tcp` > `http` > `https`).
+- Task `ingress.enabled` cannot be `true` if bundle `ingress.enabled` is `false`.
+- Task `dns.enabled` cannot be `true` if bundle `dns.enabled` is `false`.
+
+Protocol subsumption order: `tcp` subsumes `udp`, `http`, and `https`; `http` subsumes `https`. The rationale is transport-layer grants are broader than application-layer grants.
+
+**Process subset rules:**
+- For each entry in task `exec`: there must exist a bundle `exec` entry with the same `binary` absolute path, and task `args_pattern` (if present) must match only a subset of what bundle `args_pattern` matches. Pattern subset-ness is determined by regex intersection: if both patterns are present, the task pattern must be syntactically more restrictive (the regex compiler can statically compare character classes and quantifiers; if static comparison is inconclusive, the check fails-safe by rejecting).
+- Task `spawn_subtasks.enabled` cannot be `true` if bundle `spawn_subtasks.enabled` is `false`.
+- Task `max_depth <= bundle.max_depth` and `max_count <= bundle.max_count`.
+
+**Secrets subset rules:**
+- For each entry in task `secrets`: there must exist a bundle `secrets` entry with the same `name`. Task `purpose` must equal bundle `purpose` or bundle `purpose` is `custom` (which subsumes all purposes).
+- Task `delivery` must be compatible with bundle `delivery`: `rpc` is the most restrictive, `env` and `file` are equivalent. A bundle granting `delivery: env` also allows task `delivery: rpc`.
+
+**RPC subset rules:**
+- For each method pattern in task `rpc.methods`: there must exist a bundle method pattern that covers it. Coverage rule: `"artifact.publish"` is covered by `"artifact.*"` or `"artifact.publish"`; `"artifact.*"` is covered by itself (not a broader wildcard, since `"*"` is disallowed at manifest validation).
+- For each pattern in task `rpc.artifact_access.reads`: there must exist a bundle reads pattern that covers it. Coverage rule: all four descriptor fields are matched via the same glob algorithm specified in Artifact Protocol, Capability pattern matching; for the pattern to cover another, each field's glob must match a superset of strings. Example: `name: "test-*"` covers `name: "test-results-*"`; `name: "**"` covers everything. Same for writes.
+
+**Resources subset rules:**
+- `task.cpu_limit <= bundle.cpu_limit`
+- `task.memory_limit <= bundle.memory_limit`
+- `task.disk_limit <= bundle.disk_limit`
+- `task.wall_time_limit <= bundle.wall_time_limit`
+- `task.llm_token_budget.input_tokens <= bundle.llm_token_budget.input_tokens`
+- `task.llm_token_budget.output_tokens <= bundle.llm_token_budget.output_tokens`
+- For each `(model, budget)` in task `by_model`: there must exist a bundle `by_model` entry with the same model and `task_budget <= bundle_budget` for both input and output tokens.
+
+Implementation note: the subset checker is a pure function of two typed manifest objects. It performs no I/O, issues no RPCs, and has no side effects. It is called at task dispatch time, at expansion validation time, and during DAG schema validation. A checked result may be cached per `(task_manifest_hash, bundle_manifest_hash)` pair.
 
 The schema is purely additive: there is no way to say "allow everything except X." This keeps subset-checking trivial and the threat model clean. Common patterns like "read the whole working tree except `.env`" must be expressed by listing allowed paths rather than excluded paths.
 
@@ -528,7 +919,7 @@ A clarification folded in from the DAG executor design: gate nodes do carry a ta
     reducer: <reference to a registered reducer>
 ```
 
-`join: all` is the default. `any` and `first_success` are for the "race three approaches, take whichever finishes first" pattern. `quorum` is for "spawn five workers, majority opinion wins." Making aggregators explicit is a divergence from convention but is worth it because the semantics are visible in the schema rather than buried in executor behavior, reviewers can see "this bundle uses majority voting" without reading code, and the executor implementation is simpler (incoming edges to non-aggregator nodes always have `all` semantics; aggregators are the only place where it varies). Reducer registry semantics for `output_strategy: reduce` are deferred.
+`join: all` is the default. `any` and `first_success` are for the "race three approaches, take whichever finishes first" pattern. `quorum` is for "spawn five workers, majority opinion wins." Making aggregators explicit is a divergence from convention but is worth it because the semantics are visible in the schema rather than buried in executor behavior, reviewers can see "this bundle uses majority voting" without reading code, and the executor implementation is simpler (incoming edges to non-aggregator nodes always have `all` semantics; aggregators are the only place where it varies). The reducer registry (named reducers for `output_strategy: reduce`, with built-in implementations for `majority_vote`, `concatenate`, `select_best_by`, and `collect_all`) is specified in the DAG executor section under Reducer registry. Custom reducers are deferred (see Deferred items).
 
 **Edges and edge conditions.**
 
@@ -541,7 +932,7 @@ edges:
       property: <expression>
 ```
 
-`always` means the edge fires regardless of source outcome (cleanup nodes). `on_success` is the default. `on_failure` is for error-handling branches. `on_property` evaluates an expression against the source node's outputs to decide whether the edge fires. The expression sublanguage is intentionally restricted: field access on source node outputs, comparison operators, boolean combinators. No function calls, no loops. Anything more complex should be a gate node, not an edge condition. Formal grammar for the sublanguage is deferred (the schema fields that reference it are marked TBD pending that work).
+`always` means the edge fires regardless of source outcome (cleanup nodes). `on_success` is the default. `on_failure` is for error-handling branches. `on_property` evaluates an expression against the source node's outputs to decide whether the edge fires. The expression sublanguage is intentionally restricted: field access on source node outputs, comparison operators, boolean combinators. No function calls, no loops. Anything more complex should be a gate node, not an edge condition. The formal grammar (EBNF), evaluation semantics, and sandboxing rules are fully specified in the DAG executor section under The `on_property` expression sublanguage.
 
 The schema deliberately has no loops. "Retry until X" is expressed via `retry_policy`, not loops; "iterate over a list" is expressed via dynamic expansion (worker spawns one sub-task per item), not loops. This is a real expressiveness limitation; workflow engines that support loops (Temporal, Step Functions) get something this system doesn't. The reasoning is that loops make static analysis dramatically harder and the human reviewer should see exactly the structure that will execute. Acceptable cost; flagged as a deliberate constraint.
 
@@ -642,7 +1033,7 @@ The scheduler selects from the ready set on every tick, subject to two concurren
 
 The **global worker semaphore** caps total concurrent workers across all in-flight bundles. In v1.1 this is 4 (sized to the 30 GB box). It is enforced by the orchestrator, not the executor; the executor simply asks the orchestrator to dispatch a worker and may have the request queued if the semaphore is full. Queued-but-not-yet-dispatched worker nodes remain in `ready` state.
 
-The **per-bundle concurrency budget** caps concurrent workers within a single bundle. In v1.1 this is not separately configured (the global budget is the only cap), but the executor tracks it as a distinct concept to make per-bundle fairness straightforward to add later. A reasonable default is `max(2, global_budget // active_bundles)`, reconsidered in v1.2.
+The **per-bundle concurrency budget** caps concurrent workers within a single bundle. In v1.1 this is not separately configured (the global budget is the only cap), but the executor tracks it as a distinct concept to make per-bundle fairness straightforward to add later. [PROVISIONAL] The default formula is `max(2, global_budget // active_bundles)`, reconsidered in v1.2. An implementing agent should hardcode this formula and not treat it as a ratified constraint.
 
 Gate and aggregator nodes do not consume the worker budget. They run in-process in the orchestrator and their cost is bounded by reducer and predicate execution, which v1.1 keeps cheap. If in-process aggregators ever become expensive (a worker-spawning reducer was considered and rejected, but a future variant might re-raise the question), they would consume budget the same way worker nodes do, because they would effectively become worker nodes.
 
@@ -656,7 +1047,7 @@ Three predicate kinds, each with concrete execution semantics.
 
 **`artifact_property`** evaluates a boolean expression over an artifact's properties. The executor fetches the artifact via the artifact layer (capability-checked through the gate node's task manifest), parses the expression against the artifact's declared schema, and returns true or false. The expression sublanguage is the same one used for `on_property` edges; see below.
 
-**`rpc_query`** issues an RPC to a service whose endpoint and method are declared in the gate spec. The RPC requires its own capability grant in the gate's task manifest. The RPC returns a boolean. Timeout defaults to 30 seconds and is configurable per gate. Transient RPC failures are currently not distinguished from predicate-false responses (both produce gate failure, subject to retry policy); a future refinement to classify error types is flagged.
+**`rpc_query`** issues an RPC to a service whose endpoint and method are declared in the gate spec. The RPC requires its own capability grant in the gate's task manifest. The RPC returns a boolean. Timeout defaults to 30 seconds [PROVISIONAL: chosen as a reasonable ceiling for internal service calls; should be tuned against observed p95 latency of target services] and is configurable per gate. Transient RPC failures are currently not distinguished from predicate-false responses (both produce gate failure, subject to retry policy); a future refinement to classify error types is flagged.
 
 **`human_approval`** is the architectural interrupt point. On dispatch, the executor creates an approval request in the `approval_requests` table and surfaces it through all three review surfaces (MCP tool output, GitHub Issues comment, CLI listing). The gate transitions to `running` and stays there until a decision event arrives. An `approve` decision completes the gate. A `reject` decision fails it. A `modify` decision on a gate is not supported; `modify` applies to bundle proposals. Mid-flight modification is the job of `pause → redirect → resume`, not of gate decision semantics.
 
@@ -678,7 +1069,7 @@ Output strategy is orthogonal to join. **`collect`** returns the list of all fir
 
 Not all combinations are legal: `(all, first)` would be ambiguous about which output to take and is rejected by schema validation. `(any, collect)` is legal and returns a list that may grow after the aggregator fires; the executor snapshots at fire time and ignores later arrivals.
 
-**Aggregator cancellation protocol.** When an aggregator transitions from `pending` to `ready` via `first_success` or via a quorum-with-cancel-remaining satisfied condition, the executor identifies still-running sibling predecessors and cancels them. The protocol enumerates the aggregator's incoming edges whose sources are in state `ready` or `running`, then issues cancellation events. For worker nodes this means `worker.cancel` RPC with a 30-second grace period, then SIGTERM, then SIGKILL after another 10 seconds. For gate nodes with `rpc_query`, the RPC is abandoned and the node transitioned directly to `cancelled`. For gate nodes with `human_approval` still pending, the approval request is withdrawn (marked `expired`) and the node transitioned to `cancelled`.
+**Aggregator cancellation protocol.** When an aggregator transitions from `pending` to `ready` via `first_success` or via a quorum-with-cancel-remaining satisfied condition, the executor identifies still-running sibling predecessors and cancels them. The protocol enumerates the aggregator's incoming edges whose sources are in state `ready` or `running`, then issues cancellation events. For worker nodes this means `worker.cancel` RPC with a 30-second grace period [PROVISIONAL], then SIGTERM, then SIGKILL after another 10 seconds [PROVISIONAL]. Both durations need validation against observed worker step-completion times. For gate nodes with `rpc_query`, the RPC is abandoned and the node transitioned directly to `cancelled`. For gate nodes with `human_approval` still pending, the approval request is withdrawn (marked `expired`) and the node transitioned to `cancelled`.
 
 The grace period exists so that a worker that has nearly finished can commit its work before being killed; the work may still be useful even if the aggregator no longer needs it (for memory, for calibration data, for audit). Workers that exit cleanly during the grace period transition to `completed`, not `cancelled`, and their outputs are captured in the audit trail. The aggregator has already fired and does not re-evaluate based on the late completion.
 
@@ -1169,13 +1560,13 @@ Sharding by the first two hex characters of the BLAKE3 hash creates 256 top-leve
 
 File names are the full 64-character lowercase hex hash. No file extension. The `artifact_metadata.content_type` column is the authoritative source for how to interpret the bytes.
 
-**Inline threshold: 4096 bytes.** The value was chosen for three reasons. First, 4 KB matches a typical OS page size, aligning with I/O patterns. Second, the most common small artifacts (JSON test results, status blobs, YAML config fragments) are typically in the hundreds to low thousands of bytes, well within 4 KB. Third, inline artifacts benefit from SQLite's atomicity: a crash during publish either commits the full metadata row with the BLOB or commits nothing. There is no orphan window for inline artifacts, unlike on-disk artifacts where the file write and the metadata commit are not atomic.
+**Inline threshold: 4096 bytes** [PROVISIONAL: should be revisited after observing actual artifact size distributions in the first few dozen bundles; configurable in `settings.json` under `artifacts.inline_threshold_bytes`]. The value was chosen for three reasons. First, 4 KB matches a typical OS page size, aligning with I/O patterns. Second, the most common small artifacts (JSON test results, status blobs, YAML config fragments) are typically in the hundreds to low thousands of bytes, well within 4 KB. Third, inline artifacts benefit from SQLite's atomicity: a crash during publish either commits the full metadata row with the BLOB or commits nothing. There is no orphan window for inline artifacts, unlike on-disk artifacts where the file write and the metadata commit are not atomic.
 
 **Per-artifact size limit: 100 MB.** This is larger than any reasonable single artifact in v1.1 (worker reports, test outputs, code patches, configuration bundles, small binary assets) and small enough to keep garbage collection practical. It is also small enough that base64 encoding in JSON-RPC is tolerable (roughly 150 MB on the wire for 100 MB of data; see the streaming decision and deferred items). If a bundle needs to pass data larger than 100 MB between workers, it should use the git worktree, which workers share via the orchestrator-mediated branch merge specified in Bundle lifecycle: execution and integration, not via the artifact layer. The artifact layer is for structured data, not bulk file transfer.
 
 **Per-bundle storage cap: 1 GB.** Summed across all artifacts in that bundle's namespace. This is a soft cap: when a bundle exceeds its cap, the artifact layer runs a sweep of that namespace to collect eligible artifacts before rejecting the publish. If GC cannot free enough space (all artifacts are still referenced or within their retention window), the publish is rejected with `storage_full`. In practice, a bundle producing 1 GB of artifacts is producing an unusually large volume of structured output.
 
-**Global storage cap: 50 GB** (configurable in `settings.json` under `artifacts.global_storage_cap_bytes`). Summed across all global artifacts. Same soft-cap semantics: the GC sweep runs first; if that fails, publishes are rejected. The default of 50 GB is sized to leave comfortable headroom on the 30 GB box; the actual disk has more space than RAM, but 50 GB ensures the artifact store never becomes the dominant disk consumer.
+**Global storage cap: 50 GB** [PROVISIONAL: sized to the 30 GB dev box; should be re-evaluated when actual artifact accumulation patterns are known] (configurable in `settings.json` under `artifacts.global_storage_cap_bytes`). Summed across all global artifacts. Same soft-cap semantics: the GC sweep runs first; if that fails, publishes are rejected. The default of 50 GB is sized to leave comfortable headroom on the 30 GB box; the actual disk has more space than RAM, but 50 GB ensures the artifact store never becomes the dominant disk consumer.
 
 **The ArtifactStore interface.** The abstract interface that lets `LocalFilesystemArtifactStore` (v1.1) and a future `S3ArtifactStore` (k8s) plug in without changes to manifests, RPC handlers, or executor logic:
 
@@ -1285,9 +1676,9 @@ For artifacts declared as DAG inputs but produced outside the DAG (bundle inputs
 
 **When artifacts become eligible for collection:**
 
-Task-scoped artifacts become eligible when the producing task's worker terminates (clean exit, failure, or kill). `gc_eligible_at` is set to `worker_ended_at + task_retention_seconds`, with a default retention of 86400 seconds (24 hours). The 24-hour window allows the worker's own retry attempts and brief forensic inspection.
+Task-scoped artifacts become eligible when the producing task's worker terminates (clean exit, failure, or kill). `gc_eligible_at` is set to `worker_ended_at + task_retention_seconds`, with a default retention of 86400 seconds (24 hours) [PROVISIONAL: calibrated to an assumed operator debug cadence; configurable]. The 24-hour window allows the worker's own retry attempts and brief forensic inspection.
 
-Bundle-scoped artifacts become eligible when the bundle reaches a terminal state (`complete`, `failed`, `rejected`). `gc_eligible_at` is set to `bundle_ended_at + bundle_retention_seconds`. The default retention is 604800 seconds (7 days) for `complete` and `rejected` bundles, and 2592000 seconds (30 days) for `failed` bundles. The extended retention for failed bundles preserves forensic artifacts for post-mortem analysis without requiring operator intervention.
+Bundle-scoped artifacts become eligible when the bundle reaches a terminal state (`complete`, `failed`, `rejected`). `gc_eligible_at` is set to `bundle_ended_at + bundle_retention_seconds`. The default retention is 604800 seconds (7 days) [PROVISIONAL] for `complete` and `rejected` bundles, and 2592000 seconds (30 days) [PROVISIONAL] for `failed` bundles. Both are configurable in `settings.json`. The extended retention for failed bundles preserves forensic artifacts for post-mortem analysis without requiring operator intervention.
 
 Global artifacts do not become eligible by time. They persist until explicitly deleted or until the global storage cap triggers LRU eviction. A global artifact with `ref_count = 0` and no `gc_eligible_at` is still alive; it is collected only under storage pressure.
 
@@ -1656,7 +2047,7 @@ The 3×3 matrix gates bundles into one of four tiers:
 The four tiers:
 
 - **Auto-approve.** Bundler creates the feature branch and starts work without asking. The reviewer is informed via a single line in a daily digest.
-- **Approve-with-summary.** Bundler posts a summary (proposal one-liner, complexity/risk scores with breakdown, files-to-be-touched list, test plan summary, estimated wall-clock duration, link to full RFC). Default if reviewer doesn't respond in the configured window: low-risk cells default-approve after 4 hours; moderate-risk cells default-hold (require explicit response). The 4-hour window is configurable in `settings.json` under `approval.default_approve_window_hours`. Default-approve outcomes are tracked as a calibration axis; if default-approved bundles have a higher failure rate than explicitly-approved bundles of the same stakes, the threshold is wrong and the remedy is adjusting the matrix, not default-holding everything.
+- **Approve-with-summary.** Bundler posts a summary (proposal one-liner, complexity/risk scores with breakdown, files-to-be-touched list, test plan summary, estimated wall-clock duration, link to full RFC). Default action if reviewer doesn't respond in the configured window: **hold** (require explicit response). All cells default to hold. The per-cell overrides in `settings.json` under `approval.default_action_overrides` start at `"hold"` and may be changed to `"approve"` after the calibration loop has accumulated enough history to justify auto-approve for specific cells. The timeout window is configurable in `settings.json` under `approval.summary_timeout_hours` (default 4 hours).
 - **Full human review.** Bundler posts the full RFC, verification plan, worker decomposition, capability requests, and concerns section. No default action; bundle waits indefinitely.
 - **Full review with cooldown.** Same as full review, plus a minimum 1-hour dwell time before approval can be granted, even if the reviewer responds immediately. Forcing function for high-stakes changes: look at it, walk away, come back. For bundles flagged `irreversible` (rollback is not machine-executable and manual recovery would require >1 hour of operator time, as assessed by the Verification Plan's rollback plan), the cooldown is 24 hours rather than 1 hour. The `irreversible` flag is set by the bundler during planning and is reviewable during approval. Both cooldown durations are configurable in `settings.json`. Override available for genuine emergencies via `/force-approve` or MCP equivalent; overrides write an audit log entry with the reason and are tracked in calibration.
 
@@ -2107,6 +2498,7 @@ The bundle state machine is the authoritative source for what transitions are le
 | # | From | Trigger | To | Actor | SQLite writes | Event enqueued |
 |---|------|---------|----|-------|---------------|----------------|
 | 1 | (none) | `bundle_input_received` | `PROPOSED` | Orchestrator | INSERT `bundles` row, INSERT `audit_log` | (none) |
+| 1a | `PROPOSED` | `kernel_direct_approval` | `APPROVED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.approved_at`, UPDATE `bundles.approved_by`, INSERT `approval_decisions`, INSERT `audit_log` | (none) |
 | 2 | `PROPOSED` | `bundler_completed` | `IN_REVIEW` | Bundler agent | UPDATE `bundles.state`, UPDATE `bundles.proposal_json`, INSERT `audit_log`, INSERT pre-execution track dispatch records | `review_tracks_dispatched` |
 | 3 | `IN_REVIEW` | `review_tracks_completed` | `PROPOSED` | Review track agent (on finding blocking issue) | UPDATE `bundles.state`, UPDATE `bundles.concerns_json`, INSERT `audit_log` | (none) |
 | 4 | `IN_REVIEW` | `approval_matrix_approved` | `APPROVED` | Orchestrator (auto) or Reviewer (manual) | UPDATE `bundles.state`, UPDATE `bundles.approved_at`, UPDATE `bundles.approved_by`, INSERT `approval_decisions`, INSERT `audit_log` | (none) |
@@ -2133,6 +2525,8 @@ The bundle state machine is the authoritative source for what transitions are le
 | 25 | `IN_PROGRESS` | `bundle_failed_during_execution` | `FAILED` | Orchestrator (on unrecoverable DAG failure) | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | (none; in-flight workers left running per executor design) |
 
 **Transitions requiring special attention:**
+
+**Transition 1a** (`PROPOSED → APPROVED`) [PHASE-1-ONLY]: This transition exists in v1.1 Phase 1, when the bundler agent is not yet implemented. It allows the human reviewer to approve a bundle directly from the CLI surface (`studio approve <id>`) without the bundler producing a proposal or pre-execution review running. The transition is removed in Phase 2 when the bundler exists; at that point `bundler_completed` (transition 2) becomes the only legal path out of `PROPOSED`. The state machine validates this transition only when a `kernel_mode` flag is set at orchestrator startup; in full system mode the transition is treated as illegal with reason "Bundle has not been reviewed. Wait for pre-execution review and approval."
 
 **Transition 3** (`IN_REVIEW → PROPOSED`): Triggered when a review track finds a blocking issue and the bundler must revise. Not the same as `/modify` (which is reviewer-initiated). The review track agent sets `bundles.concerns_json` with the blocking finding.
 
@@ -2196,6 +2590,8 @@ The state machine validates by checking membership in a frozenset of `(from_stat
 **Surface observability.** SQLite: `bundles.state` is the authoritative source, updated in the same transaction as the transition. MCP: `studio://bundles/{id}` reads state directly. GitHub Issues: on every state transition, the bundle's issue is updated — body appends a transition timeline entry `"[{timestamp}] {from_state} → {to_state} by {actor} via {surface}"` and labels are swapped (old state label removed, new added: `state/proposed`, `state/in-review`, etc.). CLI: `studio show <bundle-id>` displays current state and transition history from `audit_log`.
 
 **Implementation notes.** The state machine does NOT mutate executor state directly. It enqueues events (`bundle_pause_requested`, `bundle_abort_requested`, etc.) into the executor's event queue. The executor's event pump picks up these events on the next tick and performs the executor-level actions. The bundle state machine and the DAG executor communicate through the event queue and SQLite, not through direct method calls. The two state spaces (bundle state and DAG node states) are in separate tables and are not locked together.
+
+The implementing agent defines all 12 enum values in `BundleState` (Python `StrEnum`) even though Phase 1 implements transition handlers for only a subset. The unused values (`redirecting`, `verifying`, `parked`) are valid future states defined in the schema. Their presence at definition time prevents a migration when Phase 2 adds the bundler, QA agent, and redirecting machinery. Phase 2 adds transition handlers; it does not add new enum values.
 
 ### Mid-flight steering mechanics
 
@@ -2375,7 +2771,7 @@ Production deploy failures are not currently a relevant case, since there is no 
 
 **Worker lifecycle.** Orchestrator picks worker class C for task T based on T's requirements, spawns the worker via WorkerRunner, gives it its own working tree on its own branch, gives it its declared capability set, and gives it pointers to its declared input artifacts. The worker reads its task spec (passed via env var or mounted file): bundle context, RFC excerpt, verification plan excerpt, conditions, `AGENTS.md`, capability manifest subset, model and thinking-mode config. It invokes OpenCode against the configured Ollama Cloud model. It emits heartbeats on state transitions and at maximum 60-minute intervals, including the `phase` field. It may request capability expansion mid-task via RPC; this goes through the approval flow before new workers spawn. On completion (success, failure, or stuck), it commits to its sub-branch, emits a `worker-report.json`, and exits. The orchestrator reviews exit state, merges the sub-branch to the feature branch (or kills it), updates `tasks.json`, and decides next steps.
 
-Workers that go stuck (hit the configured per-worker-class timeout, currently 3 stuck-iterations as the kill-and-respawn threshold) are killed and reassigned. The reset-and-iterate pattern (small bounded tasks, kill-and-respawn over long-context grinding) was an intentional adoption from the production-tested patterns surveyed during the orchestrator design conversation.
+Workers that go stuck (hit the configured per-worker-class timeout, currently 3 stuck-iterations [PROVISIONAL] as the kill-and-respawn threshold) are killed and reassigned. The reset-and-iterate pattern (small bounded tasks, kill-and-respawn over long-context grinding) was an intentional adoption from the production-tested patterns surveyed during the orchestrator design conversation.
 
 ## Surfaces
 
@@ -2387,9 +2783,228 @@ This was chosen over GitHub Issues as primary because Claude Desktop is increasi
 
 The MCP method surface:
 
-- Tools (write/action): `list_pending_bundles(filter?)`, `get_bundle(id)`, `approve_bundle(id, comment?)`, `reject_bundle(id, reason)`, `request_modification(id, instructions)`, `escalate_bundle(id, reason)`, `pause_bundle(id)`, `resume_bundle(id)`, `kill_worker(bundle_id, worker_id, reason)`, `grant_capability(request_id, scope?, expiry?)`, `revoke_capability(capability_id, reason)`.
-- Resources (read-only context): `studio://bundles/pending`, `studio://bundles/{id}`, `studio://bundles/{id}/workers`, `studio://workers/active`, `studio://workers/{bundle_id}/{worker_id}/report`, `studio://capabilities/manifest`, `studio://capabilities/pending-requests`, `studio://memory/agents/{repo}`, `studio://calibration/recent`, `studio://decisions/recent`, `studio://system/status`.
-- Prompts (canned interaction patterns): `review-pending`, `morning-digest`, `risk-audit`, `bundle-deep-dive`.
+**Tools (write/action).** All MCP tools require explicit human gesture (tool-confirmation flow). Each tool maps to the orchestrator state machine; the orchestrator's response is the tool's return value.
+
+**`list_pending_bundles`**
+```
+Input:
+{
+  "filter": {
+    "tier": "auto" | "auto_notify" | "summary" | "full_review" | "full_review_cooldown" | null,
+    "state": "<state enum>" | null,
+    "repo": "<string>" | null,
+    "limit": <int, default 20, max 100>
+  } | null
+}
+
+Output:
+{
+  "bundles": [
+    {
+      "id": "<ulid>",
+      "state": "<state enum>",
+      "tier": "<tier enum>",
+      "target": "<string>",
+      "complexity_score": <int 0-10>,
+      "risk_score": <int 0-10>,
+      "title": "<first line of idea>",
+      "created_at": "<iso8601>",
+      "approved_at": "<iso8601 or null>"
+    }
+  ],
+  "total": <int>,
+  "truncated": true | false
+}
+```
+
+**`get_bundle`**
+```
+Input:
+{
+  "id": "<ulid>"
+}
+
+Output:
+{
+  "bundle": <full bundle_output as specified in Bundle lifecycle: execution and integration>
+}
+```
+Error: `{"error": "NOT_FOUND", "detail": "Bundle <id> does not exist"}`.
+
+**`approve_bundle`**
+```
+Input:
+{
+  "id": "<ulid>",
+  "comment": "<string or null>"
+}
+
+Output (success):
+{
+  "transition": "IN_REVIEW -> APPROVED" | "APPROVED -> IN_PROGRESS" | "VERIFYING -> COMPLETE",
+  "bundle_id": "<ulid>",
+  "new_state": "<state enum>"
+}
+```
+Error: `{"error": "ILLEGAL_TRANSITION", "current_state": "<state>", "detail": "<reason>"}`.
+
+**`reject_bundle`**
+```
+Input:
+{
+  "id": "<ulid>",
+  "reason": "<string>"
+}
+
+Output (success):
+{
+  "transition": "IN_REVIEW -> REJECTED" | "APPROVED -> REJECTED",
+  "bundle_id": "<ulid>",
+  "new_state": "rejected"
+}
+```
+
+**`request_modification`**
+```
+Input:
+{
+  "id": "<ulid>",
+  "instructions": "<string>"
+}
+
+Output (success):
+{
+  "transition": "IN_REVIEW -> PROPOSED",
+  "bundle_id": "<ulid>",
+  "new_state": "proposed",
+  "message": "Bundler will revise based on instructions."
+}
+```
+Legal from `proposed`, `in_review`, or `approved` (pre-execution only). Error: `{"error": "ILLEGAL_TRANSITION", ...}`.
+
+**`escalate_bundle`**
+```
+Input:
+{
+  "id": "<ulid>",
+  "reason": "<string>"
+}
+
+Output (success):
+{
+  "bundle_id": "<ulid>",
+  "new_tier": "<tier enum>",
+  "previous_tier": "<tier enum>",
+  "message": "Bundle escalated to <tier>."
+}
+```
+Escalates to the next higher tier. Cannot de-escalate. Error if already at `full_review_cooldown`.
+
+**`pause_bundle`** — Legal from `in_progress` only.
+```
+Input:
+{
+  "id": "<ulid>"
+}
+
+Output (success):
+{
+  "transition": "IN_PROGRESS -> PAUSED",
+  "bundle_id": "<ulid>",
+  "new_state": "paused",
+  "workers_waiting": <int>
+}
+```
+
+**`resume_bundle`** — Legal from `paused` only.
+```
+Input:
+{
+  "id": "<ulid>",
+  "note": "<string or null>"
+}
+
+Output (success):
+{
+  "transition": "PAUSED -> IN_PROGRESS",
+  "bundle_id": "<ulid>",
+  "new_state": "in_progress"
+}
+```
+
+**`kill_worker`**
+```
+Input:
+{
+  "bundle_id": "<ulid>",
+  "worker_id": "<ulid>",
+  "reason": "<string>"
+}
+
+Output (success):
+{
+  "worker_id": "<ulid>",
+  "action": "cancel_dispatched",
+  "message": "Cancel sent to worker."
+}
+```
+
+**`grant_capability`**
+```
+Input:
+{
+  "request_id": "<ulid>",
+  "scope": { ... } | null,     // null = grant exactly as requested
+  "expiry": "<iso8601 or null>"
+}
+
+Output (success):
+{
+  "capability_id": "<ulid>",
+  "granted_scope": { ... },
+  "expires_at": "<iso8601 or null>"
+}
+```
+
+**`revoke_capability`**
+```
+Input:
+{
+  "capability_id": "<ulid>",
+  "reason": "<string>"
+}
+
+Output (success):
+{
+  "capability_id": "<ulid>",
+  "revoked_at": "<iso8601>"
+}
+```
+
+**Resources (read-only context).** MCP resources are URIs that return typed JSON or Markdown content. All resources are read-only and do not require human gesture.
+
+| URI | Returns | Description |
+|-----|---------|-------------|
+| `studio://bundles/pending` | `List[BundleSummary]` | All bundles not in terminal state |
+| `studio://bundles/{id}` | `BundleOutput` | Full bundle output (same shape as `get_bundle` result) |
+| `studio://bundles/{id}/workers` | `List[WorkerSummary]` | Workers for a bundle: id, state, phase, started_at |
+| `studio://workers/active` | `List[WorkerSummary]` | All workers in `running` or `paused` state |
+| `studio://workers/{bundle_id}/{worker_id}/report` | `WorkerReport` | Final worker report JSON |
+| `studio://capabilities/manifest` | `CapabilityManifest` | Current system capability source of truth |
+| `studio://capabilities/pending-requests` | `List[CapabilityRequest]` | Pending capability requests with status |
+| `studio://memory/agents/{repo}` | `text/markdown` | `AGENTS.md` content for the named repo |
+| `studio://calibration/recent` | `List[CalibrationEntry]` | Last 30 days of calibration data |
+| `studio://decisions/recent` | `List[DecisionEntry]` | Last 30 days of decisions |
+| `studio://system/status` | `SystemStatus` | Orchestrator health, worker pool, Ollama Cloud reachability |
+
+**Prompts (canned interaction patterns).** MCP prompts are templated messages provided to the LLM client. They do not execute any code.
+
+| Prompt name | Arguments | Template purpose |
+|-------------|-----------|-----------------|
+| `review-pending` | (none) | "Here are the pending bundles. For each, summarize the proposal, flag concerns, and recommend approve/reject/modify." |
+| `morning-digest` | (none) | "Here is what happened overnight: completed bundles, new proposals, calibration alerts." |
+| `risk-audit` | `repo: string` | "Audit recent bundles targeting <repo>. Identify patterns in risk scoring, failure modes, and security findings." |
+| `bundle-deep-dive` | `id: string` | "Do a deep review of bundle <id>: read the full RFC, verification plan, worker decomposition, and all review track findings. Flag anything the automated review may have missed." |
 
 Approval actions always require explicit human gesture: Claude Desktop can recommend, the human must click. This is just MCP's normal tool-confirmation behavior, but it's a deliberate design constraint, not an accident. Claude Desktop is itself an LLM-mediated surface, and asking it "should I approve this?" gets another model's recommendation on top of the bundler's proposal. That's mostly a feature (independent review), but the action itself stays explicit.
 
@@ -2399,7 +3014,7 @@ The MCP tools are designed to make it easy for Claude Desktop to surface its own
 
 **CLI, tertiary.** `studio approve <bundle-id>`, `studio list-pending`, `studio show <bundle-id>`. Useful when the reviewer is SSH'd into the box. Doesn't replace the issue or MCP flow but supplements it. Both surfaces produce the same orchestrator action.
 
-**Cross-surface sync.** MCP actions mirror to GitHub Issues as comments (audit trail); GitHub Issue actions mirror to the MCP-side decision log. Several open-question implementation details remain (multi-surface action ordering, race-condition resolution if approval races rejection across surfaces within the same minute) and are deferred to implementation-time decisions, not architecture-time decisions.
+**Cross-surface sync.** MCP actions mirror to GitHub Issues as comments (audit trail); GitHub Issue actions mirror to the orchestrator's decision log. Multi-surface action ordering and race resolution follow the first-write-wins policy specified in Bundle lifecycle: planning and approval, Multi-surface action ordering and race resolution: SQLite serialization ensures one decision commits first; the second surface receives a conflict error with enough context to understand what happened.
 
 **Notifications, v1.** GitHub native only, deliberately simplest. Workers assign the reviewer to issues requiring attention; GitHub's email and mobile push handle delivery. Assignment triggers: bundle enters Needs Input column; bundle gets `acting-soon` label. No other transitions trigger assignment. Pull-based for everything else.
 
@@ -2658,4 +3273,114 @@ A migration plan from v1 numerics to v1.1 (when v1.1 actually reaches a state th
 
 A protocol for flagging supersessions during design is worth adopting explicitly. The drift items above all share a structure: a later turn made a decision that obsoleted an earlier one without saying so. A simple rule like "if a new decision changes a previous one, flag both with a supersession note" would have caught most of these.
 
-End of document.
+## Editorial pass notes
+
+This section is the human-readable audit trail of the editorial pass performed on 2026-05-08. Its primary purpose is to give the PM and the next design session a complete picture of what changed, what was tagged, and what remains unresolved. The implementing agent should read this section to understand which values are hard constraints and which are provisional defaults it should hardcode as tunable.
+
+### Precision changes made
+
+**[Architecture, Bundle state machine]** Replaced conversational summary ("In summary: twelve states...") with a typed table enumerating all 12 states with enum values, terminal/non-terminal classification, and descriptions. Added the `IllegalTransitionError` exception class definition and its JSON-RPC serialization format (code `-32001`). The state machine reference now cross-references the exact section "Bundle lifecycle: execution and integration" where the full 25-row transition table lives.
+
+**[Architecture, Crash recovery]** Replaced prose description of crash recovery with a numbered 6-step procedure. Each step names the specific SQL operation (e.g., "Scan workers for rows in state running or paused; mark each failed with exit_reason = 'orchestrator_crash'") and the state transitions produced. Added explicit cross-reference to the DAG executor's "Checkpointing and crash recovery" subsection.
+
+**[Architecture, SQLite schema]** Added `connection_lost` to the `workers.state` schema comment so the comment enumerates all valid worker states: `pending|running|complete|failed|killed|connection_lost`.
+
+**[Worker RPC protocol]** Added full JSON-RPC 2.0 request/response schemas for all 14 methods (8 worker-to-orchestrator, 6 orchestrator-to-worker). Each schema includes field names, types, and value ranges. Methods previously described in prose-only now have typed schemas matching the precision level of the Artifact Protocol section's RPC method specifications.
+
+**[Worker RPC protocol]** Added a formal error code table with 9 RPC-level error codes (`-32000` through `-32603`), each with name and meaning. Added notification vs. call classification table for worker-to-orchestrator methods. Added algorithmic description of the RPC dispatcher's capability check (wildcard matching rules for `rpc.methods` grants in both directions).
+
+**[Capability manifest, Composition rules]** Added algorithmic subset-checking function `is_subset(task_manifest, bundle_manifest) -> tuple[bool, str]` with per-category rules. Each category (filesystem, network, process, secrets, RPC, resources) has explicit pseudo-code for the subset test. Added network protocol subsumption order (`tcp > udp, http, https; http > https`). Added RPC method pattern coverage rules and artifact descriptor pattern coverage rules using the glob algorithm from the Artifact Protocol section.
+
+**[Surfaces, MCP tools]** Added full typed input/output schemas for all 11 MCP tools. Each tool now has a JSON input schema, JSON output schema for success, and JSON error schema for failure (with error codes and detail fields where applicable). Legal from-states are specified for state-changing tools.
+
+**[Surfaces, MCP resources]** Added a typed table of all 11 MCP resources with URI template, return type, and description. Each resource is now machine-resolvable: an implementing agent knows exactly what type to return for each URI pattern.
+
+**[Surfaces, MCP prompts]** Added a typed table of all 4 MCP prompts with argument names, types, and template purpose descriptions.
+
+**[Surfaces, Cross-surface sync]** Updated to reference the ratified first-write-wins policy from "Bundle lifecycle: planning and approval, Multi-surface action ordering and race resolution" instead of the prior language deferring race resolution to implementation-time.
+
+### Stale deferred references fixed
+
+Four sections contained "is deferred" language for items that are now fully specified elsewhere in the document. These were false signals to an implementing agent. They have been replaced with cross-references to the specifying sections:
+
+1. **[Worker environment, Secrets]** "that protocol is deferred" replaced with cross-reference to Artifact Protocol section for `secrets.fetch`.
+2. **[Capability manifest, Secrets grants]** "the protocol semantics for secrets.fetch are deferred" replaced with cross-reference to Artifact Protocol section.
+3. **[Task DAG schema, Aggregator nodes]** "Reducer registry semantics... are deferred" replaced with cross-reference to DAG executor's Reducer registry subsection.
+4. **[Task DAG schema, Edges and edge conditions]** "Formal grammar for the sublanguage is deferred" replaced with cross-reference to DAG executor's "The `on_property` expression sublanguage" subsection.
+
+### Provisional items tagged
+
+The following values were tagged `[PROVISIONAL]` inline. An implementing agent should hardcode each as a named constant or configuration default and not treat it as a ratified constraint:
+
+1. **Per-worker resource limits** (4 GB RAM, 2 CPU, 10 GB disk) — Architecture section.
+2. **Worker timeout defaults** (2h small / 4h medium / 8h large) — Worker environment section. Already noted as provisional in prose; now tagged inline.
+3. **Heartbeat maximum interval** (60 minutes) — Worker environment section.
+4. **Ollama Cloud health check interval** (30 seconds) and **grace window** (5 minutes) — Worker environment section, both in JSON config block and in prose.
+5. **Gate rpc_query timeout** (30 seconds) — DAG executor, Gate node mechanics.
+6. **Cancellation grace period** (30 seconds) and **SIGKILL delay** (10 seconds) — DAG executor, Aggregator mechanics and Abort sections.
+7. **Inline artifact threshold** (4096 bytes) — Artifact Protocol, Storage layer.
+8. **Task artifact retention** (24 hours) — Artifact Protocol, Lifecycle and garbage collection.
+9. **Bundle artifact retention** (7 days complete/rejected, 30 days failed) — Artifact Protocol, Lifecycle and garbage collection.
+10. **Global storage cap** (50 GB) — Artifact Protocol, Storage layer.
+11. **Stuck-iterations threshold** (3) — Bundle lifecycle, Execution structure.
+12. **Per-bundle concurrency budget formula** (`max(2, global_budget // active_bundles)`) — DAG executor, Ready-set scheduling.
+13. **Friction-pattern aggregation threshold** (3 reports in 7 days) — Surfaces section. Already marked "not committed"; now tagged.
+
+### Cross-references fixed
+
+Broken or vague cross-references corrected:
+
+1. **Architecture section**: "In summary" prose replaced with table and explicit section reference to "Bundle lifecycle: execution and integration."
+2. **Architecture section**: Crash recovery reference now names the exact subsection: "DAG executor section under Checkpointing and crash recovery."
+3. **Worker environment**: Secrets section now references "Artifact Protocol section" instead of calling the protocol deferred.
+4. **Capability manifest**: Secrets grants now reference "Artifact Protocol section" for `secrets.fetch`.
+5. **Task DAG schema**: Aggregator nodes now reference "DAG executor section under Reducer registry."
+6. **Task DAG schema**: Edge conditions now reference "DAG executor section under The `on_property` expression sublanguage."
+7. **Surfaces**: Cross-surface sync now references "Bundle lifecycle: planning and approval, Multi-surface action ordering and race resolution."
+
+### Items moved to Deferred
+
+No half-specified behavior was moved to the Deferred Items section during this pass. The four items that appeared to be half-specified (secrets.fetch protocol, reducer registry, expression sublanguage grammar) were discovered to already be fully specified in later sections of the document. Their earlier "deferred" labels were stale. These were corrected to cross-references rather than split into the Deferred Items section, since the behavior was already fully specified elsewhere.
+
+### Phase 1 readiness fixes (2026-05-08)
+
+After the initial editorial pass, a Phase 1 readiness assessment identified three blocking issues and four non-blocking ambiguities. The following fixes were applied:
+
+**Fixed blocking issues:**
+1. **[workers.state schema]** Added `paused` to `workers.state` schema comment. Full enumeration: `pending|running|paused|complete|failed|killed|connection_lost`. The `running -> paused` transition occurs in the worker row when pause completes, matching the `dag_nodes` state transition.
+2. **[Bundle state machine]** Added kernel-mode transition: `PROPOSED → APPROVED` (trigger: `kernel_direct_approval`, actor: Reviewer). This transition exists in v1.1 Phase 1 only, when the bundler agent is not yet implemented. It is removed in Phase 2 when the bundler exists and `bundler_completed` becomes the only path from `PROPOSED`. The transition is marked `[PHASE-1-ONLY]` in the transition table.
+3. **[Worker RPC protocol, cap.check]** Specified `op_descriptor` structured format: `<category>.<operation>[:<resource>]`. Examples: `filesystem.write:/work/src/main.py`, `network.egress:api.github.com:443`, `process.exec:/usr/bin/git`, `rpc.method:artifact.publish`. The dispatcher parses the category prefix and dispatches to the appropriate category-specific capability check.
+
+**Fixed non-blocking ambiguities:**
+4. **[worker.heartbeat phase enum]** Added `starting` to the heartbeat phase enum. Full set: `starting | thinking | tool-call | writing-code | running-tests | idle`. The `starting` value is the canonical first heartbeat emitted after worker spawn, before the worker begins meaningful work.
+5. **[worker.heartbeat state updates]** Specified that `worker.heartbeat` updates `workers.last_heartbeat` on every call. On the first heartbeat received from a worker in `pending` state, it additionally transitions `workers.state` from `pending → running`. Subsequent heartbeats from a worker already in `running` state only update `last_heartbeat`.
+6. **[Crash recovery Phase 1 no-ops]** Step 1's "paused" branch: in Phase 1, no transition produces paused workers, so this branch is a no-op. Step 4 (replay approval decisions): in Phase 1, the `approval_requests` table is unused (no MCP, no GitHub Issues surface), so this step is a no-op. The implementing agent writes the reconciliation logic for all steps but the Phase 1 execution path never hits the paused or approval-replay branches.
+7. **[State machine enum completeness]** The implementing agent defines all 12 enum values in `BundleState` (Python `StrEnum`) even though Phase 1 implements only 8 transition handlers. The unused values (`redirecting`, `verifying`, `parked`) are valid future states and their presence prevents a schema migration when Phase 2 adds the bundler, QA agent, and redirecting machinery.
+
+### Gaps found but not filled
+
+The following are design gaps that an implementing agent would encounter. They need a design pass before implementation can proceed. None were filled during this editorial pass.
+
+**1. `irreversible` flag formal schema slot.**
+- **Location**: Bundle lifecycle: planning and approval (cooldown carve-out). The Deferred items section already lists this as deferred.
+- **Which agent hits it**: The agent implementing the approval matrix evaluator and the bundle output schema.
+- **Question**: Where exactly in the bundle proposal schema does the `irreversible` flag live? Is it a field on the proposal (`proposal.irreversible: bool`) or a property derived from the verification plan's rollback assessment? The approval matrix cooldown logic needs to read it; the bundle output schema needs to serialize it.
+- **Recommendation**: Add `irreversible: bool` to the `bundle_output.proposal` block and to the `bundles` table as a column. Default `false`. Set by the bundler during planning. The approval matrix evaluator reads `bundles.irreversible` to determine cooldown duration (1 hour vs. 24 hours).
+
+**2. Mermaid rendering caching not specified.**
+- **Location**: Open questions, "Mermaid rendering frequency."
+- **Which agent hits it**: The agent implementing the MCP resource handlers and GitHub comment updates.
+- **Question**: The spec says mermaid rendering "is cheap enough to re-render on every MCP resource fetch." For large DAGs with hundreds of nodes (possible after aggressive expansion), "cheap enough" may not hold. Should the implementing agent add caching, or should it re-render unconditionally and defer caching until a performance problem is observed?
+- **Recommendation**: The implementing agent should re-render unconditionally in v1.1 and add a `TODO` comment marking the spot for a state-hash-based cache. The cache invalidation key is the max `node_state_history.id` for the bundle's DAG. This is a 10-line optimization deferred until needed.
+
+**3. Approve-with-summary tier default action contradiction.**
+- **Location**: Bundle lifecycle: planning and approval.
+- **Which agent hits it**: The agent implementing the approval matrix evaluator and the timer-based auto-action logic.
+- **Question**: The approval matrix table description says "Default if reviewer doesn't respond in the configured window: low-risk cells default-approve after 4 hours; moderate-risk cells default-hold." But the "Default actions, cooldown durations" subsection says "PM ratified: default-hold across the board" and the `settings.json` snippet shows all actions set to `"hold"`. Which is authoritative?
+- **Recommendation**: The "default-hold across the board" ratification is authoritative. The matrix table description should be updated to say "Default action: hold (require explicit response). The per-cell overrides in settings.json start at hold and may be changed to approve after the calibration loop has accumulated enough history." This is a spec bug, not an editorial ambiguity.
+
+**4. Gate human-approval default timeout.**
+- **Location**: Deferred items, "Human-approval gate timeout."
+- **Which agent hits it**: The agent implementing gate node mechanics and the stalled-bundle detector.
+- **Question**: The spec does not specify a default timeout for `human_approval` gates. The 8-hour stalled-bundle detector catches the case indirectly. An implementing agent needs to know what value to use for `approval_timeout` on gate creation.
+- **Recommendation**: Default to `null` (indefinite). The gate stays in `running` until a human decision arrives. The stalled-bundle detector's existing 8-hour window fires the `acting-soon` label for bundles with long-pending gates, which is the correct behavior for a human-in-the-loop interrupt. Gate-specific timeout with default-reject semantics is a v1.2 feature.
