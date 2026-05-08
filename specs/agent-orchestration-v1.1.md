@@ -1484,50 +1484,84 @@ A bundle is the unit of human approval and execution. Its lifecycle starts when 
 
 ### Bundle input schema
 
-A bundle's inputs are the contract between whoever filed the work and the bundler agent that plans it. The task-level I/O spec in the Task DAG schema is the model: each task declares its inputs and outputs. The bundle-level schema mirrors that structure at a higher level of abstraction.
+The bundle input is the typed contract between whoever files work and the bundler agent. The orchestrator validates it before handing it to the bundler. The task-level I/O spec (Task DAG schema) is the structural model; the bundle-level schema mirrors it at a higher abstraction level.
 
 ```yaml
 bundle_input:
-  idea:
-    source: idea_forum | cli | mcp | github_issue | agent_generated
-    body: "<free-text request>"
-    title: "<optional one-line summary>"
+  # REQUIRED
+  idea: str                         # free-text request, up to 64KB
+  filed_by: str                     # identity string of the submitter
+  filed_at: str                     # ISO8601 timestamp, orchestrator-populated on receipt
+  filed_via: enum                   # idea_forum | cli | mcp | github_issue | agent_generated
 
-  structured_params:
-    target_hint: new-repo | existing-repo:<name> | control-plane | null
-    priority_hint: low | normal | high | null
-    deadline: <ISO8601 timestamp or null>
-    requested_capabilities: [<capability name>, ...]
+  # OPTIONAL
+  target_hint: str | null           # "new-repo" | "existing-repo:<name>" | "control-plane" | null
+  priority_hint: enum | null        # "low" | "normal" | "high" | null
+  deadline: str | null              # ISO8601 timestamp or null
+  requested_capabilities: [str]     # capability names the submitter thinks will be needed, default []
 
-  parent_bundle_id: <ULID or null>
+  # LINEAGE (all optional, default null)
+  parent_bundle_id: str | null      # ULID of the bundle that spawned this one
+  supersedes_bundle_id: str | null  # ULID of a prior bundle this one replaces
+  related_bundle_ids: [str]         # ULIDs of related bundles for context, default []
 
-  related_bundle_ids: [<ULID>, ...]
-
+  # ATTACHMENTS (optional, default [])
   attachments:
-    - name: <string>
-      content_type: <mime-like>
-      data_ref: <artifact descriptor or null>
-      url: <string or null>
-
-  metadata:
-    filed_by: <identity string>
-    filed_at: <ISO8601 timestamp>
-    filed_via: idea_forum | cli | mcp | github_issue | agent_generated
+    - name: str                     # human-readable label
+      content_type: str             # MIME-like, e.g. "image/png", "text/plain"
+      data_ref: str | null          # artifact descriptor if bytes already stored
+      url: str | null               # URL to fetch if bytes not yet stored
 ```
 
-**`idea`** is the only required field. The `source` discriminator tells the bundler what kind of material it's working with: a one-line CLI request gets different treatment than a structured GitHub Issue with reproduction steps, and an agent-generated proposal (a follow-up bundle triggered by an Investigate decision on a capability request) carries its own framing. The `body` is free-text and deliberately unstructured; the bundler's job is to turn it into a structured proposal.
+**Field specifications:**
 
-**`structured_params`** is optional and advisory. The three hints (target, priority, deadline) let the human steer without committing. The bundler may override any hint if the resulting proposal would be incoherent; override reasons are surfaced in the proposal's concerns section. `requested_capabilities` is an early signal: "I think this will need a new API key for SendGrid." The bundler treats these as suggestions, not grants; the capability request still goes through the normal approval flow.
+**`idea`** (required, string, max 65536 bytes). Free-text description of the work requested. Deliberately unstructured; the bundler's job is to structure it. The orchestrator rejects empty strings and strings over 64KB with error `INVALID_INPUT: idea must be 1-65536 bytes`.
 
-**`parent_bundle_id`** captures lineage. When a bundle is spawned from an Investigate decision on a capability request, or when an agent proposes follow-up work after completing a bundle, the parent link preserves the through-line. It is not a scheduling dependency; it is provenance metadata. A bundle with a parent is otherwise independent.
+**`filed_by`** (required, string). Identity of whoever submitted the idea. In v1.1 this is always the single human reviewer, but typed as a string to avoid coupling to the identity model. The orchestrator does not validate this field against a known-identity list; it is recorded for audit and calibration.
 
-**`related_bundle_ids`** is a looser reference: "this is like bundle X" or "this supersedes bundle Y." The bundler consults related bundles during planning for context, but does not block on them.
+**`filed_at`** (required, string, ISO8601). Set by the orchestrator at input receipt time, not by the submitter. If the submitter provides a value, it is overwritten. This prevents timestamp forgery.
 
-**`attachments`** let the filer provide supporting material. Attachments with a `data_ref` are injected into the bundle's artifact namespace at planning time so the bundler and pre-execution review tracks can reference them. Attachments with only a `url` are fetched by the bundler and cached; the fetched content becomes a bundle-scoped artifact.
+**`filed_via`** (required, enum). The surface the input arrived through. Values: `idea_forum`, `cli`, `mcp`, `github_issue`, `agent_generated`. The orchestrator sets this based on which surface received the input; the submitter cannot override it. Used for calibration (do CLI-filed ideas produce better bundler proposals than MCP-filed ones?).
 
-**`metadata`** records provenance. `filed_by` is an identity string; in v1.1 it is always the single human reviewer, but the field is typed as a string rather than an enum to avoid coupling to the identity model. `filed_via` records the surface for calibration.
+**`target_hint`** (optional, string or null). The submitter's preference for where work should land. Values: `"new-repo"`, `"existing-repo:<name>"`, `"control-plane"`, or null (no preference). This is a hint, not a constraint. The bundler may override it; the override reason appears in the proposal's concerns section. Validation: if the value matches the pattern `existing-repo:<name>`, the `<name>` must match `[a-z0-9-]+` (1-64 chars). An invalid pattern causes the orchestrator to reject the input with `INVALID_INPUT: target_hint must be "new-repo", "existing-repo:<name>", "control-plane", or null`.
 
-On receiving a bundle input, the bundler: resolves `parent_bundle_id` and `related_bundle_ids` to load prior bundle artifacts from `memory/` for context; fetches and caches any URL-only attachments; reads relevant calibration data and prior decisions; drafts requirements, RFC, UX flow (if relevant), implementation plan, and verification plan; computes complexity and risk scores per the approval matrix factors; decomposes the work into a task DAG with capability manifests; determines the `target:` field (specified in Bundle lifecycle: execution and integration); and populates the concerns section.
+**`priority_hint`** (optional, enum or null). Values: `"low"`, `"normal"`, `"high"`, or null. Advisory. The bundler may override. No effect on scheduling in v1.1 (scheduler is FIFO); reserved for future priority-based scheduling.
+
+**`deadline`** (optional, ISO8601 string or null). Advisory timestamp. The bundler may surface a concern if the estimated wall-clock duration exceeds the available time. The orchestrator does not enforce deadlines in v1.1.
+
+**`requested_capabilities`** (optional, list of strings, default []). Capability names the submitter anticipates the bundle will need. Example: `["github-api-repo-create", "sendgrid-send"]`. The bundler treats these as suggestions during capability manifest construction, not as pre-grants. Each name must match `[a-z][a-z0-9-]*` (1-64 chars). Invalid names are rejected with `INVALID_INPUT: requested_capabilities[<i>] "<name>" is not a valid capability name`.
+
+**`parent_bundle_id`** (optional, ULID string or null). Set when this bundle is spawned from another bundle's action: an Investigate decision on a capability request, an agent-proposed follow-up, or a Redirect re-plan (where the original bundle is the parent). Not a scheduling dependency; provenance metadata only. The orchestrator validates that the ULID exists in the `bundles` table; if not, rejects with `INVALID_INPUT: parent_bundle_id "<id>" does not exist`.
+
+**`supersedes_bundle_id`** (optional, ULID string or null). Set when this bundle replaces a prior bundle (e.g., a rejected bundle that was completely re-thought). The superseded bundle is referenced in this bundle's proposal. The orchestrator validates ULID existence same as `parent_bundle_id`.
+
+**`related_bundle_ids`** (optional, list of ULID strings, default []). Loose references for bundler context: "this is like bundle X." No validation beyond ULID format. Non-existent ULIDs are silently ignored (they may be from a different environment).
+
+**`attachments`** (optional, list of attachment objects, default []). Each attachment has: `name` (required, string, 1-256 chars), `content_type` (required, MIME-like string), `data_ref` (optional, artifact descriptor string, mutually exclusive with `url`), `url` (optional, URL string, mutually exclusive with `data_ref`). Exactly one of `data_ref` or `url` must be provided per attachment. On receipt: attachments with `data_ref` are resolved by the orchestrator and injected into the bundle's artifact namespace as `bundle:attachment-<n>` artifacts before the bundler runs. Attachments with `url` are fetched by the bundler during planning; the fetched content is cached as a bundle-scoped artifact.
+
+**Orchestrator validation (pre-bundler).** Before handing the input to the bundler agent, the orchestrator runs these validations in order:
+
+1. `idea` is a non-empty string <= 65536 bytes.
+2. `filed_via` is one of the five enum values.
+3. `target_hint` is null or matches one of the three patterns (exact string `"new-repo"`, regex `^existing-repo:[a-z0-9-]{1,64}$`, or exact string `"control-plane"`).
+4. `priority_hint` is null, `"low"`, `"normal"`, or `"high"`.
+5. `deadline` is null or a valid ISO8601 string parseable by `datetime.fromisoformat`.
+6. Each `requested_capabilities` entry matches `^[a-z][a-z0-9-]*$` and is 1-64 chars.
+7. `parent_bundle_id` is null or a ULID that exists in `bundles.id`.
+8. `supersedes_bundle_id` is null or a ULID that exists in `bundles.id`.
+9. Each attachment has exactly one of `data_ref` or `url` set.
+
+Any validation failure returns a structured error to the submitting surface:
+
+```json
+{
+  "error": "INVALID_INPUT",
+  "detail": "<human-readable description of which field failed and why>",
+  "field": "<dotted path to the failing field, e.g. 'requested_capabilities[2]'>"
+}
+```
+
+Validated inputs are assigned a ULID, written to a new row in the `bundles` table with `state = proposed`, and dispatched to the bundler agent as a planning task.
 
 ### Planning
 
@@ -1644,7 +1678,21 @@ The four tiers:
 
 ### Default actions, cooldown durations, and multi-surface race resolution
 
-**Default action for summary-tier timeouts.** Low-risk cells default-approve after 4 hours; moderate-risk cells default-hold (require explicit response). Calibration data answers whether default-approve is safe better than design-time conservatism. Configurable in `settings.json`.
+**Default action for summary-tier timeouts.** PM ratified: default-hold across the board. Regardless of risk cell, the default when the PM does not respond within the configured window is **hold** (require explicit response). This applies until the calibration loop has accumulated enough history to justify auto-approve on specific cells. The PM can change individual cells in `settings.json`:
+
+```json
+{
+  "approval": {
+    "summary_tier_default_action": "hold",
+    "default_action_overrides": {
+      "low_risk_low_complexity": "hold",
+      "low_risk_moderate_complexity": "hold",
+      "moderate_risk_low_complexity": "hold"
+    },
+    "summary_timeout_hours": 4
+  }
+}
+```
 
 **Cooldown duration.** 1 hour for full-review-cooldown tier, 24 hours for bundles flagged `irreversible`. The `irreversible` flag is a new field on the bundle proposal, set by the bundler when the Verification Plan's rollback plan concludes rollback is not machine-executable and manual recovery would require >1 hour of operator time. In v1.1, with no production and most changes being reversible, the `irreversible` flag will be rare. The flag exists primarily as a design slot for when production becomes real.
 
@@ -1660,226 +1708,628 @@ Once a bundle is approved, the orchestrator transitions it to `approved`, then t
 
 ### Bundle output schema
 
-A bundle's outputs are the structured record of what happened, preserved for the reviewer, for calibration, for post-mortem, and for future bundles that consult memory. They mirror the task-level output spec in the DAG schema but operate at the bundle level.
+The bundle output is the typed record of everything the bundle produced. It is written incrementally during execution and finalized at terminal state. Consumers: the calibration loop (`memory/calibration/scoring-outcomes.jsonl`), the post-mortem prompt, the approval surface (rendered differently per tier), and future bundles that consult memory.
 
 ```yaml
 bundle_output:
+  # POPULATED AT PROPOSAL TIME (before execution)
+  proposal:
+    complexity_score: int           # 0-10
+    risk_score: int                 # 0-10
+    complexity_factors: {str: int}  # per-factor breakdown for reviewer inspection
+    risk_factors: {str: int}        # per-factor breakdown for reviewer inspection
+    estimated_loc: int              # estimated lines of code
+    estimated_duration_seconds: int # estimated wall-clock duration
+    estimated_worker_count: int     # planned worker nodes in DAG
+    estimated_tokens: int           # estimated total token consumption
+    target: str                     # "new-repo" | "existing-repo:<name>" | "control-plane"
+    target_rationale: str           # why the bundler chose this target
+    concerns: [str]                 # bundler's concerns section, required non-empty
+
+  # POPULATED AT COMPLETION TIME (terminal state)
   outcome:
-    status: shipped | parked | killed | failed_verification | aborted
-    rationale: "<human-readable explanation of the outcome>"
+    status: enum                    # shipped | parked | killed | failed_verification | aborted | rejected
+    rationale: str                  # human-readable explanation
 
   product_artifacts:
     spawned_repos:
-      - name: <repo name>
-        url: <github url>
-        registry_entry: <key in memory/products/registry.json>
+      - name: str                   # repo slug
+        url: str                    # full GitHub URL
+        registry_key: str           # key in memory/products/registry.json
     merged_prs:
-      - repo: <repo name>
-        pr_number: <int>
-        pr_url: <github url>
-        merge_commit: <sha>
+      - repo: str                   # repo slug
+        pr_number: int
+        pr_url: str
+        merge_commit_sha: str
 
   artifact_manifest:
-    published_global_artifacts:
-      - descriptor: {namespace: global, name: <string>, version: <string>, content_type: <string>}
-        hash: <blaake3 hex>
-    bundle_artifact_index: <artifact descriptor for the index of all bundle-scoped artifacts>
+    global_artifacts_published:
+      - descriptor: {namespace: str, name: str, version: str, content_type: str}
+        hash: str                   # BLAKE3 hex
+    bundle_artifact_index_ref: str  # artifact descriptor for the index of all bundle artifacts
 
   verification:
-    plan_ref: <artifact descriptor pointing to the Verification Plan>
-    report_ref: <artifact descriptor pointing to the Verification Report>
-    outcome: passed | failed | partial
-    failed_criteria: [<criterion>, ...]
-    rollback_triggered: true | false
-    rollback_bundle_id: <ULID or null>
+    plan_ref: str                   # artifact descriptor for the Verification Plan
+    report_ref: str | null          # artifact descriptor for the Verification Report
+    outcome: enum | null            # passed | failed | partial | null (if not yet verified)
+    failed_criteria: [str]          # list of failed acceptance criteria
+    rollback_triggered: bool
+    rollback_bundle_id: str | null  # ULID of the rollback bundle if spawned
 
+  # POPULATED INCREMENTALLY DURING EXECUTION, FINALIZED AT COMPLETION
   calibration:
-    axes:
-      complexity:
-        estimated: <int>
-        actual: <float>
-      risk:
-        estimated: <int>
-        actual: <float>
-      code_surface:
-        estimated_lines: <int>
-        actual_lines: <int>
-      agent_iterations:
-        estimated: <int>
-        actual: <int>
-      wall_clock:
-        estimated_minutes: <int>
-        actual_minutes: <int>
-      blast_radius:
-        predicted: <string>
-        realized: <string>
-    divergence_threshold_exceeded: [<axis name>, ...]
+    actual_loc: int
+    actual_duration_seconds: int    # active worker time, excluding pause time
+    actual_worker_count: int        # total workers spawned (including retries)
+    actual_tokens: int
+    retry_count: int
+    expansion_count: int            # number of dynamic expansions that occurred
+    divergence_threshold_exceeded: [str]  # list of axis names exceeding 50% divergence
 
   cost:
     llm_tokens:
-      input_total: <int>
-      output_total: <int>
-      by_model: {<model>: {input: <int>, output: <int>}}
-    worker_count: <int>
-    worker_hours_total: <float>
-    peak_ram_bytes: <int>
-    peak_disk_bytes: <int>
+      input_total: int
+      output_total: int
+      by_model: {str: {input: int, output: int}}
+    worker_hours_total: float
+    peak_ram_bytes: int
+    peak_disk_bytes: int
 
   memory_pointers:
-    decision_artifact: <path in memory/decisions/>
-    post_mortem_artifact: <path in memory/post-mortems/ or null>
-    calibration_append: <path in memory/calibration/>
-    security_findings: [<path in memory/security-findings/>, ...]
+    decision_ref: str               # path in memory/decisions/
+    post_mortem_ref: str | null     # path in memory/post-mortems/ or null
+    calibration_ref: str            # path in memory/calibration/
+    security_findings_refs: [str]   # paths in memory/security-findings/
 
   steering_events:
-    pause_count: <int>
-    redirect_count: <int>
-    modification_count: <int>
-    mid_flight_approvals: [<approval_decision summary>, ...]
+    pause_count: int
+    redirect_count: int
+    modification_count: int
+    mid_flight_decisions:           # reviewer actions during execution
+      - action: str                 # pause | resume | redirect | abort
+        at: str                     # ISO8601
+        by: str                     # identity string
+        note: str | null
 
-  metadata:
-    bundle_id: <ULID>
-    completed_at: <ISO8601 timestamp>
-    total_wall_clock_seconds: <int>
+  identity:
+    bundle_id: str                  # ULID
+    created_at: str                 # ISO8601
+    completed_at: str               # ISO8601, set at terminal transition
+    total_wall_clock_seconds: int   # created_at to completed_at, includes pause time
 ```
 
-**`outcome`** is the headline. Five terminal statuses. `shipped` means the work was merged or the repo was created and verification passed. `parked` means the bundle was completed (code written, PRs opened) but deliberately not merged; the work is preserved on its feature branch for later. `killed` means the work was discarded; the killed-bundle archive in `memory/killed/` preserves the full proposal and execution record. `failed_verification` means execution completed but post-execution QA failed and rollback was either not possible or not configured. `aborted` means the reviewer killed the bundle mid-flight. `rejected` is a pre-execution terminal state that exits before producing a full output record; rejected bundles get a lightweight outcome record with only `status: rejected` and `rationale`, stored in the `bundles` table row.
+**Population lifecycle:**
 
-**`product_artifacts`** is the concrete deliverable record. `spawned_repos` lists every repo created by this bundle (usually zero or one; cross-target bundles are not supported in v1.1). `merged_prs` lists every PR that was merged, in the control-plane or in any product repo.
+**At proposal time** (before the bundle reaches the approval matrix): the `proposal` block is fully populated by the bundler. The `identity.bundle_id` and `identity.created_at` are already set by the orchestrator from input receipt. All other blocks are empty or null.
 
-**`artifact_manifest`** provides discoverability. `published_global_artifacts` is the bundle's contribution to the global namespace; future bundles consult this to find persistent outputs. `bundle_artifact_index` is a single JSON artifact listing every bundle-scoped artifact produced during execution.
+**During execution**: the `calibration` block fields are updated after each worker completes (loc, duration, tokens, retries, expansions are accumulated). The `steering_events` block is updated on each mid-flight reviewer action. The `cost` block is accumulated as workers consume resources. These are written to the `bundles` row's `outcome_json` column on each update, inside the same SQLite transaction as the triggering event.
 
-**`verification`** captures the QA handoff. `plan_ref` and `report_ref` point into `memory/verification-plans/` and `memory/executions/<bundle-id>/verification-report.json` respectively. `rollback_triggered` and `rollback_bundle_id` record whether verification failure initiated an automatic or manual rollback.
+**At terminal state**: all remaining fields are populated. `outcome`, `product_artifacts`, `artifact_manifest`, `verification`, and `memory_pointers` are finalized. `identity.completed_at` and `identity.total_wall_clock_seconds` are set.
 
-**`calibration`** is the feedback data the calibration loop consumes. Each axis records the bundler's estimate (from the proposal) and the actual (measured from execution). Axes whose divergence exceeds 50% are listed in `divergence_threshold_exceeded`, which triggers the post-mortem prompt. The calibration data is appended to `memory/calibration/scoring-outcomes.jsonl` by the orchestrator on bundle completion.
+**Approval surface rendering per tier:**
 
-**`cost`** is the resource consumption record. v1.1 has no cost ceiling (token spend is flat-rate and compute is owned hardware), so cost is recorded for calibration rather than enforcement. `by_model` breaks down token consumption so the operator can reason about model-specific cost tradeoffs.
+The approval surface (MCP resource `studio://bundles/{id}`, GitHub Issue body, CLI `studio show`) renders different subsets of the output depending on tier:
 
-**`memory_pointers`** are the durable artifact references. The decision artifact is always written (even for auto-approved bundles; a one-line decision is still a decision). The post-mortem artifact exists only when divergence exceeded threshold.
-
-**`steering_events`** records mid-flight interventions. A bundle that was paused three times and redirected twice is a calibration signal.
-
-**`metadata`** closes the lifecycle loop. `bundle_id` matches the id in the `bundles` table. `completed_at` is the timestamp of terminal transition. `total_wall_clock_seconds` is the clock time from `in_progress` to terminal state, including pause time; it's distinct from `calibration.wall_clock.actual_minutes` which measures active worker time.
+- **Auto-approve tier**: `bundle_id`, `created_at`, `proposal.complexity_score`, `proposal.risk_score`, `proposal.target`, `proposal.concerns` (truncated to first 3). A single sentence summary: "Bundle <id> auto-approved: <target> change scored C=<n> R=<n>."
+- **Summary tier**: All of `proposal` block. `outcome` if terminal. `calibration` divergence flags if any. `verification.outcome` if complete. Does not include full `cost` breakdown, full `artifact_manifest`, or `memory_pointers`.
+- **Full review tier**: The complete `bundle_output`, including all pre-execution track findings (adversarial, security, verification plan) inlined into the proposal body. The reviewer sees every field.
+- **Full review with cooldown**: Same as full review, with the cooldown timer displayed prominently.
 
 ### The `target:` field
 
-The `target:` field declares where the bundle's output should land. Three values are defined: `new-repo`, `existing-repo:<name>`, and `control-plane`. The field is set by the bundler during planning, informed by the optional `target_hint` in the bundle input. It is reviewable and overridable by the human during approval; the human's override takes precedence.
+The `target:` field declares where the bundle's output lands. Three values: `new-repo`, `existing-repo:<name>`, `control-plane`. This section specifies the decision rule, the control-plane/product boundary, the mechanics for each value, approval matrix interaction, and cross-target policy.
 
-**Three values, when each applies, decision rule.** `new-repo` applies when the bundle introduces a new product: a distinct deployable, ownable, versioned thing that does not belong inside an existing repo. The decision rule: if the bundle's primary deliverable is a new service, a new frontend, a new tool, or a new self-contained system, it gets `new-repo`. If the bundle's primary deliverable is a modification to an existing product, it gets `existing-repo`. This is deliberately fuzzy at the boundary, and the bundler escalates ambiguous cases to the reviewer as a concern rather than guessing. `existing-repo:<name>` applies when the bundle modifies a product that already has a repo. The `<name>` is the repo slug as recorded in `memory/products/registry.json`. If the name does not exist in the registry, the bundler treats it as a concern. `control-plane` applies when the bundle's work is entirely internal to the orchestrator's own repo: modifications to `AGENTS.md`, capability manifest, settings, agent prompts, orchestrator code, memory layout, templates, CI workflows, or documentation that lives alongside the orchestrator.
+#### Decision rule: how `target:` is set
 
-**Who sets the field.** The bundler computes `target:` as part of planning. The human can override it during approval via any surface. If the human sets a target that contradicts the proposal's content, the bundler revises the proposal to match on the next planning pass.
+The `target:` field is set by the **bundler during planning**. The submitter may provide a `target_hint` in the bundle input; this is advisory. The bundler follows this algorithm:
 
-**Control-plane vs. product content boundary.** Control-plane content is anything that constitutes the orchestration system itself: bundle proposals and RFCs, decision records, the Review Deck and its artifacts, memory directories, the capability manifest, agent prompt templates and system prompts, orchestrator source code and configuration, worker base-image Dockerfiles, repo templates, GitHub Actions workflows for the control-plane repo, the MCP server implementation, and documentation about the orchestration system. Product content is anything that ships as part of a product: application source code, product tests, product CI workflows, product Dockerfiles, product documentation, product configuration, product data models and migrations, and product-specific agent memory (`AGENTS.md` at the product repo root).
+```python
+def determine_target(input: BundleInput, proposal: BundleProposal) -> tuple[str, str]:
+    """Returns (target_value, rationale_string)."""
+    hint = input.target_hint
 
-Ambiguous content is resolved as follows. Agent prompt templates that customize behavior for a specific product are product content but live in the control-plane under `memory/products/<product-slug>/agent-overrides.yaml`. This keeps agent configuration centrally manageable while scoping overrides to specific products. Repo templates (`templates/new-product-repo/`) are control-plane content that instantiates into product repos at creation time; the template is control-plane, the instantiated copy is product. Modifications to the template affect future products, not existing ones.
+    # Step 1: classify the work
+    is_new_product = proposal_creates_new_deployable_unit(proposal)
+    modifies_existing = references_existing_repo_in_registry(proposal)
+    is_control_plane_only = all_changes_are_control_plane_content(proposal)
 
-**New-repo flow end to end.** Creating a new product repo is a multi-step flow gated by mandatory review:
+    # Step 2: resolve classification against hint
+    if hint is None:
+        if is_new_product and not modifies_existing:
+            return ("new-repo", "bundle creates a new deployable product")
+        elif modifies_existing and not is_new_product:
+            repo = resolve_existing_repo(proposal)
+            return (f"existing-repo:{repo}", f"bundle modifies existing repo '{repo}'")
+        elif is_control_plane_only:
+            return ("control-plane", "all changes are internal to the control plane")
+        else:
+            raise AmbiguousTargetError(
+                "cannot determine target automatically",
+                candidates=["new-repo", "control-plane", "existing-repo:..."]
+            )
 
-1. **Approval.** The bundle is approved with `target: new-repo`. This is a mandatory-review trigger, so the bundle always goes to full human review regardless of complexity and risk scores.
-2. **Repo name resolution.** The bundler proposes a repo name (slug derived from the bundle title, configurable naming convention from `settings.json`). The reviewer can override during approval. The orchestrator checks GitHub for name collisions before creation.
-3. **Scaffolding.** The first worker task in the DAG checks out `templates/new-product-repo/` from the control-plane repo and instantiates it into a new directory. Template variables (product name, description, initial version, originating bundle id) are substituted. The scaffold includes: `README.md`, `docs/`, `INSTALL.md`, `DEPLOY.md`, `AGENTS.md` (pre-populated with the product description and a pointer to the originating bundle), `LICENSE`, `.github/` (issue templates, PR template, CODEOWNERS with the reviewer as default owner, branch protection config), `CHANGELOG.md` with the initial entry auto-generated from the bundle's RFC, a working CI pipeline, and a reproducible deploy mechanism.
-4. **Repo creation.** The orchestrator calls the GitHub API (using the GitHub App installation token) to create the repo under the configured org, with the configured default visibility. The scaffold is pushed as the initial commit on `main`.
-5. **Branch protection.** The orchestrator configures branch protection on `main`: require pull request reviews, require status checks, require conversation resolution, prohibit force pushes and deletions.
-6. **Registry update.** The orchestrator appends an entry to `memory/products/registry.json`: `{product_slug, repo_name, repo_url, originating_bundle_id, created_at, status: "active"}`.
-7. **Product development.** Subsequent worker tasks in the same bundle develop the product code in the new repo, using the per-worker-branch and DAG-order-merge mechanics.
-8. **Verification.** The QA agent verifies the product in the new repo post-execution.
+    # Step 3: hint provided, check coherence
+    if hint == "new-repo":
+        if modifies_existing and not is_new_product:
+            return ("existing-repo:...", "target_hint was 'new-repo' but bundle modifies existing repo; overridden")
+        return ("new-repo", "matches target_hint: creates new deployable product")
 
-If the bundle is aborted after repo creation but before completion, the repo is left in place (it has the scaffold and whatever partial work was committed to feature branches). The repo's status in the registry is set to `abandoned`. A follow-up bundle can target the abandoned repo with `target: existing-repo:<name>` to continue the work.
+    elif hint.startswith("existing-repo:"):
+        repo_name = hint.split(":", 1)[1]
+        if not repo_exists_in_registry(repo_name):
+            raise InvalidTargetError(f"target_hint references non-existent repo '{repo_name}'")
+        return (hint, f"matches target_hint: modifies '{repo_name}'")
 
-**Existing-repo and control-plane flows.** `existing-repo:<name>` follows the standard execution flow: workers operate on per-worker branches off a bundle base branch in the target repo, integration proceeds in DAG order, and the final bundle branch is merged to the target repo's main branch on successful verification. The orchestrator validates that the named repo exists in `memory/products/registry.json` before starting execution. `control-plane` follows the same execution flow but with elevated caution: control-plane bundles are always mandatory-review, the orchestrator takes a snapshot of the control-plane repo's state as a global artifact before execution begins so rollback has a clean baseline independent of git history, and control-plane bundles can never auto-ship.
+    elif hint == "control-plane":
+        if not is_control_plane_only:
+            raise AmbiguousTargetError(
+                "target_hint is 'control-plane' but proposal includes non-control-plane changes",
+                candidates=["control-plane", "new-repo", "existing-repo:..."]
+            )
+        return ("control-plane", "matches target_hint: all changes are control-plane")
+```
 
-**Cross-target bundles: rejected for v1.1.** A bundle that modifies both the control-plane and a product repo, or that modifies two product repos, is not supported. The `target:` field is a single value, not a list. The most common case (capability addition paired with first use) is handled as two bundles with `related_bundle_ids` linking them; the reviewer approves both in sequence. The escape hatch: a `control-plane` bundle may modify `memory/products/<product-slug>/agent-overrides.yaml`, which is technically product-scoped content stored in the control-plane. The single-target constraint is a real limitation; multi-target bundles are deferred to v1.2.
+**Classification helpers:**
 
-**Approval matrix interaction.** Three interactions. First, `target: new-repo` is a mandatory-review trigger. Second, `target: control-plane` is already a mandatory-review trigger (modifying control-plane code) and can never auto-ship. Third, `existing-repo` targets inherit the product repo's risk profile through the security-sensitive path patterns in `settings.json`.
+`proposal_creates_new_deployable_unit(proposal) -> bool` returns True when the proposal's primary output is a new service, frontend, CLI tool, or other self-contained deployable. The bundler makes this call by analyzing the requirements: if the proposal describes a thing that has its own deploy step, its own port, its own data store, or its own user-facing surface distinct from existing products, it's a new deployable unit. Ambiguous cases are escalated to the reviewer.
+
+`references_existing_repo_in_registry(proposal) -> bool` returns True when the proposal explicitly names a repo from `memory/products/registry.json` as a modification target. The bundler checks the registry during planning.
+
+`all_changes_are_control_plane_content(proposal) -> bool` returns True when all files the proposal plans to touch are classified as control-plane content per the boundary specification below.
+
+`resolve_existing_repo(proposal) -> str` returns the repo slug. If the proposal references exactly one existing repo, that slug. If it references multiple, the bundler escalates (cross-target not supported).
+
+**When the bundler cannot determine the target**, it raises `AmbiguousTargetError` which is surfaced to the reviewer as a concern. The reviewer resolves by providing a specific target during approval or by issuing `/modify target: <value>`. The bundle stays in `in_review` until the target is resolved.
+
+#### Control-plane vs. product content boundary
+
+The boundary is a file-classification rule. An agent classifying a file as control-plane or product content applies this decision tree without judgment:
+
+**Control-plane content** (all of the following):
+- Any file under `specs/`, `design/`, `templates/`, `memory/` in the control-plane repo
+- `settings.json`, `settings.local.json`, `.claude/settings.json`
+- Any file under `.github/` in the control-plane repo
+- Orchestrator source code: any `.py` file under paths matching `orchestrator/`, `mcp_server/`, `worker_runner/`
+- Worker base-image Dockerfiles: any `Dockerfile` under `docker/`
+- Agent prompt templates: files matching `prompts/*.md` or `prompts/*.yaml` in the control-plane repo
+- Product-specific agent overrides: files under `memory/products/<slug>/agent-overrides.yaml` (these are product content semantically but live in the control-plane repo administratively; they are classified as control-plane for target-determination purposes)
+- The control-plane repo's own `AGENTS.md` at the repo root
+
+**Product content** (all of the following):
+- Any file in a product repo (any repo listed in `memory/products/registry.json`)
+- Application source code, tests, product Dockerfiles, product CI workflows
+- Product documentation: `docs/`, `README.md`, `INSTALL.md`, `DEPLOY.md`, `CHANGELOG.md` in a product repo
+- A product repo's `AGENTS.md` at the product repo root (distinct from the control-plane `AGENTS.md`)
+
+**Ambiguous cases resolved explicitly:**
+- **Agent prompts that are product-specific.** They live under `memory/products/<slug>/agent-overrides.yaml` in the control-plane repo. Classified as control-plane content because they are centrally managed configuration, not product source code. Modifying them requires a `control-plane` target bundle.
+- **Templates (`templates/new-product-repo/`).** These are control-plane content. When instantiated into a new product repo during new-repo flow, the instantiated copy becomes product content. Modifying templates requires a `control-plane` target bundle and affects only future product repos.
+- **Shared utility libraries.** If a library is used by multiple products, it belongs in its own product repo (`existing-repo:<library-name>`). If it's part of the orchestration system (e.g., a shared RPC client library used by workers), it's control-plane content.
+- **`AGENTS.md` files.** The `AGENTS.md` at the control-plane repo root is control-plane content. The `AGENTS.md` at each product repo root is product content. They are distinct files in different repos and are never confused.
+
+#### Mechanics per value
+
+##### `new-repo`
+
+**Worker class.** A `lightweight` worker executes the repo-creation sequence (does not need developer-class resources; it's making API calls and writing scaffold files). Capability grants needed:
+- `secrets: github-app-installation-token` (delivery: rpc)
+- `network: api.github.com` (egress, HTTPS)
+- `filesystem: write` to the worker's scratch directory for scaffold generation
+- `process.exec: git, gh` (for git operations)
+- `rpc.methods: [artifact.publish]`
+
+**Sequence:**
+
+1. **Repo name resolution.** The worker reads the bundle proposal's suggested repo name (the slug, derived from the bundle title per the naming convention in `settings.json`). The worker calls the GitHub API (`GET /repos/{org}/{slug}`) to check for name collisions. On collision: the worker appends a numeric suffix (`-2`, `-3`, ...) and re-checks until an available name is found. The resolved name is written to the proposal's `target` field (updated to `existing-repo:<resolved-slug>` after creation, but during execution the target remains `new-repo`).
+
+2. **Scaffold generation.** The worker checks out `templates/new-product-repo/` from the control-plane repo and instantiates it with template variable substitution:
+   - `{{PRODUCT_NAME}}` → human-readable name from the bundle title
+   - `{{PRODUCT_SLUG}}` → resolved repo slug
+   - `{{PRODUCT_DESCRIPTION}}` → first paragraph of the bundle RFC
+   - `{{ORIGINATING_BUNDLE_ID}}` → the bundle's ULID
+   - `{{CREATED_AT}}` → ISO8601 timestamp
+   - `{{DEFAULT_BRANCH}}` → "main"
+
+   The scaffold directory structure:
+   ```
+   <slug>/
+     README.md
+     docs/
+       architecture.md          # placeholder with bundle RFC summary
+       api-reference.md         # empty placeholder
+       data-model.md            # empty placeholder
+       decisions.md             # initialized with "Created by bundle <id>"
+     INSTALL.md
+     DEPLOY.md
+     AGENTS.md                  # pre-populated with product context
+     LICENSE                    # from template
+     .github/
+       ISSUE_TEMPLATE.md
+       PULL_REQUEST_TEMPLATE.md
+       CODEOWNERS               # populated per below
+       workflows/
+         ci.yaml                # lint + test + build pipeline
+     CHANGELOG.md               # initial entry from bundle RFC
+     docker-compose.yaml        # reproducible deploy mechanism
+   ```
+
+3. **CODEOWNERS population.** The `CODEOWNERS` file is generated with the following rules:
+   - `*` → the reviewer's GitHub username (from `settings.json` under `reviewer.github_username`)
+   - `.github/` → the reviewer's GitHub username
+   - The GitHub App bot identity is NOT added as a code owner, so bot-authored PRs are not auto-approved by CODEOWNERS
+
+4. **Repo creation.** The worker calls GitHub API:
+   ```
+   POST /orgs/{org}/repos
+   {
+     "name": "<slug>",
+     "description": "<first line of bundle RFC>",
+     "private": true,
+     "has_issues": true,
+     "has_projects": false,
+     "has_wiki": false,
+     "default_branch": "main",
+     "auto_init": false
+   }
+   ```
+   Authentication: GitHub App installation token fetched via `secrets.fetch("github-app-installation-token")`.
+
+5. **Initial push.** The worker initializes a git repo in the scaffold directory, adds all files, commits with message `"Initial scaffold from bundle <bundle-id>"`, and pushes to `main`:
+   ```
+   git init
+   git add -A
+   git commit -m "Initial scaffold from bundle <bundle-id>"
+   git remote add origin https://x-access-token:{token}@github.com/{org}/{slug}.git
+   git push -u origin main
+   ```
+
+6. **Branch protection.** The worker calls GitHub API:
+   ```
+   PUT /repos/{org}/{slug}/branches/main/protection
+   {
+     "required_status_checks": {"strict": true, "contexts": ["ci"]},
+     "enforce_admins": false,
+     "required_pull_request_reviews": {
+       "required_approving_review_count": 1,
+       "dismiss_stale_reviews": true,
+       "require_code_owner_reviews": true
+     },
+     "restrictions": null,
+     "allow_force_pushes": false,
+     "allow_deletions": false
+   }
+   ```
+
+7. **Registry update.** The worker publishes a `registry-update` artifact and the orchestrator appends to `memory/products/registry.json`:
+   ```json
+   {
+     "product_slug": "<slug>",
+     "repo_name": "<org>/<slug>",
+     "repo_url": "https://github.com/<org>/<slug>",
+     "originating_bundle_id": "<bundle-id>",
+     "created_at": "<ISO8601>",
+     "status": "active"
+   }
+   ```
+
+8. **Artifact publication.** The worker publishes a `new-repo-result` artifact: `{slug, url, clone_url, created_at}`, referenced by subsequent worker tasks in the same bundle that need to operate on the new repo.
+
+9. **Subsequent workers.** The remaining worker tasks in the bundle's DAG target the new repo. They clone it (via the GitHub App token), create per-worker branches off `main`, and follow the standard execution flow from Execution structure.
+
+**If the bundle is aborted after repo creation:** the repo is left in place with its scaffold and any partial feature branches. The registry entry's `status` is set to `abandoned`. A follow-up bundle can target the repo with `target: existing-repo:<slug>`.
+
+**New repo README reference to originating bundle:**
+```markdown
+# <product-name>
+
+<product-description>
+
+---
+*Created by [bundle <bundle-id>](<control-plane-repo-url>/issues/<issue-number>)*
+```
+
+##### `existing-repo:<name>`
+
+**Repo name resolution.** The `<name>` is resolved against `memory/products/registry.json` by exact match on `product_slug`. If the name does not exist in the registry, the orchestrator rejects the bundle at planning time with error: `INVALID_TARGET: repo "<name>" not found in memory/products/registry.json`. The registry is authoritative; a repo that exists on GitHub but not in the registry cannot be targeted.
+
+**Execution flow.** Workers operate in the target product repo using the same pattern as the control-plane flow:
+- A bundle base branch is created off the target repo's default branch (`main`), named `bundle/<bundle-id>`.
+- Each worker gets its own worktree on a sub-branch: `bundle/<bundle-id>/worker-<n>`.
+- DAG-order merging proceeds identically: workers read from the merged state of their predecessors.
+- Final integration merge goes to `bundle/<bundle-id>`.
+- On verification pass, the bundle branch is merged to `main` via a PR (same as control-plane flow).
+
+**What's different from control-plane flow:** Nothing mechanical. The repo is different, the permissions are the same (the GitHub App has access to all repos in the org), and the worker lifecycle is identical. The difference is semantic: `existing-repo` bundles are product changes, not control-plane changes, so mandatory-review triggers for control-plane modification do not apply. The repo's own security-sensitive path patterns (from `settings.json`) determine whether the bundle gets the auth/billing/secrets/PII elevated review.
+
+##### `control-plane`
+
+**Execution flow.** The bundle operates against the control-plane repo itself. Mechanically identical to `existing-repo:<control-plane-slug>` except:
+
+1. **Pre-execution snapshot.** Before the first worker task begins, the orchestrator creates a `control-plane-snapshot` global artifact containing the full state of the control-plane repo at that moment (a tarball or git bundle of the current HEAD). This is stored with extended retention (90 days) and is distinct from git history, providing a clean rollback baseline.
+
+2. **Mandatory-review triggers.** In addition to the existing "modification to control-plane code or `settings.json`" trigger, the following are also mandatory-review for control-plane bundles:
+   - Any modification to `AGENTS.md` at the control-plane repo root
+   - Any modification to `memory/capabilities/manifest.md`
+   - Any modification to agent prompt templates (`prompts/*.md`, `prompts/*.yaml`)
+   - Any modification to worker base-image Dockerfiles (`docker/*`)
+   - Any modification to `templates/new-product-repo/`
+
+3. **No auto-ship.** Control-plane bundles can never auto-ship, regardless of complexity and risk scores. This is enforced by the approval matrix evaluator.
+
+#### Approval matrix interaction
+
+**`target: new-repo` is a mandatory-review trigger.** Added to the `mandatory_review_triggers` list in `settings.json`. Rationale: creating a repository is an irreversible namespace action (deleting a repo burns the URL and fragments clone history), changes the org's repo inventory permanently, and should always require explicit human consent.
+
+**`target: control-plane` triggers the existing mandatory-review rule** for "modifying control-plane code or `settings.json`." The additional control-plane triggers listed above extend this rule. All control-plane bundles are full human review, never auto-ship.
+
+**`target: existing-repo:<name>` does not trigger additional mandatory review** beyond what the bundle's content triggers (auth, billing, secrets, PII, etc.). The repo's security-sensitive path patterns in `settings.json` govern.
+
+#### Cross-target bundles: rejected for v1.1
+
+A bundle with a single `target:` value cannot modify files in both the control-plane and a product repo, nor in two product repos. This is an explicit constraint.
+
+**What the bundler does when an idea naturally spans both:**
+
+1. The bundler detects the cross-target scope during planning (the classification step in the decision rule algorithm).
+2. The bundler does NOT silently split the idea. It surfaces the cross-target scope as a concern: "This idea spans both the control-plane (adding a capability) and the api repo (using the capability). The system requires single-target bundles. Recommended: split into two bundles and link via related_bundle_ids."
+3. The reviewer sees the concern during approval. The reviewer can:
+   - Accept the recommendation: reject this bundle with `/reject split into two` and file two separate inputs.
+   - Force a single target: `/modify target: control-plane` to scope only the control-plane work, deferring the product work.
+   - Override: in v1.1, there is no override for cross-target. The system rejects cross-target bundles at schema validation.
+
+**Rationale.** Cross-target bundles complicate every lifecycle operation: approval (which repo's triggers?), execution (workers span repos, integration doesn't exist), rollback (rolling back one repo's changes while leaving the other creates an inconsistent state). The complexity is disproportionate to the use case volume in v1.1. The two-bundle workaround with `related_bundle_ids` covers the common case (capability plus first use).
+
+**Escape hatch.** A `control-plane` bundle may modify `memory/products/<slug>/agent-overrides.yaml`, which is product-specific configuration stored in the control-plane. This is the only sanctioned cross-cutting modification. The escape hatch is narrow and deliberately documented so the implementing agent doesn't generalize it.
 
 ### Bundle state machine
 
-The bundle state machine governs every transition a bundle can make between creation and terminal outcome. Twelve states, 25 legal transitions. Transitions are guarded; illegal transitions are rejected by the orchestrator and return errors to whoever requested them.
+The bundle state machine is the authoritative source for what transitions are legal, what triggers them, and what side effects they produce. It is implemented as a single Python class in the orchestrator core, `BundleStateMachine`, with one method per legal transition. Each method validates the current state, performs the transition inside a SQLite transaction, writes audit entries, and enqueues any required events to the executor's event pump.
 
-**States:**
+**States.** Twelve states. Each is a string enum value stored in `bundles.state`.
 
-| State | Description |
-|-------|-------------|
-| `proposed` | Bundler has produced a proposal; awaiting pre-execution review and approval |
-| `in_review` | Pre-execution review tracks are running; not yet at the approval matrix |
-| `approved` | Bundle has passed review and been approved; awaiting execution start |
-| `in_progress` | DAG executor is driving worker tasks |
-| `paused` | Execution is halted mid-flight; state is preserved, workers are idle |
-| `redirecting` | Paused bundle is being re-planned; new DAG being produced (transient) |
-| `verifying` | All worker tasks complete; QA agent is running post-execution verification |
-| `complete` | Terminal: bundle shipped successfully |
-| `parked` | Terminal: work completed but deliberately not merged; preserved for later |
-| `failed` | Terminal: execution or verification failed; partial state preserved for forensics |
-| `rejected` | Terminal: bundle was rejected during review; no execution occurred |
-| `aborted` | Terminal: reviewer killed the bundle mid-flight; partial state preserved |
+| State | Enum value | Description |
+|-------|-----------|-------------|
+| `PROPOSED` | `"proposed"` | Bundler has produced a proposal; awaiting pre-execution review |
+| `IN_REVIEW` | `"in_review"` | Pre-execution review tracks are running |
+| `APPROVED` | `"approved"` | Bundle passed review and approval; awaiting execution start |
+| `IN_PROGRESS` | `"in_progress"` | DAG executor is driving worker tasks |
+| `PAUSED` | `"paused"` | Execution halted; workers idle, state preserved |
+| `REDIRECTING` | `"redirecting"` | Paused bundle is being re-planned; transient |
+| `VERIFYING` | `"verifying"` | All workers complete; QA agent running post-execution verification |
+| `COMPLETE` | `"complete"` | Terminal: shipped successfully |
+| `PARKED` | `"parked"` | Terminal: work completed but not merged; preserved |
+| `FAILED` | `"failed"` | Terminal: execution or verification failed; partial state preserved |
+| `REJECTED` | `"rejected"` | Terminal: rejected during review; no execution |
+| `ABORTED` | `"aborted"` | Terminal: reviewer killed bundle mid-flight; partial state preserved |
 
-**Transition table:**
+**Transition table.** Each row is `(from_state, trigger, to_state, actor, side_effects)`. Every transition is one SQLite transaction.
 
-| From | To | Trigger | Actor |
-|------|----|---------|-------|
-| (start) | `proposed` | Bundle input received | Filer (human or agent) |
-| `proposed` | `in_review` | Bundler completes proposal | Bundler agent |
-| `in_review` | `proposed` | Review track finds blocking issue, returns for revision | Review track agent |
-| `in_review` | `approved` | Approval matrix returns approve, or human approves | Orchestrator or Reviewer |
-| `in_review` | `rejected` | Human rejects | Reviewer |
-| `approved` | `in_progress` | Orchestrator starts execution | Orchestrator |
-| `approved` | `rejected` | Reviewer rejects after approval but before execution start | Reviewer |
-| `in_progress` | `paused` | Reviewer issues Pause | Reviewer |
-| `in_progress` | `verifying` | All exit nodes reach terminal state | Orchestrator |
-| `in_progress` | `aborted` | Reviewer issues Abort | Reviewer |
-| `paused` | `in_progress` | Reviewer issues Resume | Reviewer |
-| `paused` | `redirecting` | Reviewer issues Redirect with new instructions | Reviewer |
-| `paused` | `aborted` | Reviewer issues Abort | Reviewer |
-| `redirecting` | `in_review` | Bundler completes re-plan | Bundler agent |
-| `redirecting` | `paused` | Reviewer issues Pause during re-planning | Reviewer |
-| `redirecting` | `aborted` | Reviewer issues Abort during re-planning | Reviewer |
-| `verifying` | `complete` | Verification passes, reviewer approves ship (or auto-ship criteria met) | QA agent + Orchestrator/Reviewer |
-| `verifying` | `parked` | Reviewer chooses to park rather than ship | Reviewer |
-| `verifying` | `failed` | Verification fails and rollback is not configured or not possible | QA agent |
-| `verifying` | `in_progress` | Verification fails, rollback bundle spawned (rollback is a new bundle; this bundle enters `failed` after rollback completes) | QA agent + Orchestrator |
-| `complete` | `in_progress` | Rollback triggered post-merge (rollback is a new bundle; this bundle stays `complete`) | Reviewer |
+| # | From | Trigger | To | Actor | SQLite writes | Event enqueued |
+|---|------|---------|----|-------|---------------|----------------|
+| 1 | (none) | `bundle_input_received` | `PROPOSED` | Orchestrator | INSERT `bundles` row, INSERT `audit_log` | (none) |
+| 2 | `PROPOSED` | `bundler_completed` | `IN_REVIEW` | Bundler agent | UPDATE `bundles.state`, UPDATE `bundles.proposal_json`, INSERT `audit_log`, INSERT pre-execution track dispatch records | `review_tracks_dispatched` |
+| 3 | `IN_REVIEW` | `review_tracks_completed` | `PROPOSED` | Review track agent (on finding blocking issue) | UPDATE `bundles.state`, UPDATE `bundles.concerns_json`, INSERT `audit_log` | (none) |
+| 4 | `IN_REVIEW` | `approval_matrix_approved` | `APPROVED` | Orchestrator (auto) or Reviewer (manual) | UPDATE `bundles.state`, UPDATE `bundles.approved_at`, UPDATE `bundles.approved_by`, INSERT `approval_decisions`, INSERT `audit_log` | (none) |
+| 5 | `IN_REVIEW` | `approval_matrix_rejected` | `REJECTED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `approval_decisions`, INSERT `audit_log` | (none) |
+| 6 | `APPROVED` | `execution_started` | `IN_PROGRESS` | Orchestrator | UPDATE `bundles.state`, INSERT `audit_log` | `bundle_execution_started` |
+| 7 | `APPROVED` | `reviewer_rejected` | `REJECTED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json` (superseding prior approve), INSERT `approval_decisions`, INSERT `audit_log` | (none) |
+| 8 | `IN_PROGRESS` | `reviewer_paused` | `PAUSED` | Reviewer | UPDATE `bundles.state`, INSERT `audit_log`, INSERT `steering_events` in `outcome_json` | `bundle_pause_requested` |
+| 9 | `IN_PROGRESS` | `all_exit_nodes_terminal` | `VERIFYING` | Orchestrator | UPDATE `bundles.state`, INSERT `audit_log` | `verification_requested` |
+| 10 | `IN_PROGRESS` | `reviewer_aborted` | `ABORTED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | `bundle_abort_requested` |
+| 11 | `PAUSED` | `reviewer_resumed` | `IN_PROGRESS` | Reviewer | UPDATE `bundles.state`, INSERT `audit_log`, INSERT `steering_events` in `outcome_json` | `bundle_resume_requested` |
+| 12 | `PAUSED` | `reviewer_redirected` | `REDIRECTING` | Reviewer | UPDATE `bundles.state`, INSERT `audit_log`, INSERT `steering_events` in `outcome_json` | `bundle_redirect_requested` |
+| 13 | `PAUSED` | `reviewer_aborted` | `ABORTED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | `bundle_abort_requested` |
+| 14 | `REDIRECTING` | `replan_completed` | `IN_REVIEW` | Bundler agent | UPDATE `bundles.state`, UPDATE `bundles.proposal_json` (new proposal), INSERT `audit_log`, INSERT re-plan provenance record | `review_tracks_dispatched` |
+| 15 | `REDIRECTING` | `reviewer_paused` | `PAUSED` | Reviewer | UPDATE `bundles.state`, INSERT `audit_log` | (none; re-plan discarded) |
+| 16 | `REDIRECTING` | `reviewer_aborted` | `ABORTED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | `bundle_abort_requested` |
+| 17 | `VERIFYING` | `verification_passed` | `COMPLETE` | QA agent + Orchestrator (or Reviewer for manual ship) | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json` (full), INSERT `audit_log`. If auto-ship: INSERT `approval_decisions` with `actor = "system"` | (none) |
+| 18 | `VERIFYING` | `reviewer_parked` | `PARKED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log`, INSERT `approval_decisions` | (none) |
+| 19 | `VERIFYING` | `verification_failed_no_rollback` | `FAILED` | QA agent | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | (none) |
+| 20 | `VERIFYING` | `verification_failed_auto_rollback` | `IN_PROGRESS` | QA agent + Orchestrator | UPDATE `bundles.state` (not terminal; rollback in flight), INSERT `audit_log` | `rollback_bundle_spawned` |
+| 21 | `VERIFYING` | `verification_failed_manual_rollback` | `IN_PROGRESS` | Reviewer | UPDATE `bundles.state`, INSERT `audit_log`, INSERT `approval_decisions` | `rollback_bundle_spawned` |
+| 22 | `COMPLETE` | `rollback_requested` | `COMPLETE` | Reviewer | (bundle stays COMPLETE; rollback is a new bundle), INSERT `steering_events` in original bundle's `outcome_json`, INSERT `audit_log` | `rollback_bundle_spawned` |
+| 23 | `FAILED` | `verification_retried` | `VERIFYING` | Reviewer | UPDATE `bundles.state`, INSERT `audit_log` | `verification_requested` |
+| 24 | `FAILED` | `reviewer_overridden` | `COMPLETE` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.outcome_json` (status changed to shipped with override note), INSERT `audit_log`, INSERT `approval_decisions` | (none) |
+| 25 | `IN_PROGRESS` | `bundle_failed_during_execution` | `FAILED` | Orchestrator (on unrecoverable DAG failure) | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | (none; in-flight workers left running per executor design) |
 
-Any transition not in the table is illegal. The orchestrator rejects illegal transitions with an error that includes the current state, the requested transition, and the reason. Examples: `approved → proposed` ("Bundle is approved; use /modify to revise before execution"), `complete → failed` ("Bundle is complete; transitions from terminal states are not allowed"), `proposed → in_progress` ("Bundle has not been reviewed. Wait for pre-execution review and approval."), `in_progress → approved` ("Bundle is executing. Pause first, then Redirect to re-plan.").
+**Transitions requiring special attention:**
 
-**Surface observability.** Every state transition is observable through all three surfaces. MCP: the `studio://bundles/{id}` resource reflects the current state on every fetch. GitHub Issues: the bundle's issue is updated on every state transition; the issue body reflects the current state and timeline; labels are updated to match (`state/proposed`, `state/in-review`, etc.). CLI: `studio show <bundle-id>` displays current state and transition history. Transitions are recorded in `audit_log` atomically with the state change in the same SQLite transaction.
+**Transition 3** (`IN_REVIEW → PROPOSED`): Triggered when a review track finds a blocking issue and the bundler must revise. Not the same as `/modify` (which is reviewer-initiated). The review track agent sets `bundles.concerns_json` with the blocking finding.
 
-**Triggering transitions from surfaces.** All three surfaces can trigger reviewer-initiated transitions. MCP triggers via tool calls (`approve_bundle`, `pause_bundle`, etc.). GitHub Issues triggers via comments (`/approve`, `/pause`, `/redirect [instructions]`, `/abort [reason]`, `/park [reason]`). CLI triggers via commands (`studio approve <id>`, `studio pause <id>`, etc.). For v1.1, all surfaces have equal authority.
+**Transition 8** (`IN_PROGRESS → PAUSED`): The `bundle_pause_requested` event triggers the Pause executor mechanics (see Mid-flight steering). The transition itself commits immediately; the pause may take seconds-to-minutes for in-flight workers to finish their current step.
+
+**Transition 14** (`REDIRECTING → IN_REVIEW`): The re-plan provenance record captures the relationship:
+```json
+{
+  "kind": "redirect_replan",
+  "prior_dag_hash": "<content hash of the pre-redirect DAG>",
+  "new_dag_hash": "<content hash of the post-redirect DAG>",
+  "completed_nodes_retained": ["<node_id>", ...],
+  "completed_nodes_discarded": ["<node_id>", ...],
+  "redirect_instructions": "<reviewer's instructions>",
+  "snapshot_artifact_ref": "<descriptor of the bundle-state-snapshot>"
+}
+```
+
+**Transition 20** (`VERIFYING → IN_PROGRESS`): Auto-rollback. The bundle enters `IN_PROGRESS` because rollback execution is happening. If rollback completes, the bundle transitions to `FAILED`. If rollback itself fails, the bundle transitions to `FAILED` with `rollback_failed: true` in `outcome_json`.
+
+**Transition 22** (`COMPLETE → COMPLETE`): Rollback of a shipped bundle. The bundle stays `COMPLETE` (it was shipped; the net is zero after rollback). The audit trail records the rollback.
+
+**Transition 25** (`IN_PROGRESS → FAILED`): Unrecoverable DAG failure during execution (not verification failure). Per the executor design, in-flight workers are NOT auto-cancelled. The reviewer can issue Abort to clean up.
+
+**Illegal transitions.** The state machine validates every requested transition. Illegal transitions raise `IllegalTransitionError`:
+```python
+class IllegalTransitionError(Exception):
+    def __init__(self, current_state: str, attempted_transition: str, reason: str):
+        self.current_state = current_state
+        self.attempted_transition = attempted_transition
+        self.reason = reason
+```
+
+Serialized for external surfaces as:
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32001,
+    "message": "illegal_transition",
+    "data": {
+      "current_state": "complete",
+      "attempted_transition": "approve",
+      "reason": "Bundle is complete; transitions from terminal states are not allowed."
+    }
+  },
+  "id": null
+}
+```
+
+The state machine validates by checking membership in a frozenset of `(from_state, to_state)` tuples. Common illegal transitions:
+
+| Attempted | Reason template |
+|-----------|----------------|
+| Any transition from a terminal state | "Bundle is {state}; transitions from terminal states are not allowed." |
+| `PROPOSED → IN_PROGRESS` | "Bundle has not been reviewed. Wait for pre-execution review and approval." |
+| `APPROVED → PROPOSED` | "Bundle is approved. Use /modify to revise before execution starts." |
+| `IN_PROGRESS → APPROVED` | "Bundle is executing. Pause first, then Redirect to re-plan." |
+| `PAUSED → VERIFYING` | "Bundle is paused. Resume or Redirect first." |
+
+**Surface observability.** SQLite: `bundles.state` is the authoritative source, updated in the same transaction as the transition. MCP: `studio://bundles/{id}` reads state directly. GitHub Issues: on every state transition, the bundle's issue is updated — body appends a transition timeline entry `"[{timestamp}] {from_state} → {to_state} by {actor} via {surface}"` and labels are swapped (old state label removed, new added: `state/proposed`, `state/in-review`, etc.). CLI: `studio show <bundle-id>` displays current state and transition history from `audit_log`.
+
+**Implementation notes.** The state machine does NOT mutate executor state directly. It enqueues events (`bundle_pause_requested`, `bundle_abort_requested`, etc.) into the executor's event queue. The executor's event pump picks up these events on the next tick and performs the executor-level actions. The bundle state machine and the DAG executor communicate through the event queue and SQLite, not through direct method calls. The two state spaces (bundle state and DAG node states) are in separate tables and are not locked together.
 
 ### Mid-flight steering mechanics
 
-The steering vocabulary (Pause, Redirect, Abort, Rollback) is accepted. This section specifies the executor's role in each. Rollback is addressed separately because it operates post-execution, not mid-flight.
+All four verbs (Pause, Redirect, Abort, Rollback) are PM-ratified. The state machine and executor communicate through the event queue and SQLite, not through direct method calls.
 
-**Pause.** The reviewer issues Pause via any surface. The orchestrator sends `worker.pause()` RPCs to all workers in state `running` or `ready` for this bundle. Each worker finishes its current step (the in-progress tool call, test run, or file write) and then halts; true mid-step checkpointing would require workers to understand checkpoint semantics, which is far more coupling than the kill-all-on-crash policy accepts. Workers in state `pending` are left `pending`. The scheduler is halted (no new nodes are dispatched from the ready set). The event pump continues to process events so in-flight steps reach completion, but new dispatches are suppressed. The pause event is written to `audit_log`. Each worker's state in `dag_nodes` is updated: `running → paused`. Worker worktrees are left intact.
+#### Pause
 
-Resume: the reviewer issues Resume via any surface, optionally with notes. Notes are injected into the orchestrator's context as a `reviewer_notes` field, visible to workers on their next task spec refresh. The orchestrator re-ticks the scheduler: the ready set is recomputed, paused workers transition `paused → running` and pick up where they left off. If the reviewer provides no notes, resume is a simple unpause. If the reviewer wants to change the DAG, they use Redirect, not Pause-with-notes.
+**Trigger:** Reviewer issues Pause from any surface. Legal from `IN_PROGRESS` only.
 
-**Redirect.** Redirect implies Pause (the bundle is paused first if not already paused), then re-plan. The design ratifies the natural answer: Redirect discards the current DAG and runs the planner on the current worktree state as a fresh bundle, with completed work as the baseline.
+**Complete sequence:**
 
-1. **Pause.** If not already `paused`, Pause is applied first.
-2. **Snapshot current state.** The orchestrator produces a `bundle-state-snapshot` artifact containing: the current worktree state (commits on branches, modified files, diff against base branch); the completed nodes from the prior DAG with their terminal states and output artifact references; the in-progress and pending nodes that will be discarded; and the prior proposal and DAG for the audit trail.
-3. **Transition to `redirecting`.** Transient state; the reviewer sees "redirecting..." in the surface.
-4. **Dispatch re-planning.** The orchestrator spawns a new planning task within the existing bundle's identity. The planner agent receives: the original bundle input, the reviewer's redirect instructions, the state snapshot artifact, and calibration data and relevant memory.
-5. **Produce new DAG.** The planner produces a new task DAG. Completed nodes from the prior DAG are referenced as baseline artifacts: if worker-3 completed successfully and its output is still valid under the new instructions, the new DAG references worker-3's artifacts and does not re-execute the work. The planner decides which completed work is reusable; the reviewer can override during re-approval.
-6. **Re-enter review.** The new DAG goes through pre-execution review tracks (abbreviated: only the delta from the prior review is examined unless the delta is large enough that the review track agents self-escalate to full re-review) and the approval matrix. The bundle transitions `redirecting → in_review`.
-7. **Resume execution.** On approval, the bundle transitions to `in_progress`. The executor ingests the new DAG, and execution proceeds from the new DAG's entry nodes.
+1. **State machine transition.** `bundles.state` transitions `IN_PROGRESS → PAUSED`. Commits immediately. `steering_events` in `outcome_json` records: `{action: "pause", at: <ISO8601>, by: <actor>, note: null}`. `bundle_pause_requested` event enqueued.
 
-Completed work is referenced via both artifact descriptors and branch state. The new DAG's capability manifests must be subsets of the bundle's original capability manifest; if the redirect instructions imply scope increase beyond the original manifest, the planner must request additional capabilities through the normal capability-request approval flow. The audit trail preserves the through-line via the bundle id: the original proposal, the redirect event, the state snapshot, the new proposal, and the new DAG are all linked to the same bundle id.
+2. **Executor receives event.** On next tick, the event pump processes `bundle_pause_requested`:
+   - Identifies all `dag_nodes` rows for this bundle in state `running`.
+   - Sends `worker.pause()` RPC to each such worker.
+   - Sets a `scheduler_halted` flag in the executor's in-memory state for this bundle (prevents new dispatches).
+   - The event pump continues to process other events (worker completions still arrive).
 
-**Abort.** The reviewer issues Abort from any non-terminal state. The bundle must be in `approved`, `in_progress`, `paused`, or `redirecting`. Abort from `proposed` or `in_review` is treated as Reject, not Abort.
+3. **Worker behavior.** On receiving `worker.pause()`:
+   - The worker finishes its current step (the in-progress tool call, test run, file write, or LLM API call).
+   - The worker does NOT checkpoint mid-step. Rationale: mid-step checkpointing requires workers to serialize and reconstitute state, which is more coupling than the kill-all-on-crash policy accepts.
+   - After completing the current step, the worker calls `worker.final_report` with a `{"paused": true, "current_phase": "<phase>", "progress": {...}}` payload, then halts.
+   - The worker does NOT exit the process. It stays alive, connected to the RPC channel, waiting for `worker.resume()`.
 
-The orchestrator sends `worker.cancel(reason="bundle_aborted")` to all workers in state `running` or `paused` for this bundle. The cancellation follows the protocol from DAG executor Aggregator mechanics: 30-second grace period, then SIGTERM, then SIGKILL after another 10 seconds. Workers that complete cleanly during the grace period transition to `cancelled`, not `failed`. Workers in state `pending` or `ready` are transitioned directly to `cancelled`.
+4. **Worker state updates.** As each worker completes its pause: `dag_nodes.state: running → paused`. `node_state_history` records: `{from_state: "running", to_state: "paused", reason: "bundle_paused"}`.
 
-Draft PRs opened by the bundle are closed with a comment: "Bundle aborted by reviewer. Feature branch `<branch>` is preserved for recovery." Worker worktrees are not deleted; they occupy disk space but preserve partial work for recovery. The periodic background sweep (Artifact Protocol) collects worktrees for aborted bundles after a configurable retention period (default 30 days). The bundle transitions to `aborted`. A lightweight outcome is written.
+5. **Surface state.** While workers are finishing their steps, the surface shows `PAUSED` state. The GitHub Issue body appends: "Pause requested. Waiting for N workers to finish current steps..." When all workers have paused: "Paused. All workers idle."
 
-What's preserved: commits on feature branches, artifact refs in `artifact_refs` (until the retention window expires), the full audit log. What's not preserved: capability grants made specifically for this bundle are revoked on Abort; in-flight RPC calls are abandoned; workers killed via SIGKILL lose uncommitted working state.
+**What is preserved:** All worker worktrees. All `dag_nodes` rows with current states. The SQLite database state. The bundle's feature branch.
 
-**Rollback.** Rollback is distinct from Abort because it operates post-merge or post-deploy, not mid-flight. Rollback is a new bundle, not a special bundle kind, not a direct action. The rationale: rollback touches the same repos, code paths, and deployment mechanisms as the original work, and needs capability grants, a task DAG, worker execution, and verification just like any other change. A rollback that fails is itself a failed bundle with its own post-mortem. The rollback bundle's input carries `parent_bundle_id` pointing to the bundle being rolled back.
+#### Resume (from Pause)
 
-Two trigger paths. Manual: the reviewer issues Rollback from any surface (`studio rollback <bundle-id>` or MCP equivalent). This creates a rollback bundle input and enters the normal bundle lifecycle. Automatic: post-execution verification fails, the failure meets the auto-rollback criteria (stakes are Low, rollback is machine-executable per the Verification Plan, and the Verification Plan declared auto-rollback eligibility), and the orchestrator spawns the rollback bundle automatically.
+**Trigger:** Reviewer issues Resume from any surface, optionally with a note string. Legal from `PAUSED` only.
 
-The rollback bundle's bundler reads the original bundle's Verification Plan (which includes the rollback plan) as a starting point but is not bound by it; if the plan says "revert commit X" but commit X now has conflicts, the bundler proposes an alternative. The rollback bundle has its own Verification Plan, which verifies that the rolled-back state matches the pre-merge state while preserving unrelated changes that landed after the original bundle.
+1. **State machine transition.** `bundles.state` transitions `PAUSED → IN_PROGRESS`. `steering_events` records: `{action: "resume", at: <ISO8601>, by: <actor>, note: "<note or null>"}`. `bundle_resume_requested` event enqueued.
 
-Verification-driven rollback: when the original bundle's post-execution verification fails and rollback is triggered, the original bundle's state after rollback depends on the rollback outcome. If the rollback bundle completes successfully, the original bundle stays in `complete` (it was shipped, then un-shipped) and the rollback event is appended to its `steering_events`. If the rollback bundle fails, the original bundle is annotated with a `rollback_failed` flag and the reviewer is paged via the notification surface.
+2. **Executor receives event.** On next tick:
+   - Reads the `steering_events` note from `outcome_json`.
+   - For each `dag_nodes` row in state `paused`, sends `worker.resume()` RPC.
+   - Removes `scheduler_halted` flag.
+   - Re-ticks the scheduler: recomputes ready set from current node states.
+
+3. **Worker behavior.** On receiving `worker.resume()`: reads its current task spec. If the executor's note is present, the worker prepends it to its working context (visible to the LLM on the next prompt). Resumes execution from where it paused.
+
+**Note delivery mechanism.** Notes are delivered via the `worker.resume()` RPC response, not via `worker.inject_context`. The `resume` RPC returns `{note: "<note or null>"}` alongside the standard ack.
+
+#### Redirect
+
+**Trigger:** Reviewer issues Redirect from any surface with a `new_instructions` string. Legal from `PAUSED` only. If bundle is in `IN_PROGRESS`, reviewer must Pause first.
+
+**Ratified design:** "Discard current DAG, run planner on current worktree state as fresh bundle, completed work as baseline."
+
+1. **State machine transition.** `bundles.state` transitions `PAUSED → REDIRECTING`. `steering_events` records: `{action: "redirect", at: <ISO8601>, by: <actor>, note: "<new_instructions>"}`. `bundle_redirect_requested` event enqueued.
+
+2. **Snapshot current state.** The executor produces a `bundle-state-snapshot` artifact containing:
+   - A git tree-ish reference: the merged state of all completed worker sub-branches, resolved to a concrete commit SHA. If no workers completed, the bundle base branch HEAD.
+   - A JSON manifest of all `dag_nodes` rows in terminal states (`completed`, `failed`, `skipped`, `cancelled`), each with: `node_id`, `terminal_state`, `output_artifacts`, and `branch_ref`.
+   - The prior DAG structure (nodes and edges) for the audit trail.
+
+3. **Re-planning dispatch.** The orchestrator spawns a new planning task within the existing bundle's identity. The planner agent receives:
+   - The original `bundle_input`.
+   - The reviewer's `new_instructions` (from the redirect steering event).
+   - The `bundle-state-snapshot` artifact reference.
+   - Memory context (calibration data, prior decisions) same as original planning.
+
+4. **Planner produces new DAG.** The planner evaluates which completed work is reusable. If the new instructions invalidate prior work, the new DAG includes replacement workers. The planner decides; the reviewer can override during re-approval.
+
+5. **Capability manifest constraint.** The new DAG's node capability manifests must be subsets of the original bundle manifest. If the new instructions require capabilities beyond the original manifest, the planner must request them via the capability-request flow. Redirect does not silently expand the capability envelope.
+
+6. **State machine transition.** On planner completion: `REDIRECTING → IN_REVIEW`. The new proposal replaces the old one in `bundles.proposal_json`. The re-plan provenance record (Transition 14) is written. `review_tracks_dispatched` event enqueued (abbreviated review: only the delta examined, unless review track agents self-escalate).
+
+7. **Approval and resume.** The new DAG goes through the approval matrix. Bundle transitions `IN_REVIEW → APPROVED → IN_PROGRESS` and execution resumes with the new DAG.
+
+**What "current worktree state" means concretely:** `git merge-base --octopus <worker-1-branch> <worker-2-branch> ...` to find the common ancestor of all completed work. If merge-base fails (rare), falls back to the last successfully merged integration point.
+
+#### Abort
+
+**Trigger:** Reviewer issues Abort from any surface. Legal from `APPROVED`, `IN_PROGRESS`, `PAUSED`, `REDIRECTING`. Abort from `PROPOSED` or `IN_REVIEW` is treated as Reject (Transition 5).
+
+1. **State machine transition.** `bundles.state` transitions to `ABORTED`. `bundles.completed_at` set. `bundles.outcome_json` populated with `{outcome: {status: "aborted", rationale: "<reason>"}}`. `steering_events` records: `{action: "abort", at: <ISO8601>, by: <actor>}`. `bundle_abort_requested` event enqueued.
+
+2. **Cancellation order: all simultaneously**, not reverse-DAG-order. The executor sends `worker.cancel(reason="bundle_aborted")` RPC to every worker with an active connection.
+   - 30-second grace period for worker to finish current step and commit.
+   - SIGTERM after grace.
+   - SIGKILL 10 seconds after SIGTERM.
+   - Workers in `ready`/`pending` (not yet spawned) transition directly to `cancelled` without RPC.
+   - Workers in `paused` (already idle) transition to `cancelled` without grace period.
+
+3. **Draft PR handling.** If the bundle opened draft PRs, the orchestrator closes them via `PATCH /repos/{org}/{repo}/pulls/{number} {"state": "closed"}` with comment: "Bundle aborted by reviewer. Feature branch `<branch>` is preserved for recovery."
+
+4. **Explicit preservation/revocation decisions:**
+   - `artifact_refs` rows: **preserved.** Remain until the aborted-bundle retention window expires and periodic GC sweep collects them.
+   - Capability grants made specifically for this bundle: **revoked.** `capabilities.revoked_at` and `capabilities.revoke_reason = "bundle_aborted"` set.
+   - `audit_log` entries: **never deleted.** Full audit trail from creation to abort is immutable.
+   - Git branches: feature branch and worker sub-branches remain. Not deleted by the system.
+   - In-flight RPC calls: abandoned. Workers killed via SIGKILL lose uncommitted working state.
+
+#### Rollback
+
+**Design decision: rollback is a new bundle**, not a special bundle kind, not a direct orchestrator action.
+
+**Rationale.** Rollback is a software change like any other: it touches the same repos, code paths, and deployment mechanisms as the original work. It needs capability grants, a task DAG, worker execution, and verification. A rollback that fails is itself a failed bundle with its own post-mortem. This handles trivial and nontrivial rollbacks uniformly.
+
+**Trigger paths:**
+
+1. **Manual.** Reviewer issues Rollback: `studio rollback <bundle-id>`. Creates a `bundle_input` with `parent_bundle_id = <bundle-id>`, `filed_via = <cli|mcp|github_issue>`. Enters normal bundle lifecycle.
+
+2. **Automatic on QA verification failure.** Triggered when ALL of:
+   - Verification Report outcome is `failed` or `partial`
+   - Bundle's stakes are `Low`
+   - Verification Plan's `rollback_plan.machine_executable` is `true`
+   - Verification Plan's `rollback_plan.auto_rollback_eligible` is `true`
+   
+   When all conditions met, the orchestrator auto-creates the rollback bundle input (`filed_by = "system"`, `filed_via = "agent_generated"`). Auto-approved and executes immediately.
+
+**What the rollback executor runs:** The rollback bundle's bundler reads the original bundle's rollback plan:
+```yaml
+rollback_plan:
+  machine_executable: bool
+  auto_rollback_eligible: bool
+  steps:
+    - description: str
+      kind: git_revert | api_call | deploy_previous | manual
+      spec: { ... }
+```
+The bundler translates this into a task DAG. For `git_revert`, the worker runs `git revert <merge-commit>`. For `deploy_previous`, the worker re-deploys the previous known-good artifact. The bundler is not bound by the plan; if the plan says "revert commit X" but commit X has conflicts, the bundler proposes an alternative.
+
+**How rollback is verified:** The rollback bundle gets its own Verification Plan. The QA agent checks: the rolled-back state matches pre-original-bundle state for touched files, unrelated changes are preserved, and the rolled-back product passes the same CI and smoke tests.
+
+**Terminal states after rollback:**
+- **Successful:** Original bundle stays `COMPLETE`. Rollback event appended to its `steering_events`. Rollback bundle completes with `outcome: shipped`.
+- **Failed:** Original bundle annotated with `rollback_failed: true`. Reviewer paged. Rollback bundle completes with `outcome: failed`.
+- **Auto-rollback:** Original bundle transitions `VERIFYING → IN_PROGRESS` (Transition 20) during rollback, then to `FAILED` when rollback completes. Original bundle's `outcome_json.verification.rollback_triggered` is `true`.
 
 ### Post-execution verification handoff (QA dual-use seam)
 
@@ -2070,15 +2520,13 @@ These are known gaps. Each will need its own design pass before it's implementat
 
 **Rollback bundle calibration as a separate tracking class.** Rollback bundles are bundles and get calibration data like any other. Whether they should be tracked as a separate class (do rollback bundles have systematically different complexity vs. actual profiles?) is a future question.
 
+**Auto-rollback eligibility for medium-stakes bundles.** Currently restricted to Low-stakes bundles. Expanding to medium-stakes is gated on empirical rollback reliability data. Blocker: no production data exists in v1.1. Provisional: Low-stakes only until rollback bundles demonstrate >95% success rate over at least 20 rollbacks.
+
 ## Open questions and flagged decisions
 
-Items where the design has punted, raised a concern, or made a call that should be revisited.
+Items where the design has punted, raised a concern, or made a call that should be revisited. Four open questions were ratified by the PM during the bundle lifecycle completion design pass: pre-execution review ordering (confirmed), modification re-scoring (yes, always), steering vocabulary (all four verbs ratified), and default action for summary-tier timeouts (default-hold across the board). These are no longer open.
 
 **Provisional wall-clock and heartbeat numbers.** First-run timeout defaults of 2 hours for small tasks, 4 hours for medium, 8 hours for large. 60-minute maximum heartbeat interval. These are explicitly provisional; they need to survive first contact with real workloads before being ratified.
-
-**Default-approve window of 4 hours.** The value was chosen to balance velocity with intervention opportunity, but it's a Review Deck v1 numeric interacting with a v1.1 approval matrix. The interaction was not formally analyzed in v1; track as calibration data and revisit after 30 days of live operation.
-
-**1-hour cooldown with irreversible carve-out at 24 hours.** The distinction between "high risk" and "irreversible" is a new concept introduced by the bundle lifecycle design. The `irreversible` flag's definition ("rollback is not machine-executable and manual recovery would require >1 hour") is a first draft. Needs calibration against real bundles.
 
 **Verification-driven auto-rollback criteria.** Three conditions: stakes Low, rollback machine-executable, and auto-rollback declared in the Verification Plan. The "stakes Low" condition means auto-rollback never fires for medium or high-stakes bundles, which is conservative. If auto-rollback proves reliable in practice (the rollback bundle succeeds >95% of the time), expanding to medium-stakes bundles is a calibration-driven decision.
 
@@ -2097,8 +2545,6 @@ Items where the design has punted, raised a concern, or made a call that should 
 **Bundle-failure cancellation policy.** When a bundle is marked `failed` due to a node failure, the executor leaves still-running in-flight nodes alone. The rationale is preserving partial work for recovery and reviewer inspection. The cost is that worker budget is consumed by work whose output may no longer be useful. Whether to add a soft-abort policy (cancel in-flight nodes when the bundle is committed-failed) is in deferred items but worth flagging here as a real trade.
 
 **Mermaid rendering frequency.** The mermaid is cheap to re-render but it does run on every MCP resource fetch and GitHub comment update. For large DAGs (hundreds of nodes after aggressive expansion), even cheap rendering could become a noticeable hit on the orchestrator's main loop. Caching with state-hash invalidation is straightforward to add if it becomes a problem; not done in v1.1.
-
-**Cross-target bundles rejected for v1.1.** The limitation is real and the two-bundle workaround with `related_bundle_ids` is clunky. If the capability-plus-first-use pattern is common, a v1.2 design pass should revisit with a concrete proposal for multi-target DAGs and cross-repo integration steps.
 
 ## Rejected alternatives
 
@@ -2202,7 +2648,9 @@ The prior conversation accumulated several silent supersessions and scope creeps
 
 **Areas the next design phase should plan to address.**
 
-The DAG executor, artifact protocol, bundle lifecycle, I/O schema, and target field semantics, the largest deferred chunks from the initial v1.1 consolidation, are now specified. The remaining deferred items are narrower in scope; the largest is the schema versioning policy, followed by the capability manifest review UX.
+The DAG executor, artifact protocol, bundle lifecycle, I/O schema, and target field semantics — the largest deferred chunks from the initial v1.1 consolidation — are now fully specified at machine-readable precision (typed schemas, enumerable state transitions, named error cases). The remaining deferred items are narrower in scope; the largest is the schema versioning policy, followed by the capability manifest review UX.
+
+One integration note: the Architecture section's state machine reference (line 175) summarizes the 12-state/25-transition model. The SQLite schema comment for `bundles.state` at line 92 already enumerates all 12 states.
 
 The next major architectural addition beyond the deferred items is the k8s deployment target and its associated work (Helm chart, NetworkPolicies, PodSecurityStandards, image signing, S3-backed artifact store), which is gated on the k8s milestone rather than on design completion.
 
