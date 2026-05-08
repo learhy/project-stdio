@@ -409,7 +409,7 @@ Reconciliation is idempotent. Running it twice on the same SQLite state produces
 
 ## 9. CLI surface
 
-Seven commands:
+Eight commands:
 
 **`studio submit <path>`**
 Reads the submission JSON, validates it, creates a `bundles` row in `PROPOSED` state, and prints the bundle ID.
