@@ -89,7 +89,7 @@ The schema sketch (subject to refinement in implementation):
 CREATE TABLE bundles (
   id TEXT PRIMARY KEY,             -- ULID
   repo TEXT NOT NULL,
-  state TEXT NOT NULL,             -- proposed|approved|in_progress|verifying|complete|failed|rejected
+  state TEXT NOT NULL,             -- proposed|in_review|approved|in_progress|paused|redirecting|verifying|complete|parked|failed|rejected|aborted
   tier TEXT NOT NULL,              -- auto|auto_notify|summary|full_review|full_review_cooldown
   complexity_score INTEGER,
   risk_score INTEGER,
@@ -172,23 +172,7 @@ Large fields are JSON because their internal schema will evolve. SQLite's JSON1 
 
 The DAG executor adds further tables (`dag_nodes`, `dag_edges`, `node_state_history`, `dag_expansions`, `approval_requests`, `artifact_refs`) covering DAG state, transition history, expansion provenance, the unified approval-request lifecycle, and the executor's view of artifact publication. Those are specified in the DAG executor section; the artifact metadata schema backing `artifact_refs` is specified in the Artifact Protocol section.
 
-**Bundle state machine.** Transitions are guarded; illegal transitions are rejected by the orchestrator and return errors to whoever requested them. The transitions:
-
-```
-proposed ─approve──→ approved ─start──→ in_progress ─workers_done──→ verifying
-   │                    │                   │                            │
-   │                    │                   │                            ├─verify_pass─→ complete
-   ├─reject──→ rejected │                   │                            └─verify_fail─→ failed
-   │                    │                   │
-   └─modify──→ proposed │                   └─pause──→ paused ─resume──→ in_progress
-   (revised)            │                                │
-                        │                                └─kill──→ failed
-                        └─pause──→ paused ─resume──→ approved
-                                     │
-                                     └─kill──→ failed
-```
-
-Every transition writes to `audit_log` and (if human-driven) to `approval_decisions`.
+**Bundle state machine.** The bundle state machine is fully specified in Bundle lifecycle: execution and integration. In summary: twelve states (`proposed`, `in_review`, `approved`, `in_progress`, `paused`, `redirecting`, `verifying`, `complete`, `parked`, `failed`, `rejected`, `aborted`) with 25 legal transitions. Transitions are guarded; illegal transitions are rejected by the orchestrator and return errors to whoever requested them. Every transition writes to `audit_log` and (if human-driven) to `approval_decisions`. The mid-flight steering states (`paused`, `redirecting`) and the parked terminal state were added during the bundle lifecycle design pass; the original sketch had only eight states.
 
 **Crash recovery.** On orchestrator startup, the policy is kill-all rather than try-to-resume in-flight workers. Reconstructing live worker connections and reattaching to running subprocesses is genuinely hard to get right and the failure modes are nasty. Restarts of a stable service should be rare (deploys, kernel upgrades), and the cost of redoing in-flight bundle work is bounded. On startup the orchestrator scans for workers in state `running`, marks them failed with reason `orchestrator_crash`, transitions affected bundles accordingly, replays unread approval decisions from external surfaces (GitHub Issues comments, MCP-side decisions that hadn't been ACKed), and then opens the webhook endpoint and MCP socket. Bundles in `verifying` re-trigger verification, since verification is idempotent by design. The full reconciliation sequence (kill-all, reconcile node states, apply retry policies, replay approval decisions, re-trigger bundle reconciliation, open surfaces) is specified in the DAG executor section.
 
@@ -1496,11 +1480,62 @@ These items replace the current "Artifact protocol details" entry in the v1.1 De
 
 ## Bundle lifecycle: planning and approval
 
-A bundle is the unit of human approval and execution. Its lifecycle starts when an idea (from any source) is picked up by a bundler agent and ends when the work is shipped, parked, or killed. This section covers the planning and approval portion. The execution portion follows.
+A bundle is the unit of human approval and execution. Its lifecycle starts when an idea (from any source) is picked up by a bundler agent and ends when the work is shipped, parked, or killed. This section covers the planning and approval portion: the input schema, the bundler's planning job, the pre-execution review tracks and their integration with the approval matrix, modification requests and re-scoring, default actions, cooldown durations, and multi-surface race resolution. The execution portion follows.
+
+### Bundle input schema
+
+A bundle's inputs are the contract between whoever filed the work and the bundler agent that plans it. The task-level I/O spec in the Task DAG schema is the model: each task declares its inputs and outputs. The bundle-level schema mirrors that structure at a higher level of abstraction.
+
+```yaml
+bundle_input:
+  idea:
+    source: idea_forum | cli | mcp | github_issue | agent_generated
+    body: "<free-text request>"
+    title: "<optional one-line summary>"
+
+  structured_params:
+    target_hint: new-repo | existing-repo:<name> | control-plane | null
+    priority_hint: low | normal | high | null
+    deadline: <ISO8601 timestamp or null>
+    requested_capabilities: [<capability name>, ...]
+
+  parent_bundle_id: <ULID or null>
+
+  related_bundle_ids: [<ULID>, ...]
+
+  attachments:
+    - name: <string>
+      content_type: <mime-like>
+      data_ref: <artifact descriptor or null>
+      url: <string or null>
+
+  metadata:
+    filed_by: <identity string>
+    filed_at: <ISO8601 timestamp>
+    filed_via: idea_forum | cli | mcp | github_issue | agent_generated
+```
+
+**`idea`** is the only required field. The `source` discriminator tells the bundler what kind of material it's working with: a one-line CLI request gets different treatment than a structured GitHub Issue with reproduction steps, and an agent-generated proposal (a follow-up bundle triggered by an Investigate decision on a capability request) carries its own framing. The `body` is free-text and deliberately unstructured; the bundler's job is to turn it into a structured proposal.
+
+**`structured_params`** is optional and advisory. The three hints (target, priority, deadline) let the human steer without committing. The bundler may override any hint if the resulting proposal would be incoherent; override reasons are surfaced in the proposal's concerns section. `requested_capabilities` is an early signal: "I think this will need a new API key for SendGrid." The bundler treats these as suggestions, not grants; the capability request still goes through the normal approval flow.
+
+**`parent_bundle_id`** captures lineage. When a bundle is spawned from an Investigate decision on a capability request, or when an agent proposes follow-up work after completing a bundle, the parent link preserves the through-line. It is not a scheduling dependency; it is provenance metadata. A bundle with a parent is otherwise independent.
+
+**`related_bundle_ids`** is a looser reference: "this is like bundle X" or "this supersedes bundle Y." The bundler consults related bundles during planning for context, but does not block on them.
+
+**`attachments`** let the filer provide supporting material. Attachments with a `data_ref` are injected into the bundle's artifact namespace at planning time so the bundler and pre-execution review tracks can reference them. Attachments with only a `url` are fetched by the bundler and cached; the fetched content becomes a bundle-scoped artifact.
+
+**`metadata`** records provenance. `filed_by` is an identity string; in v1.1 it is always the single human reviewer, but the field is typed as a string rather than an enum to avoid coupling to the identity model. `filed_via` records the surface for calibration.
+
+On receiving a bundle input, the bundler: resolves `parent_bundle_id` and `related_bundle_ids` to load prior bundle artifacts from `memory/` for context; fetches and caches any URL-only attachments; reads relevant calibration data and prior decisions; drafts requirements, RFC, UX flow (if relevant), implementation plan, and verification plan; computes complexity and risk scores per the approval matrix factors; decomposes the work into a task DAG with capability manifests; determines the `target:` field (specified in Bundle lifecycle: execution and integration); and populates the concerns section.
+
+### Planning
 
 **Planning** is done by a bundler agent. The bundler reads the inbound idea, consults memory (similar past bundles, calibration data, prior killed ideas with reasoning), drafts requirements, drafts an RFC, drafts a UX flow if relevant, drafts an implementation plan, drafts a verification plan, and decomposes the work into a task DAG with capability manifests. It also computes a complexity score and a risk score and writes a concerns section.
 
 The bundler is required to populate the concerns section. "No concerns" on a high-risk bundle is treated as a calibration signal that something is off, not as confirmation that the bundle is safe.
+
+### Pre-execution review tracks
 
 **Pre-execution review tracks** run before the bundle reaches the human reviewer. Three specialist tracks, each emitting structured findings into the bundle artifact:
 
@@ -1510,9 +1545,69 @@ The bundler is required to populate the concerns section. "No concerns" on a hig
 
 3. **QA / verification planning.** A QA agent that doesn't test the code (the code might not exist yet) but produces a Verification Plan: acceptance criteria (observable, testable conditions tied back to requirements), test surface (unit, integration, end-to-end, load, manual smoke, with coverage targets), pre-merge gates (CI, coverage threshold, security findings resolved, manual smoke checklist), post-ship verification (specific metrics, time windows, expected ranges; this is the data the post-mortem feedback loop will consume), and a rollback plan. Hard rules: no bundle reaches human review without a Verification Plan; bundles without a viable rollback auto-bump Reversibility to 3 in stakes scoring.
 
-The same QA agent is called again post-execution to validate the shipped product against the Verification Plan it itself produced. This is a deliberate dual use: pre-execution, the QA agent does verification planning; post-execution, the QA agent runs the plan against the actual shipped artifact. The two jobs are genuinely different (planning vs. validation) but share infrastructure (the same agent, the same capability scope, the same rubrics) and naturally compose. Failed criteria post-execution trigger one of: auto-rollback (if rollback is machine-executable and stakes are Low), or a `status:verification-failed` issue that pulls the bundle back into the Human Review Board's Needs Input column. The Verification Report becomes input to the post-mortem feedback loop: it's calibration data on how well the Verification Plan predicted reality.
+The same QA agent is called again post-execution to validate the shipped product against the Verification Plan it itself produced. This is a deliberate dual use: pre-execution, the QA agent does verification planning; post-execution, the QA agent runs the plan against the actual shipped artifact. The two jobs are genuinely different (planning vs. validation) but share infrastructure (the same agent, the same capability scope, the same rubrics) and naturally compose. The full handoff seam is specified in Bundle lifecycle: execution and integration.
 
 Pre-execution review tracks may emit capability requests as a separate output stream from findings. A security review agent flagging "this finding would be more reliable with secret-scanning tooling I don't have" generates both a finding (about the bundle) and a capability request (about the system).
+
+### Pre-execution review track integration with approval matrix
+
+**Pre-execution review tracks run before the approval matrix.** This ordering is ratified and load-bearing. The sequence is: bundle proposed, pre-execution review tracks run, review findings stored, approval matrix evaluates, decision. The approval matrix's decision logic depends on review track outputs: a bundle with a critical security finding cannot auto-ship regardless of its risk and complexity scores. If review tracks ran after the matrix, the matrix would make decisions on incomplete information, and the auto-ship gate would have to be re-evaluated after review tracks complete, which is effectively the same ordering with extra steps.
+
+**Data flow.** Each track's findings are stored as bundle-scoped artifacts (descriptors: `bundle:adversarial-findings`, `bundle:security-findings`, `bundle:verification-plan`). They are also inlined into the bundle's proposal for the reviewer's direct inspection. The approval matrix evaluator (a deterministic function in the orchestrator, not an LLM call) reads the bundle's complexity and risk scores, the review track findings, and the mandatory-review trigger list. It produces a tier decision and an auto-ship eligibility boolean.
+
+**Matrix decision logic** (pseudocode):
+
+```python
+def evaluate_approval_matrix(bundle, findings, triggers):
+    # Mandatory-review triggers override the matrix entirely
+    if any(trigger.matches(bundle) for trigger in triggers):
+        return Tier.FULL_REVIEW, auto_ship=False, reason="mandatory review trigger"
+
+    # Security findings gate auto-ship
+    security = findings.get("security", [])
+    has_critical = any(f.severity == "critical" for f in security)
+    has_unresolved_medium_plus = any(
+        f.severity in ("medium", "high", "critical") and f.status == "unresolved"
+        for f in security
+    )
+
+    if has_critical:
+        return Tier.FULL_REVIEW_COOLDOWN, auto_ship=False, reason="critical security finding"
+    if has_unresolved_medium_plus:
+        return Tier.FULL_REVIEW, auto_ship=False, reason="unresolved security findings"
+
+    # Rollback plan gates auto-ship
+    verification_plan = findings.get("verification_plan")
+    has_viable_rollback = verification_plan and verification_plan.rollback_feasible
+    if not has_viable_rollback:
+        bundle.risk_scores.reversibility = max(bundle.risk_scores.reversibility, 3)
+
+    # Auth / billing / secrets / PII gate auto-ship
+    touches_sensitive = any(tag in bundle.tags for tag in ("auth", "billing", "secrets", "pii"))
+    if touches_sensitive:
+        return Tier.FULL_REVIEW, auto_ship=False, reason="touches sensitive surface"
+
+    # Score-driven tier from the 3x3 matrix
+    tier = matrix_lookup(bundle.complexity_score, bundle.risk_score)
+
+    # Auto-ship is disabled for anything above auto or auto-notify
+    if tier in (Tier.AUTO_APPROVE, Tier.AUTO_APPROVE_NOTIFY):
+        can_auto_ship = (
+            not has_unresolved_medium_plus
+            and has_viable_rollback
+            and not touches_sensitive
+        )
+    else:
+        can_auto_ship = False
+
+    return tier, auto_ship=can_auto_ship, reason="score-driven"
+```
+
+The matrix evaluator is deterministic and auditable. The scores (complexity and risk) are produced by the bundler and reviewed by the critique tracks; the evaluator does not re-score. The evaluator's only judgment is whether review findings or mandatory triggers override the score-driven tier. This keeps the machine's role narrow: it can escalate but never de-escalate.
+
+The matrix decision (tier, auto_ship boolean, reason) is stored in the `bundles` table (`tier` column) and in `approval_decisions` (with `decision = tier` and `actor = "system"` for auto-decisions). The reviewer sees the decision on all surfaces and can override upward (escalate to a higher tier) but not downward.
+
+### Approval matrix
 
 **Approval matrix.** Complexity (0–10) and risk (0–10) are scored independently. Complexity factors: estimated lines of code touched (banded), number of components/subdirectories touched, number of worker tasks in the decomposition, cross-component coordination required, new abstractions introduced. Risk factors: touches security-sensitive paths (path patterns configurable per repo in `settings.json`), touches data-handling paths, touches public/external interfaces, reversibility, production proximity (currently 0 in v1), net-new dependency additions. Each factor's contribution is shown in the approval surface so the reviewer can sanity-check the math.
 
@@ -1527,32 +1622,276 @@ The 3×3 matrix gates bundles into one of four tiers:
 The four tiers:
 
 - **Auto-approve.** Bundler creates the feature branch and starts work without asking. The reviewer is informed via a single line in a daily digest.
-- **Approve-with-summary.** Bundler posts a summary (proposal one-liner, complexity/risk scores with breakdown, files-to-be-touched list, test plan summary, estimated wall-clock duration, link to full RFC). Default if reviewer doesn't respond in the configured window depends on the cell: low-risk cells default-approve; moderate-risk cells default-hold (require explicit response). Configurable in `settings.json`.
+- **Approve-with-summary.** Bundler posts a summary (proposal one-liner, complexity/risk scores with breakdown, files-to-be-touched list, test plan summary, estimated wall-clock duration, link to full RFC). Default if reviewer doesn't respond in the configured window: low-risk cells default-approve after 4 hours; moderate-risk cells default-hold (require explicit response). The 4-hour window is configurable in `settings.json` under `approval.default_approve_window_hours`. Default-approve outcomes are tracked as a calibration axis; if default-approved bundles have a higher failure rate than explicitly-approved bundles of the same stakes, the threshold is wrong and the remedy is adjusting the matrix, not default-holding everything.
 - **Full human review.** Bundler posts the full RFC, verification plan, worker decomposition, capability requests, and concerns section. No default action; bundle waits indefinitely.
-- **Full review with cooldown.** Same as full review, plus a minimum 1-hour dwell time before approval can be granted, even if the reviewer responds immediately. Forcing function for high-stakes changes: look at it, walk away, come back. Override available for genuine emergencies.
+- **Full review with cooldown.** Same as full review, plus a minimum 1-hour dwell time before approval can be granted, even if the reviewer responds immediately. Forcing function for high-stakes changes: look at it, walk away, come back. For bundles flagged `irreversible` (rollback is not machine-executable and manual recovery would require >1 hour of operator time, as assessed by the Verification Plan's rollback plan), the cooldown is 24 hours rather than 1 hour. The `irreversible` flag is set by the bundler during planning and is reviewable during approval. Both cooldown durations are configurable in `settings.json`. Override available for genuine emergencies via `/force-approve` or MCP equivalent; overrides write an audit log entry with the reason and are tracked in calibration.
 
-**Mandatory-review triggers** bypass the matrix entirely. These force full review regardless of complexity and risk: any modification to `AGENTS.md` files, the capability manifest itself, control-plane code or `settings.json`, GitHub Actions workflows or CI config; any new external dependency from a non-allowlisted source; deletion of more than N files (default 10); bundles whose own complexity/risk scoring is suspiciously low for the LOC estimate. These are listed in `settings.json` under `mandatory_review_triggers` and are extensible.
-
-**Pre-execution review tracks run before the approval matrix.** Their outputs feed into the approval matrix decision. Auto-ship is gated on pre-execution outcomes: any unresolved security finding of medium severity or above disables auto-ship regardless of stakes; bundles without a viable rollback can never auto-ship; bundles touching auth, billing, secrets, or PII can never auto-ship. (This ordering was inferred during consolidation; the prior conversation didn't make it explicit. Confirm.)
+**Mandatory-review triggers** bypass the matrix entirely. These force full review regardless of complexity and risk: any modification to `AGENTS.md` files, the capability manifest itself, control-plane code or `settings.json`, GitHub Actions workflows or CI config; any new external dependency from a non-allowlisted source; deletion of more than N files (default 10); bundles whose own complexity/risk scoring is suspiciously low for the LOC estimate; and `target: new-repo` (creating a new product repo is an irreversible namespace action and always requires explicit human consent). These are listed in `settings.json` under `mandatory_review_triggers` and are extensible.
 
 **Bundlers may self-escalate** to a higher tier when the score-driven tier feels wrong. They may not self-de-escalate.
 
-**Modification requests** (`/modify [instructions]` or its MCP equivalent) are the middle path between approve and reject. The bundler revises the proposal based on instructions and re-posts. Whether modification forces a re-score is an open question; the natural answer is yes, since modification can change the risk profile, but that means moderately-modified bundles can bounce between tiers in a way that feels confusing.
+### Modification requests
+
+**Modification requests** (`/modify [instructions]` or its MCP equivalent) are the middle path between approve and reject, available when the bundle is in `proposed`, `in_review`, or `approved` (pre-execution). During execution, Redirect is the equivalent verb (see Bundle lifecycle: execution and integration). The flow:
+
+1. Reviewer issues `/modify [instructions]` via any surface.
+2. The bundle transitions `in_review → proposed` (or stays in `proposed` if already there).
+3. The bundler revises the proposal based on the instructions: re-drafts requirements, RFC, implementation plan, and verification plan as needed; may re-decompose the task DAG.
+4. The revised proposal re-enters pre-execution review. If the modification was narrow, review tracks examine only the delta. If broad, full re-review.
+5. The revised proposal enters the approval matrix with new scores.
+
+**Modification forces re-score.** Yes, the bundler re-scores on modification. If a modification meaningfully changes the bundle's risk profile, the approval tier should reflect the new risk profile, not the old one. The "bouncing between tiers" concern is a UI problem, not a scoring problem. The surface should show the score delta: "Complexity: 2 → 3 after modification." The transition history makes the bounce visible and interpretable. The `bundle_output.steering_events.modification_count` records modifications; a bundle with more than three pre-execution modifications is surfaced in calibration as a signal of unstable requirements or poor initial bundling.
+
+### Default actions, cooldown durations, and multi-surface race resolution
+
+**Default action for summary-tier timeouts.** Low-risk cells default-approve after 4 hours; moderate-risk cells default-hold (require explicit response). Calibration data answers whether default-approve is safe better than design-time conservatism. Configurable in `settings.json`.
+
+**Cooldown duration.** 1 hour for full-review-cooldown tier, 24 hours for bundles flagged `irreversible`. The `irreversible` flag is a new field on the bundle proposal, set by the bundler when the Verification Plan's rollback plan concludes rollback is not machine-executable and manual recovery would require >1 hour of operator time. In v1.1, with no production and most changes being reversible, the `irreversible` flag will be rare. The flag exists primarily as a design slot for when production becomes real.
+
+**Multi-surface action ordering and race resolution.** First-write wins, second-write fails with a conflict error. The mechanism is SQLite's serialized transaction model. When an approval decision arrives from any surface, the orchestrator opens a SQLite transaction, reads the current bundle state, validates the transition, writes the decision, and commits. Two surfaces racing within the same second are serialized by SQLite's write lock: one commits first, the other sees the updated state and rejects the transition. The semantics exposed to the reviewer: the last decision chronologically is authoritative, provided it's a legal transition from the state at the moment it executes. The audit trail preserves the full sequence. The system does not attempt to merge or reconcile contradictory decisions. If a decision arrives and finds the bundle in a state where that decision is no longer legal, the surface receives an error response with enough context that the reviewer understands what happened: "Bundle <id> is in state <current>, cannot <action>. (It was <previous> when you loaded it; a decision from <other_surface> at <timestamp> changed it.)"
+
+### Calibration loop
 
 **Calibration loop.** After every bundle completes (success or failure), the orchestrator records pre-execution complexity and risk scores plus the actual outcome (success/failure, time taken, lines actually changed, tests added, rework cycles, post-merge issues). Deltas go into `memory/calibration/scoring-outcomes.jsonl`. Periodically, the orchestrator surfaces patterns ("Bundles scored complexity=3 actually averaged 5.2 — bundler under-estimating"), and the reviewer adjusts weights in `settings.json`. The post-mortem prompt fires when any tracked axis diverges from prediction by more than 50%.
 
-**Mid-flight steering vocabulary.** Once a bundle is in execution, the reviewer can intervene with three primary verbs and one optional fourth:
-
-- **Pause.** Orchestrator finishes the in-flight worker step, then halts. State is preserved. Worktrees stay. Resumable later, optionally with notes that get prepended to the orchestrator's context.
-- **Redirect.** Pause plus new instructions; orchestrator re-plans from the current state. Previous plan archived. Workers may be killed and respawned with new assignments.
-- **Abort.** Kill all workers immediately, close the draft PR, delete worktrees, terminal aborted state. Partial commits remain on the feature branch (recoverable), but active execution is dead.
-- **Rollback.** Post-merge or post-deploy only. Reverts the merged change and re-deploys. Distinct from Abort, which is for in-flight execution.
-
-This vocabulary was Claude-recommended after the reviewer explicitly said "I honestly do not know the answer" during the design conversation, and was folded into the spec without being explicitly ratified. Treating it as accepted by default; flagged in open questions for confirmation.
-
 ## Bundle lifecycle: execution and integration
 
-Once a bundle is approved, the orchestrator transitions it to `approved`, then to `in_progress`, and execution begins. The mechanics of how the executor drives the task DAG (node lifecycle, scheduling, ready-set computation, gate and aggregator semantics, dynamic expansion, retry policies, crash recovery) are specified in the DAG executor section. This section covers the lifecycle-level concerns above the executor: how decomposition is structured, how state is shared, how source trees are organized, how integration and merge work, and how repos are spawned for shipped artifacts.
+Once a bundle is approved, the orchestrator transitions it to `approved`, then to `in_progress`, and execution begins. The mechanics of how the executor drives the task DAG (node lifecycle, scheduling, ready-set computation, gate and aggregator semantics, dynamic expansion, retry policies, crash recovery) are specified in the DAG executor section. This section covers the lifecycle-level concerns above the executor: the output schema, the `target:` field and two-tier repo boundary, the full bundle state machine, mid-flight steering mechanics (Pause, Redirect, Abort, Rollback), the post-execution verification handoff, and the structural concerns of decomposition, state sharing, source trees, and integration.
+
+### Bundle output schema
+
+A bundle's outputs are the structured record of what happened, preserved for the reviewer, for calibration, for post-mortem, and for future bundles that consult memory. They mirror the task-level output spec in the DAG schema but operate at the bundle level.
+
+```yaml
+bundle_output:
+  outcome:
+    status: shipped | parked | killed | failed_verification | aborted
+    rationale: "<human-readable explanation of the outcome>"
+
+  product_artifacts:
+    spawned_repos:
+      - name: <repo name>
+        url: <github url>
+        registry_entry: <key in memory/products/registry.json>
+    merged_prs:
+      - repo: <repo name>
+        pr_number: <int>
+        pr_url: <github url>
+        merge_commit: <sha>
+
+  artifact_manifest:
+    published_global_artifacts:
+      - descriptor: {namespace: global, name: <string>, version: <string>, content_type: <string>}
+        hash: <blaake3 hex>
+    bundle_artifact_index: <artifact descriptor for the index of all bundle-scoped artifacts>
+
+  verification:
+    plan_ref: <artifact descriptor pointing to the Verification Plan>
+    report_ref: <artifact descriptor pointing to the Verification Report>
+    outcome: passed | failed | partial
+    failed_criteria: [<criterion>, ...]
+    rollback_triggered: true | false
+    rollback_bundle_id: <ULID or null>
+
+  calibration:
+    axes:
+      complexity:
+        estimated: <int>
+        actual: <float>
+      risk:
+        estimated: <int>
+        actual: <float>
+      code_surface:
+        estimated_lines: <int>
+        actual_lines: <int>
+      agent_iterations:
+        estimated: <int>
+        actual: <int>
+      wall_clock:
+        estimated_minutes: <int>
+        actual_minutes: <int>
+      blast_radius:
+        predicted: <string>
+        realized: <string>
+    divergence_threshold_exceeded: [<axis name>, ...]
+
+  cost:
+    llm_tokens:
+      input_total: <int>
+      output_total: <int>
+      by_model: {<model>: {input: <int>, output: <int>}}
+    worker_count: <int>
+    worker_hours_total: <float>
+    peak_ram_bytes: <int>
+    peak_disk_bytes: <int>
+
+  memory_pointers:
+    decision_artifact: <path in memory/decisions/>
+    post_mortem_artifact: <path in memory/post-mortems/ or null>
+    calibration_append: <path in memory/calibration/>
+    security_findings: [<path in memory/security-findings/>, ...]
+
+  steering_events:
+    pause_count: <int>
+    redirect_count: <int>
+    modification_count: <int>
+    mid_flight_approvals: [<approval_decision summary>, ...]
+
+  metadata:
+    bundle_id: <ULID>
+    completed_at: <ISO8601 timestamp>
+    total_wall_clock_seconds: <int>
+```
+
+**`outcome`** is the headline. Five terminal statuses. `shipped` means the work was merged or the repo was created and verification passed. `parked` means the bundle was completed (code written, PRs opened) but deliberately not merged; the work is preserved on its feature branch for later. `killed` means the work was discarded; the killed-bundle archive in `memory/killed/` preserves the full proposal and execution record. `failed_verification` means execution completed but post-execution QA failed and rollback was either not possible or not configured. `aborted` means the reviewer killed the bundle mid-flight. `rejected` is a pre-execution terminal state that exits before producing a full output record; rejected bundles get a lightweight outcome record with only `status: rejected` and `rationale`, stored in the `bundles` table row.
+
+**`product_artifacts`** is the concrete deliverable record. `spawned_repos` lists every repo created by this bundle (usually zero or one; cross-target bundles are not supported in v1.1). `merged_prs` lists every PR that was merged, in the control-plane or in any product repo.
+
+**`artifact_manifest`** provides discoverability. `published_global_artifacts` is the bundle's contribution to the global namespace; future bundles consult this to find persistent outputs. `bundle_artifact_index` is a single JSON artifact listing every bundle-scoped artifact produced during execution.
+
+**`verification`** captures the QA handoff. `plan_ref` and `report_ref` point into `memory/verification-plans/` and `memory/executions/<bundle-id>/verification-report.json` respectively. `rollback_triggered` and `rollback_bundle_id` record whether verification failure initiated an automatic or manual rollback.
+
+**`calibration`** is the feedback data the calibration loop consumes. Each axis records the bundler's estimate (from the proposal) and the actual (measured from execution). Axes whose divergence exceeds 50% are listed in `divergence_threshold_exceeded`, which triggers the post-mortem prompt. The calibration data is appended to `memory/calibration/scoring-outcomes.jsonl` by the orchestrator on bundle completion.
+
+**`cost`** is the resource consumption record. v1.1 has no cost ceiling (token spend is flat-rate and compute is owned hardware), so cost is recorded for calibration rather than enforcement. `by_model` breaks down token consumption so the operator can reason about model-specific cost tradeoffs.
+
+**`memory_pointers`** are the durable artifact references. The decision artifact is always written (even for auto-approved bundles; a one-line decision is still a decision). The post-mortem artifact exists only when divergence exceeded threshold.
+
+**`steering_events`** records mid-flight interventions. A bundle that was paused three times and redirected twice is a calibration signal.
+
+**`metadata`** closes the lifecycle loop. `bundle_id` matches the id in the `bundles` table. `completed_at` is the timestamp of terminal transition. `total_wall_clock_seconds` is the clock time from `in_progress` to terminal state, including pause time; it's distinct from `calibration.wall_clock.actual_minutes` which measures active worker time.
+
+### The `target:` field
+
+The `target:` field declares where the bundle's output should land. Three values are defined: `new-repo`, `existing-repo:<name>`, and `control-plane`. The field is set by the bundler during planning, informed by the optional `target_hint` in the bundle input. It is reviewable and overridable by the human during approval; the human's override takes precedence.
+
+**Three values, when each applies, decision rule.** `new-repo` applies when the bundle introduces a new product: a distinct deployable, ownable, versioned thing that does not belong inside an existing repo. The decision rule: if the bundle's primary deliverable is a new service, a new frontend, a new tool, or a new self-contained system, it gets `new-repo`. If the bundle's primary deliverable is a modification to an existing product, it gets `existing-repo`. This is deliberately fuzzy at the boundary, and the bundler escalates ambiguous cases to the reviewer as a concern rather than guessing. `existing-repo:<name>` applies when the bundle modifies a product that already has a repo. The `<name>` is the repo slug as recorded in `memory/products/registry.json`. If the name does not exist in the registry, the bundler treats it as a concern. `control-plane` applies when the bundle's work is entirely internal to the orchestrator's own repo: modifications to `AGENTS.md`, capability manifest, settings, agent prompts, orchestrator code, memory layout, templates, CI workflows, or documentation that lives alongside the orchestrator.
+
+**Who sets the field.** The bundler computes `target:` as part of planning. The human can override it during approval via any surface. If the human sets a target that contradicts the proposal's content, the bundler revises the proposal to match on the next planning pass.
+
+**Control-plane vs. product content boundary.** Control-plane content is anything that constitutes the orchestration system itself: bundle proposals and RFCs, decision records, the Review Deck and its artifacts, memory directories, the capability manifest, agent prompt templates and system prompts, orchestrator source code and configuration, worker base-image Dockerfiles, repo templates, GitHub Actions workflows for the control-plane repo, the MCP server implementation, and documentation about the orchestration system. Product content is anything that ships as part of a product: application source code, product tests, product CI workflows, product Dockerfiles, product documentation, product configuration, product data models and migrations, and product-specific agent memory (`AGENTS.md` at the product repo root).
+
+Ambiguous content is resolved as follows. Agent prompt templates that customize behavior for a specific product are product content but live in the control-plane under `memory/products/<product-slug>/agent-overrides.yaml`. This keeps agent configuration centrally manageable while scoping overrides to specific products. Repo templates (`templates/new-product-repo/`) are control-plane content that instantiates into product repos at creation time; the template is control-plane, the instantiated copy is product. Modifications to the template affect future products, not existing ones.
+
+**New-repo flow end to end.** Creating a new product repo is a multi-step flow gated by mandatory review:
+
+1. **Approval.** The bundle is approved with `target: new-repo`. This is a mandatory-review trigger, so the bundle always goes to full human review regardless of complexity and risk scores.
+2. **Repo name resolution.** The bundler proposes a repo name (slug derived from the bundle title, configurable naming convention from `settings.json`). The reviewer can override during approval. The orchestrator checks GitHub for name collisions before creation.
+3. **Scaffolding.** The first worker task in the DAG checks out `templates/new-product-repo/` from the control-plane repo and instantiates it into a new directory. Template variables (product name, description, initial version, originating bundle id) are substituted. The scaffold includes: `README.md`, `docs/`, `INSTALL.md`, `DEPLOY.md`, `AGENTS.md` (pre-populated with the product description and a pointer to the originating bundle), `LICENSE`, `.github/` (issue templates, PR template, CODEOWNERS with the reviewer as default owner, branch protection config), `CHANGELOG.md` with the initial entry auto-generated from the bundle's RFC, a working CI pipeline, and a reproducible deploy mechanism.
+4. **Repo creation.** The orchestrator calls the GitHub API (using the GitHub App installation token) to create the repo under the configured org, with the configured default visibility. The scaffold is pushed as the initial commit on `main`.
+5. **Branch protection.** The orchestrator configures branch protection on `main`: require pull request reviews, require status checks, require conversation resolution, prohibit force pushes and deletions.
+6. **Registry update.** The orchestrator appends an entry to `memory/products/registry.json`: `{product_slug, repo_name, repo_url, originating_bundle_id, created_at, status: "active"}`.
+7. **Product development.** Subsequent worker tasks in the same bundle develop the product code in the new repo, using the per-worker-branch and DAG-order-merge mechanics.
+8. **Verification.** The QA agent verifies the product in the new repo post-execution.
+
+If the bundle is aborted after repo creation but before completion, the repo is left in place (it has the scaffold and whatever partial work was committed to feature branches). The repo's status in the registry is set to `abandoned`. A follow-up bundle can target the abandoned repo with `target: existing-repo:<name>` to continue the work.
+
+**Existing-repo and control-plane flows.** `existing-repo:<name>` follows the standard execution flow: workers operate on per-worker branches off a bundle base branch in the target repo, integration proceeds in DAG order, and the final bundle branch is merged to the target repo's main branch on successful verification. The orchestrator validates that the named repo exists in `memory/products/registry.json` before starting execution. `control-plane` follows the same execution flow but with elevated caution: control-plane bundles are always mandatory-review, the orchestrator takes a snapshot of the control-plane repo's state as a global artifact before execution begins so rollback has a clean baseline independent of git history, and control-plane bundles can never auto-ship.
+
+**Cross-target bundles: rejected for v1.1.** A bundle that modifies both the control-plane and a product repo, or that modifies two product repos, is not supported. The `target:` field is a single value, not a list. The most common case (capability addition paired with first use) is handled as two bundles with `related_bundle_ids` linking them; the reviewer approves both in sequence. The escape hatch: a `control-plane` bundle may modify `memory/products/<product-slug>/agent-overrides.yaml`, which is technically product-scoped content stored in the control-plane. The single-target constraint is a real limitation; multi-target bundles are deferred to v1.2.
+
+**Approval matrix interaction.** Three interactions. First, `target: new-repo` is a mandatory-review trigger. Second, `target: control-plane` is already a mandatory-review trigger (modifying control-plane code) and can never auto-ship. Third, `existing-repo` targets inherit the product repo's risk profile through the security-sensitive path patterns in `settings.json`.
+
+### Bundle state machine
+
+The bundle state machine governs every transition a bundle can make between creation and terminal outcome. Twelve states, 25 legal transitions. Transitions are guarded; illegal transitions are rejected by the orchestrator and return errors to whoever requested them.
+
+**States:**
+
+| State | Description |
+|-------|-------------|
+| `proposed` | Bundler has produced a proposal; awaiting pre-execution review and approval |
+| `in_review` | Pre-execution review tracks are running; not yet at the approval matrix |
+| `approved` | Bundle has passed review and been approved; awaiting execution start |
+| `in_progress` | DAG executor is driving worker tasks |
+| `paused` | Execution is halted mid-flight; state is preserved, workers are idle |
+| `redirecting` | Paused bundle is being re-planned; new DAG being produced (transient) |
+| `verifying` | All worker tasks complete; QA agent is running post-execution verification |
+| `complete` | Terminal: bundle shipped successfully |
+| `parked` | Terminal: work completed but deliberately not merged; preserved for later |
+| `failed` | Terminal: execution or verification failed; partial state preserved for forensics |
+| `rejected` | Terminal: bundle was rejected during review; no execution occurred |
+| `aborted` | Terminal: reviewer killed the bundle mid-flight; partial state preserved |
+
+**Transition table:**
+
+| From | To | Trigger | Actor |
+|------|----|---------|-------|
+| (start) | `proposed` | Bundle input received | Filer (human or agent) |
+| `proposed` | `in_review` | Bundler completes proposal | Bundler agent |
+| `in_review` | `proposed` | Review track finds blocking issue, returns for revision | Review track agent |
+| `in_review` | `approved` | Approval matrix returns approve, or human approves | Orchestrator or Reviewer |
+| `in_review` | `rejected` | Human rejects | Reviewer |
+| `approved` | `in_progress` | Orchestrator starts execution | Orchestrator |
+| `approved` | `rejected` | Reviewer rejects after approval but before execution start | Reviewer |
+| `in_progress` | `paused` | Reviewer issues Pause | Reviewer |
+| `in_progress` | `verifying` | All exit nodes reach terminal state | Orchestrator |
+| `in_progress` | `aborted` | Reviewer issues Abort | Reviewer |
+| `paused` | `in_progress` | Reviewer issues Resume | Reviewer |
+| `paused` | `redirecting` | Reviewer issues Redirect with new instructions | Reviewer |
+| `paused` | `aborted` | Reviewer issues Abort | Reviewer |
+| `redirecting` | `in_review` | Bundler completes re-plan | Bundler agent |
+| `redirecting` | `paused` | Reviewer issues Pause during re-planning | Reviewer |
+| `redirecting` | `aborted` | Reviewer issues Abort during re-planning | Reviewer |
+| `verifying` | `complete` | Verification passes, reviewer approves ship (or auto-ship criteria met) | QA agent + Orchestrator/Reviewer |
+| `verifying` | `parked` | Reviewer chooses to park rather than ship | Reviewer |
+| `verifying` | `failed` | Verification fails and rollback is not configured or not possible | QA agent |
+| `verifying` | `in_progress` | Verification fails, rollback bundle spawned (rollback is a new bundle; this bundle enters `failed` after rollback completes) | QA agent + Orchestrator |
+| `complete` | `in_progress` | Rollback triggered post-merge (rollback is a new bundle; this bundle stays `complete`) | Reviewer |
+
+Any transition not in the table is illegal. The orchestrator rejects illegal transitions with an error that includes the current state, the requested transition, and the reason. Examples: `approved → proposed` ("Bundle is approved; use /modify to revise before execution"), `complete → failed` ("Bundle is complete; transitions from terminal states are not allowed"), `proposed → in_progress` ("Bundle has not been reviewed. Wait for pre-execution review and approval."), `in_progress → approved` ("Bundle is executing. Pause first, then Redirect to re-plan.").
+
+**Surface observability.** Every state transition is observable through all three surfaces. MCP: the `studio://bundles/{id}` resource reflects the current state on every fetch. GitHub Issues: the bundle's issue is updated on every state transition; the issue body reflects the current state and timeline; labels are updated to match (`state/proposed`, `state/in-review`, etc.). CLI: `studio show <bundle-id>` displays current state and transition history. Transitions are recorded in `audit_log` atomically with the state change in the same SQLite transaction.
+
+**Triggering transitions from surfaces.** All three surfaces can trigger reviewer-initiated transitions. MCP triggers via tool calls (`approve_bundle`, `pause_bundle`, etc.). GitHub Issues triggers via comments (`/approve`, `/pause`, `/redirect [instructions]`, `/abort [reason]`, `/park [reason]`). CLI triggers via commands (`studio approve <id>`, `studio pause <id>`, etc.). For v1.1, all surfaces have equal authority.
+
+### Mid-flight steering mechanics
+
+The steering vocabulary (Pause, Redirect, Abort, Rollback) is accepted. This section specifies the executor's role in each. Rollback is addressed separately because it operates post-execution, not mid-flight.
+
+**Pause.** The reviewer issues Pause via any surface. The orchestrator sends `worker.pause()` RPCs to all workers in state `running` or `ready` for this bundle. Each worker finishes its current step (the in-progress tool call, test run, or file write) and then halts; true mid-step checkpointing would require workers to understand checkpoint semantics, which is far more coupling than the kill-all-on-crash policy accepts. Workers in state `pending` are left `pending`. The scheduler is halted (no new nodes are dispatched from the ready set). The event pump continues to process events so in-flight steps reach completion, but new dispatches are suppressed. The pause event is written to `audit_log`. Each worker's state in `dag_nodes` is updated: `running → paused`. Worker worktrees are left intact.
+
+Resume: the reviewer issues Resume via any surface, optionally with notes. Notes are injected into the orchestrator's context as a `reviewer_notes` field, visible to workers on their next task spec refresh. The orchestrator re-ticks the scheduler: the ready set is recomputed, paused workers transition `paused → running` and pick up where they left off. If the reviewer provides no notes, resume is a simple unpause. If the reviewer wants to change the DAG, they use Redirect, not Pause-with-notes.
+
+**Redirect.** Redirect implies Pause (the bundle is paused first if not already paused), then re-plan. The design ratifies the natural answer: Redirect discards the current DAG and runs the planner on the current worktree state as a fresh bundle, with completed work as the baseline.
+
+1. **Pause.** If not already `paused`, Pause is applied first.
+2. **Snapshot current state.** The orchestrator produces a `bundle-state-snapshot` artifact containing: the current worktree state (commits on branches, modified files, diff against base branch); the completed nodes from the prior DAG with their terminal states and output artifact references; the in-progress and pending nodes that will be discarded; and the prior proposal and DAG for the audit trail.
+3. **Transition to `redirecting`.** Transient state; the reviewer sees "redirecting..." in the surface.
+4. **Dispatch re-planning.** The orchestrator spawns a new planning task within the existing bundle's identity. The planner agent receives: the original bundle input, the reviewer's redirect instructions, the state snapshot artifact, and calibration data and relevant memory.
+5. **Produce new DAG.** The planner produces a new task DAG. Completed nodes from the prior DAG are referenced as baseline artifacts: if worker-3 completed successfully and its output is still valid under the new instructions, the new DAG references worker-3's artifacts and does not re-execute the work. The planner decides which completed work is reusable; the reviewer can override during re-approval.
+6. **Re-enter review.** The new DAG goes through pre-execution review tracks (abbreviated: only the delta from the prior review is examined unless the delta is large enough that the review track agents self-escalate to full re-review) and the approval matrix. The bundle transitions `redirecting → in_review`.
+7. **Resume execution.** On approval, the bundle transitions to `in_progress`. The executor ingests the new DAG, and execution proceeds from the new DAG's entry nodes.
+
+Completed work is referenced via both artifact descriptors and branch state. The new DAG's capability manifests must be subsets of the bundle's original capability manifest; if the redirect instructions imply scope increase beyond the original manifest, the planner must request additional capabilities through the normal capability-request approval flow. The audit trail preserves the through-line via the bundle id: the original proposal, the redirect event, the state snapshot, the new proposal, and the new DAG are all linked to the same bundle id.
+
+**Abort.** The reviewer issues Abort from any non-terminal state. The bundle must be in `approved`, `in_progress`, `paused`, or `redirecting`. Abort from `proposed` or `in_review` is treated as Reject, not Abort.
+
+The orchestrator sends `worker.cancel(reason="bundle_aborted")` to all workers in state `running` or `paused` for this bundle. The cancellation follows the protocol from DAG executor Aggregator mechanics: 30-second grace period, then SIGTERM, then SIGKILL after another 10 seconds. Workers that complete cleanly during the grace period transition to `cancelled`, not `failed`. Workers in state `pending` or `ready` are transitioned directly to `cancelled`.
+
+Draft PRs opened by the bundle are closed with a comment: "Bundle aborted by reviewer. Feature branch `<branch>` is preserved for recovery." Worker worktrees are not deleted; they occupy disk space but preserve partial work for recovery. The periodic background sweep (Artifact Protocol) collects worktrees for aborted bundles after a configurable retention period (default 30 days). The bundle transitions to `aborted`. A lightweight outcome is written.
+
+What's preserved: commits on feature branches, artifact refs in `artifact_refs` (until the retention window expires), the full audit log. What's not preserved: capability grants made specifically for this bundle are revoked on Abort; in-flight RPC calls are abandoned; workers killed via SIGKILL lose uncommitted working state.
+
+**Rollback.** Rollback is distinct from Abort because it operates post-merge or post-deploy, not mid-flight. Rollback is a new bundle, not a special bundle kind, not a direct action. The rationale: rollback touches the same repos, code paths, and deployment mechanisms as the original work, and needs capability grants, a task DAG, worker execution, and verification just like any other change. A rollback that fails is itself a failed bundle with its own post-mortem. The rollback bundle's input carries `parent_bundle_id` pointing to the bundle being rolled back.
+
+Two trigger paths. Manual: the reviewer issues Rollback from any surface (`studio rollback <bundle-id>` or MCP equivalent). This creates a rollback bundle input and enters the normal bundle lifecycle. Automatic: post-execution verification fails, the failure meets the auto-rollback criteria (stakes are Low, rollback is machine-executable per the Verification Plan, and the Verification Plan declared auto-rollback eligibility), and the orchestrator spawns the rollback bundle automatically.
+
+The rollback bundle's bundler reads the original bundle's Verification Plan (which includes the rollback plan) as a starting point but is not bound by it; if the plan says "revert commit X" but commit X now has conflicts, the bundler proposes an alternative. The rollback bundle has its own Verification Plan, which verifies that the rolled-back state matches the pre-merge state while preserving unrelated changes that landed after the original bundle.
+
+Verification-driven rollback: when the original bundle's post-execution verification fails and rollback is triggered, the original bundle's state after rollback depends on the rollback outcome. If the rollback bundle completes successfully, the original bundle stays in `complete` (it was shipped, then un-shipped) and the rollback event is appended to its `steering_events`. If the rollback bundle fails, the original bundle is annotated with a `rollback_failed` flag and the reviewer is paged via the notification surface.
+
+### Post-execution verification handoff (QA dual-use seam)
+
+The QA agent's dual use: pre-execution, it produces a Verification Plan; post-execution, it runs the plan against the actual shipped artifact. The seam between the two uses:
+
+**Artifacts at the seam.** Pre-execution produces the Verification Plan, stored as `{namespace: bundle, name: verification-plan, version: v1, content_type: application/json}`. The plan includes: acceptance criteria, test surface, pre-merge gates, post-ship verification metrics, and a rollback plan (machine-executable boolean, steps, auto-rollback eligibility). Post-execution receives: the Verification Plan artifact, the merged bundle branch, the worker reports, the CI run results, and access to the deployed artifact. It produces a Verification Report: `{namespace: bundle, name: verification-report, version: v1, content_type: application/json}`. The report includes: per-criterion pass/fail with evidence, aggregate outcome (passed, failed, partial), failed criteria with descriptions, coverage gaps, and a rollback recommendation.
+
+**Verification failure handling.** When the Verification Report's outcome is `failed` or `partial`: the bundle transitions `verifying → failed`. A `status:verification-failed` label is applied to the GitHub Issue, and the bundle enters the Human Review Board's Needs Input column. If the Verification Plan declared auto-rollback eligibility and stakes are Low and rollback is machine-executable, the orchestrator spawns a rollback bundle automatically. Otherwise, the reviewer decides: spawn a rollback bundle manually (`studio rollback <bundle-id>`), park the bundle, or kill it. The reviewer can also Retry (re-trigger verification, which is idempotent) or Override (mark the bundle `complete` despite verification failure, with an audit log entry explaining the override). Override is a deliberate "I accept the risk" decision tracked in calibration.
+
+**The Verification Report as calibration data.** If the QA agent consistently produces plans that pass verification but the shipped product has bugs discovered later, the QA agent's plans are under-testing. If it produces plans that fail on criteria that turned out to be irrelevant, it is over-testing. Both are calibration signals. The Verification Report includes a `plan_quality_self_assessment` field, stored alongside scoring calibration data in `memory/calibration/`.
+
+### Execution structure
 
 **Decomposition is hybrid: static DAG with bounded dynamic expansion.** Each bundle proposal includes a planned task DAG. Workers can request expansion mid-execution, but the request goes through the orchestrator's approval flow, not through the worker spawning children directly. This preserves the property that the orchestrator is the spawn authority and keeps the capability model clean. It also keeps the DAG inspectable (a human reviewer sees the planned envelope; expansions stay within or escalate). Pure static decomposition was rejected because real coding work doesn't always decompose cleanly up front. Pure dynamic spawning was rejected because it makes resource usage hard to reason about, makes capability boundaries hard to enforce, and makes human review nearly impossible.
 
@@ -1576,8 +1915,6 @@ Product is single per repo; multiple components live in subdirectories (`api/`, 
 
 Linkage between control-plane and product repos: the bundle in the control-plane gets a `product-repo:` field populated at repo-creation time; the new product repo's README links back to the originating bundle; control-plane memory stores the mapping in `memory/products/registry.json`. Naming convention is configured in the main `settings.json` (default `${org}/${product-slug}` where slug comes from bundle title); default visibility (private vs. public) is also configured globally.
 
-Not every bundle should spawn a new repo. Some bundles modify existing product repos. Some bundles are internal to the control-plane itself. The bundle's RFC declares its target via a `target:` field: `new-repo`, `existing-repo:<name>`, or `control-plane`. The exact specification of this field is open (named but not formalized in the conversation), and the implicit boundary between "control-plane" and "product" content isn't fully drawn.
-
 **Failure handling during execution** uses a tiered policy similar to stakes:
 
 - Low-impact failures (flaky test, transient network blip): auto-retry with backoff.
@@ -1589,8 +1926,6 @@ Production deploy failures are not currently a relevant case, since there is no 
 **Worker lifecycle.** Orchestrator picks worker class C for task T based on T's requirements, spawns the worker via WorkerRunner, gives it its own working tree on its own branch, gives it its declared capability set, and gives it pointers to its declared input artifacts. The worker reads its task spec (passed via env var or mounted file): bundle context, RFC excerpt, verification plan excerpt, conditions, `AGENTS.md`, capability manifest subset, model and thinking-mode config. It invokes OpenCode against the configured Ollama Cloud model. It emits heartbeats on state transitions and at maximum 60-minute intervals, including the `phase` field. It may request capability expansion mid-task via RPC; this goes through the approval flow before new workers spawn. On completion (success, failure, or stuck), it commits to its sub-branch, emits a `worker-report.json`, and exits. The orchestrator reviews exit state, merges the sub-branch to the feature branch (or kills it), updates `tasks.json`, and decides next steps.
 
 Workers that go stuck (hit the configured per-worker-class timeout, currently 3 stuck-iterations as the kill-and-respawn threshold) are killed and reassigned. The reset-and-iterate pattern (small bounded tasks, kill-and-respawn over long-context grinding) was an intentional adoption from the production-tested patterns surveyed during the orchestrator design conversation.
-
-**Verification handoff.** When all workers in a bundle complete, the lead orchestrator marks execution complete and emits a `verification-requested` event. The QA agent picks up the bundle plus the Verification Plan it produced pre-execution and runs it against the merged bundle branch. The verification result feeds back: bundle marked Verified (close out and proceed to merge) or Failed (recall sequence per the failure handling tiers).
 
 ## Surfaces
 
@@ -1665,15 +2000,11 @@ These are known gaps. Each will need its own design pass before it's implementat
 
 **Artifact protocol deferred items.** The following items are deferred from the Artifact Protocol section: artifact streaming (stream_put and stream_get); version immutability enforcement for non-"latest" artifact descriptors; artifact signing for non-repudiation; transparent compression at the ArtifactStore layer; `artifact.list` pagination; a binary side channel for artifact data transfer; cross-bundle artifact sharing semantics; a configurable default TTL for global artifacts; credential-use audit trail aggregation for `secrets.fetch`; artifact-level immutability and pinning metadata flags.
 
-**Bundle-level input/output schema.** Bundles take inputs (the user's request) and produce outputs (the result). The task-level input/output is formalized in the task DAG node spec; bundle-level is not. Should mirror task spec.
-
 **Schema versioning policy.** Applies to the capability manifest schema and the task DAG schema. Forward-compatible additions only? Deprecation cycles? Migrations? Currently both schemas have `schema_version: "1.0"` but the upgrade rules are not specified.
 
 **Capability manifest review UX.** How the human approval flow actually presents a manifest. Reviewers need tooling.
 
 **Hostname-based egress enforcement implementation.** The egress proxy with name-based filtering. The mechanism is clear in principle; the operational details (cache strategy, what happens when DNS resolves to multiple IPs, how to handle TLS SNI versus plaintext HTTP) are not.
-
-**Two-tier repo boundary.** Specifically the `target:` field in bundle RFCs. Named but not specified. The implicit boundary between "control-plane content" and "product content" isn't fully drawn.
 
 **State-partitioning specification.** Made moot by the roll-our-own DAG decision (since LangGraph isn't being adopted, there's no third-party state to partition), but the principle generalizes: the boundary between hot-state (SQLite) and durable-state (`memory/`) deserves explicit rules for what goes where.
 
@@ -1727,27 +2058,29 @@ These are known gaps. Each will need its own design pass before it's implementat
 
 **Retry policy on grafted nodes.** Grafted nodes carry their own `retry_policy`. A bundle-level cap on total retries across all nodes (to prevent a runaway expansion from racking up enormous retry counts) is not specified.
 
-**Modification during pause: executor's role in re-planning.** The mid-flight steering vocabulary includes Pause and Redirect. Redirect means "pause plus new instructions; orchestrator re-plans." The executor's role in re-planning is not specified: does it re-ingest a new DAG while preserving completed nodes, or is the current DAG abandoned? The natural answer is that Redirect discards the current DAG and runs the planner on the current worktree state as a fresh bundle, with completed work part of the baseline; but that's a bundle-state-machine decision, not an executor decision. Flagged for the next pass on the steering vocabulary.
-
 **Gate `rpc_query` retry semantics.** A failing `rpc_query` is a gate failure subject to retry policy. Should transient RPC failures (network blips) be distinguished from predicate-false responses? The current design treats them the same, which means a bundle can be defeated by a flaky endpoint. A future refinement might classify errors: transient RPC errors trigger retry without consuming an attempt; predicate-false responses count as attempts.
+
+**Parked bundle lifecycle.** How parked bundles are discovered, resumed, or cleaned up. The parked state exists in the bundle state machine (specified in Bundle lifecycle: execution and integration) but the workflow around it (periodic digest surfacing, auto-cleanup after N days, resume-from-parked mechanics) is not specified.
+
+**Multi-target bundles (cross-repo execution).** Deferred to v1.2. The single-target constraint (one `target:` value per bundle, specified in Bundle lifecycle: execution and integration) holds for v1.1. If capability-plus-first-use patterns prove common, a v1.2 design pass should revisit with a concrete proposal for multi-target DAGs and cross-repo integration steps.
+
+**Abbreviated review threshold on Redirect.** The conditions under which a Redirect's delta is small enough for abbreviated review vs. requiring full re-review are not formally specified. Review track agents self-escalating when the delta exceeds their confidence threshold is the fallback.
+
+**`irreversible` flag formal schema slot.** The concept is introduced in Bundle lifecycle: planning and approval (cooldown carve-out). The exact schema field, its interaction with the approval matrix evaluator, and its surfacing in the reviewer's UI are not specified at field level.
+
+**Rollback bundle calibration as a separate tracking class.** Rollback bundles are bundles and get calibration data like any other. Whether they should be tracked as a separate class (do rollback bundles have systematically different complexity vs. actual profiles?) is a future question.
 
 ## Open questions and flagged decisions
 
-Items where the prior conversation explicitly punted, raised a concern, or made a call that should be revisited.
-
-**Mid-flight steering vocabulary acceptance.** The Pause / Redirect / Abort / Rollback verbs were Claude-recommended after the reviewer said "I honestly do not know the answer." Folded in without explicit ratification. Open question: ratify, revise, or expand.
+Items where the design has punted, raised a concern, or made a call that should be revisited.
 
 **Provisional wall-clock and heartbeat numbers.** First-run timeout defaults of 2 hours for small tasks, 4 hours for medium, 8 hours for large. 60-minute maximum heartbeat interval. These are explicitly provisional; they need to survive first contact with real workloads before being ratified.
 
-**Pre-execution review ordering.** Pre-execution review tracks run before the approval matrix; their outputs feed the matrix decision; auto-ship is gated on pre-execution outcomes. This ordering was inferred during consolidation; the prior conversation did not make it explicit. Confirm.
+**Default-approve window of 4 hours.** The value was chosen to balance velocity with intervention opportunity, but it's a Review Deck v1 numeric interacting with a v1.1 approval matrix. The interaction was not formally analyzed in v1; track as calibration data and revisit after 30 days of live operation.
 
-**Modification request re-scoring.** When a bundle is modified via `/modify`, should the bundler re-score it? Natural answer is yes, since modification can change the risk profile, but moderately-modified bundles bouncing between tiers can confuse the surface. Not committed.
+**1-hour cooldown with irreversible carve-out at 24 hours.** The distinction between "high risk" and "irreversible" is a new concept introduced by the bundle lifecycle design. The `irreversible` flag's definition ("rollback is not machine-executable and manual recovery would require >1 hour") is a first draft. Needs calibration against real bundles.
 
-**Default action for summary-tier timeouts.** Default-approve after 4 hours for low-risk-cells, default-hold for moderate-risk. Open whether to default-hold across the board until trust is built.
-
-**Cooldown duration for the highest-risk tier.** Currently 1 hour. Some patterns argue for 24-hour "sleep on it" rules for irreversible changes.
-
-**Multi-surface action ordering and race resolution.** What happens if approval-via-MCP races reject-via-Issues within the same minute? Implementation-time decision, not architecture-time.
+**Verification-driven auto-rollback criteria.** Three conditions: stakes Low, rollback machine-executable, and auto-rollback declared in the Verification Plan. The "stakes Low" condition means auto-rollback never fires for medium or high-stakes bundles, which is conservative. If auto-rollback proves reliable in practice (the rollback bundle succeeds >95% of the time), expanding to medium-stakes bundles is a calibration-driven decision.
 
 **Friction-pattern aggregation threshold for capability requests.** "N reports over a window." A reasonable starting heuristic is 3 reports in 7 days. Not committed.
 
@@ -1757,8 +2090,6 @@ Items where the prior conversation explicitly punted, raised a concern, or made 
 
 **Agent activity issues, same repo or separate.** Currently same-repo. Revisit if access-scope or volume issues emerge.
 
-**Two-tier repo `target:` field semantics.** Named but not specified. The implicit boundary between control-plane content and product content isn't drawn.
-
 **Whether to count the schemas as part of "the twelve."** Resolved during consolidation: the capability manifest schema and the task DAG schema are operationalizations of decisions already made (capability-mediated isolation, star topology, bounded dynamic expansion, roll-our-own executor), not standalone design choices. They are first-class sections in this document, but not items in the decision list.
 
 **Quorum aggregator with post-quorum completions.** When a quorum aggregator has fired with cancel-remaining enabled, and one of the cancellation targets completes cleanly in the grace window, the output is captured but not used in the reduction. Is there a use case for "quorum fires, but update the output if late completions change the reduction"? Probably no (the reduction's output has already been consumed downstream), but worth noting in case calibration data later argues otherwise.
@@ -1766,6 +2097,8 @@ Items where the prior conversation explicitly punted, raised a concern, or made 
 **Bundle-failure cancellation policy.** When a bundle is marked `failed` due to a node failure, the executor leaves still-running in-flight nodes alone. The rationale is preserving partial work for recovery and reviewer inspection. The cost is that worker budget is consumed by work whose output may no longer be useful. Whether to add a soft-abort policy (cancel in-flight nodes when the bundle is committed-failed) is in deferred items but worth flagging here as a real trade.
 
 **Mermaid rendering frequency.** The mermaid is cheap to re-render but it does run on every MCP resource fetch and GitHub comment update. For large DAGs (hundreds of nodes after aggressive expansion), even cheap rendering could become a noticeable hit on the orchestrator's main loop. Caching with state-hash invalidation is straightforward to add if it becomes a problem; not done in v1.1.
+
+**Cross-target bundles rejected for v1.1.** The limitation is real and the two-bundle workaround with `related_bundle_ids` is clunky. If the capability-plus-first-use pattern is common, a v1.2 design pass should revisit with a concrete proposal for multi-target DAGs and cross-repo integration steps.
 
 ## Rejected alternatives
 
@@ -1865,11 +2198,11 @@ The prior conversation accumulated several silent supersessions and scope creeps
 
 *Review Deck v1 numerics carried forward without reconciliation.* The 75% confidence floor, the 8-hour stalled-bundle detector, the 48-hour low-stakes auto-ship window, the 5/10/21-day high-stakes escalation ladder, the 12-hour acting-soon window, and the 7-day Recently Decided window were all set in v1. v1.1 added pre-execution review tracks, the Capability Requests Board, MCP as primary surface, and several other layers, none of which formally re-evaluated the v1 numerics. They are referenced rather than re-specified in v1.1, but they should be revisited the next time the approval flow is touched, since the surrounding system has changed.
 
-*Approval-matrix vs. pre-execution-review-track ordering.* Both are gates between bundle proposal and bundle execution. The natural ordering (review tracks run first, their outputs feed the matrix) was assumed in this consolidation but not explicitly stated in the prior conversation. Confirm.
+*Approval-matrix vs. pre-execution-review-track ordering.* Both are gates between bundle proposal and bundle execution. The natural ordering (review tracks run first, their outputs feed the matrix) was assumed in this consolidation but not explicitly stated in the prior conversation. Ratified in the bundle lifecycle design pass.
 
 **Areas the next design phase should plan to address.**
 
-The DAG executor and artifact protocol, the two largest deferred chunks from the initial v1.1 consolidation, are now specified. The remaining deferred items are narrower in scope; the largest is the bundle-level input/output schema, followed by the schema versioning policy and the capability manifest review UX.
+The DAG executor, artifact protocol, bundle lifecycle, I/O schema, and target field semantics, the largest deferred chunks from the initial v1.1 consolidation, are now specified. The remaining deferred items are narrower in scope; the largest is the schema versioning policy, followed by the capability manifest review UX.
 
 The next major architectural addition beyond the deferred items is the k8s deployment target and its associated work (Helm chart, NetworkPolicies, PodSecurityStandards, image signing, S3-backed artifact store), which is gated on the k8s milestone rather than on design completion.
 
