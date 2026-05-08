@@ -170,7 +170,7 @@ CREATE TABLE audit_log (
 
 Large fields are JSON because their internal schema will evolve. SQLite's JSON1 functions handle ad-hoc query needs. The `audit_log` table is the catch-all for cross-cutting timeline reconstruction; everything important also has its own typed table.
 
-The DAG executor adds further tables (`dag_nodes`, `dag_edges`, `node_state_history`, `dag_expansions`, `approval_requests`, `artifact_refs`) covering DAG state, transition history, expansion provenance, the unified approval-request lifecycle, and the executor's view of artifact publication. Those are specified in the DAG executor section.
+The DAG executor adds further tables (`dag_nodes`, `dag_edges`, `node_state_history`, `dag_expansions`, `approval_requests`, `artifact_refs`) covering DAG state, transition history, expansion provenance, the unified approval-request lifecycle, and the executor's view of artifact publication. Those are specified in the DAG executor section; the artifact metadata schema backing `artifact_refs` is specified in the Artifact Protocol section.
 
 **Bundle state machine.** Transitions are guarded; illegal transitions are rejected by the orchestrator and return errors to whoever requested them. The transitions:
 
@@ -291,7 +291,7 @@ Workers communicate with the orchestrator over a bidirectional RPC channel. Bidi
 - `cap.request(scope, rationale)` returns `{granted, capability_id?, denied_reason?}`: synchronous; blocks the worker until human or auto decision.
 - `cap.check(op_descriptor)` returns `{allowed, capability_id?}`: fast path for already-granted capabilities.
 - `worker.progress_report(stage, percent, message)`: notification, structured progress.
-- `artifact.request(source_worker_id, path)` returns `{artifact_data}`: inter-worker handoff, mediated.
+- `artifact.request(source_worker_id, path)` returns `{artifact_data}`: superseded by `artifact.publish` and `artifact.fetch`; see Artifact Protocol.
 - `worker.request_human_input(question, context)` returns `{response}`: escape hatch, surfaces via the approval channel.
 - `worker.final_report(outcome, files_changed, tests_run, ...)`: terminal call before clean exit.
 
@@ -302,11 +302,11 @@ Workers communicate with the orchestrator over a bidirectional RPC channel. Bidi
 - `worker.cancel(reason)`: worker cleans up and exits, with grace period before SIGTERM.
 - `worker.query_status()` returns the worker's self-reported state.
 - `worker.inject_context(data)`: push new info to a worker mid-task (for example, "the spec changed").
-- `worker.prepare_handoff(target_worker_id, artifact_descriptor)`: worker packages the artifact for another worker.
+- `worker.prepare_handoff(target_worker_id, artifact_descriptor)`: superseded by `artifact.publish`; see Artifact Protocol.
 
 **Connection-loss semantics.** If the worker's connection drops, the orchestrator marks the worker `connection_lost` and gives it a grace period to reconnect (workers can reuse their token within the grace window). After the grace period, the worker process is killed. This handles transient hiccups without making lost-connection equal lost-work for short interruptions. On Kubernetes, the orchestrator additionally watches pod events from the API server so it learns about evictions promptly rather than waiting for connection timeout.
 
-Methods like `artifact.request` and `worker.request_human_input` are protocol-reserved in v1 even though their implementation is stubbed (they return "not implemented"). This avoids a protocol version bump when those features are actually built.
+Methods like `worker.request_human_input` are protocol-reserved in v1 even though their implementation is stubbed (they return "not implemented"). This avoids a protocol version bump when those features are actually built. `artifact.request` and `worker.prepare_handoff` were previously protocol-reserved stubs but are now superseded by the fully specified `artifact.publish`, `artifact.fetch`, and `artifact.list` methods; see Artifact Protocol.
 
 The full RPC method dispatcher is itself capability-checked: every method call is validated against the worker's manifest before being served. This is what closes the loop on "workers can't escalate via RPC." A worker can only call methods its manifest grants, and the manifest is a subset of the bundle manifest, which the human approved.
 
@@ -843,7 +843,7 @@ The `node_state_history` table is append-only and indexed; it is the primary sou
 
 The `approval_requests` table generalizes over gate human-approval, dynamic expansion approval, and capability-grant approval, all of which have the same lifecycle: created, surfaced, decided. Bundle-level approval is also written here for uniformity, though the bundle state machine reads it through a different path.
 
-The `artifact_refs` table is the executor's view of the artifact layer. The artifact layer owns the storage and content addressing; `artifact_refs` is the join table letting the executor answer "has any predecessor published this artifact yet?" without a round-trip to the artifact store. This is the minimum interface the executor needs from the artifact layer; the full artifact protocol is a separately deferred chunk.
+The `artifact_refs` table is the executor's view of the artifact layer. The artifact layer owns the storage and content addressing; `artifact_refs` is the join table letting the executor answer "has any predecessor published this artifact yet?" without a round-trip to the artifact store. This is the minimum interface the executor needs from the artifact layer; the full artifact protocol is specified in the Artifact Protocol section.
 
 ### Checkpointing and crash recovery
 
@@ -871,7 +871,7 @@ A worker issues a dedicated `expansion.request` RPC method (or `cap.request` for
 1. **Parse and validate structurally.** Fragment must be a well-formed partial DAG; every node has an id unique within the bundle (not already in `dag_nodes`); every edge references either a node in the fragment or an existing node in `dag_nodes`; no cycles are introduced by grafting at `graft_point`. Cycle check runs against the merged DAG, not against the pre-graft DAG. The check is a topological sort, O(V+E), fast at the scales v1.1 sees.
 2. **Validate per the schema rules.** Every task manifest in the fragment is a subset of the bundle manifest. `expansion_policy.max_total_nodes` is not exceeded by the merged DAG. `expansion_policy.max_depth` is not exceeded (depth measured from any entry node to the deepest fragment node).
 3. **Decide auto-approve or escalate.** If `allow_dynamic_expansion` is true and every fragment manifest is a subset of the bundle manifest, auto-approve. Otherwise, create an `approval_requests` row with kind `expansion` and surface to the reviewer; the graft waits on decision.
-4. **Apply.** In a single SQLite transaction: insert the fragment's nodes into `dag_nodes` with state `pending`; insert the fragment's edges into `dag_edges`; mark the expansion record `applied`; write `audit_log` entries for the expansion. Commit.
+4. **Apply.** In a single SQLite transaction: insert the fragment's nodes into `dag_nodes` with state `pending`; insert the fragment's edges into `dag_edges`; mark the expansion record `applied`; write `audit_log` entries for the expansion; for each grafted node whose inputs declare artifacts produced by already-running predecessors, increment those artifacts' `ref_count` in `artifact_metadata` (this mirrors the ref_count increment done at normal node dispatch, specified in the Artifact Protocol section). Commit.
 5. **Tick the scheduler.** The newly-added nodes are considered for readiness in the next tick.
 
 The transaction-boundary choice is that the graft is all-or-nothing. Partial grafts (some nodes inserted, some not) are never observed. If the transaction fails (uniqueness violation caught mid-insert, etc.), the expansion record stays in `pending` and the worker's RPC returns a failure that it can surface or retry.
@@ -919,6 +919,580 @@ A **MockWorkerRunner** implements the WorkerRunner interface, accepts task specs
 **Migration tests for schema changes.** When `dag_nodes` or `dag_edges` schemas evolve, migrations are tested by loading a pre-migration database, running the migration, and asserting post-migration invariants hold.
 
 No real Ollama Cloud calls in tests. The test suite runs on CI without network access.
+
+## Artifact Protocol
+
+The artifact protocol is the system that stores, addresses, retrieves, and garbage-collects the data workers produce and consume. It sits between the DAG executor (which needs to know when an artifact becomes available so it can unblock successors) and the persistence layer (which owns SQLite for hot state and `memory/` for durable bytes). It also absorbs the secrets fetch protocol, because secrets are a degenerate kind of artifact: named, capability-checked, RPC-fetched, never persisted in worker state. Every part of v1.1 that references artifact descriptors, the `rpc.artifact_access` manifest fields, inter-worker data flow, or the `artifact_refs` join table is a client of the protocol specified here.
+
+Scope includes the three artifact RPC methods (`publish`, `fetch`, `list`), the content-addressing scheme, the storage layer and its substrate-agnostic interface, the artifact metadata schema, the lifecycle and garbage collection policy, the `secrets.fetch` RPC, capability pattern matching at fetch time, crash recovery for in-flight publishes, and integration with the DAG executor's notification channel and validation rules. Scope explicitly does not include distributed artifact stores (multi-orchestrator HA is a separate deferred item), cross-bundle artifact sharing semantics, external artifact registries, streaming for very large artifacts (deferred, with explicit gating criteria), or multi-tenant concerns.
+
+### Design framing
+
+Five load-bearing decisions shape the artifact protocol, in addition to the constraints imported from earlier sections.
+
+The star topology (from Bundle lifecycle: execution and integration) means all artifact movement is mediated by the orchestrator. Workers do not ship bytes to each other. Per-worker filesystem isolation (same section) means workers do not share disk; artifacts are the canonical inter-worker data channel. Capability-mediated access (from Capability manifest schema) means every read and write is checked against the worker's manifest before the orchestrator serves it. The orchestrator is the trust root (from Threat model and trust assumptions); workers are not trusted, and integrity comes from orchestrator mediation, not from workers cooperating. The executor's `artifact_refs` table (from DAG executor) is the join table the executor queries to answer "has a predecessor published this artifact?" and it is not redesigned here.
+
+The new decisions:
+
+**The artifact layer is a module inside the orchestrator core process, not a separate service.** It exposes an `ArtifactStore` interface, analogous to `WorkerRunner`, so the storage substrate is swappable without touching manifests, RPC, or executor logic. The rationale is that artifact operations are capability-checked (they share the dispatcher), they share the orchestrator's SQLite connection for metadata, and they emit events into the executor's event pump. Splitting the artifact layer into its own process would turn all three of those couplings into network calls, which is complexity without benefit at v1.1 scale. The interface boundary, not the process boundary, is what makes the k8s migration additive.
+
+**The descriptor is the user-facing handle; the content hash is an internal implementation detail.** The hash is not a field in the descriptor. Descriptors are declared by planners and workers before bytes exist (a worker declares what it will produce in its DAG node spec). The hash is assigned by the orchestrator at publish time, after the bytes arrive. This means the descriptor's version field is a semantic label (like `"v1"`, `"latest"`, `"draft"`), not a content-derived identity. Re-publishing to the same descriptor overwrites the hash mapping. This is intentional: `"latest"` semantics require mutability. For immutable pointers, the version should be a value that will not be reused (a ULID, a monotonically increasing integer, or omitted in favor of fetching by hash directly). Embedding the hash in the descriptor was considered and rejected because it would require a two-phase declaration (declare intent, publish bytes, update descriptor), breaking the property that a reviewer sees the complete artifact topology in the DAG before execution.
+
+**Artifact bytes live on disk under `memory/artifacts/`; metadata lives in SQLite.** This matches the persistence layering from the Persistence and audit section: bytes are durable and forensics-grade (survive SQLite corruption, operator-inspectable with standard tools); metadata is queryable and participates in atomic SQLite transactions with executor state. An inline threshold of 4 KB bridges the two: artifacts up to and including 4096 bytes are stored as BLOBs in the metadata table, giving them SQLite's transactional atomicity and single-file backup simplicity. Everything larger goes to disk. The threshold is configurable in `settings.json` under `artifacts.inline_threshold_bytes`.
+
+**Garbage collection is reference counting plus time-based expiry, not mark-and-sweep.** The star topology means the orchestrator owns every artifact reference. Reference counts are always accurate because all increments and decrements happen inside the same SQLite transactions that transition node state. Mark-and-sweep addresses distributed systems where reference counts can drift across nodes; that failure mode does not exist here. Time-based expiry handles the case where an artifact has zero active consumers but should be retained for forensic value, and the complementary case where a global artifact with no declared consumers should eventually be collected.
+
+**`artifact.publish` notifies the executor asynchronously via the event queue, not synchronously within the publish call.** When a publish completes, the artifact layer enqueues a `new_artifact` event into the executor's event queue. The executor picks it up on the next tick, queries `artifact_refs`, and unblocks any successors whose input dependencies are now satisfied. This preserves the executor's single-mutator property (the event pump is the sole mutator of executor state, as specified in the DAG executor section) and means the artifact layer does not need to know about node readiness, edge semantics, or scheduling internals. The cost is one tick of latency between publish and unblock, which is vanishingly small compared to worker runtime. If the event is lost (orchestrator crash before the executor processes it), the reconciler's ready-set recomputation on restart picks up the published artifact from `artifact_refs` and unblocks successors.
+
+### Descriptor semantics and identity
+
+The descriptor shape is fixed by the capability manifest schema: `{namespace: bundle|global|task, name: <string>, version: <string or null>, content_type: <mime-like string>}`. This section specifies resolution semantics.
+
+**Namespace scoping.** `bundle` artifacts are scoped to the producing worker's bundle. Only workers within that bundle can read them, subject to their read grants. They become eligible for garbage collection when the bundle terminates, as described in the lifecycle section below. `task` artifacts are scoped to the producing worker's own task. Only that worker can read them. They die when the worker terminates, subject to a short retention window for retry and debugging. `global` artifacts persist across bundles. Any worker with a read grant can fetch them. They are subject to the global storage cap and are collected only under cap pressure or explicit deletion. Writing to the global namespace requires an explicit `namespace: global` entry in the worker's write patterns; a wildcard namespace pattern (`"*"`) does not grant global write permission. This is a deliberate escalation gate: the human reviewer must explicitly approve global artifact production.
+
+**Name** is a free-form string, typically kebab-case or dot-separated. Names should be descriptive (`test-results`, `coverage-report`, `lint-output`). No structural enforcement beyond what the pattern matching rules impose.
+
+**Version** is a human-meaningful label. Conventions: `"latest"` for a mutable rolling pointer, `"v1"` or `"v2"` for intended-to-be-stable snapshots, and `null` or omitted when versioning is not meaningful. The artifact layer does not enforce immutability on non-`"latest"` versions; re-publishing to `"v1"` overwrites. Immutability is a convention in v1.1. A future design pass may add an immutability flag; see open questions.
+
+**Content type** is a MIME-like string. Examples: `application/json`, `text/plain`, `application/octet-stream`, `application/vnd.studio.worker-report+json`. The artifact layer does not parse content; the content type is metadata for consumers. The `vnd.studio.*` prefix is reserved for system-defined types.
+
+**Identity rule.** Two descriptors refer to the same artifact if and only if all four fields match exactly (after pattern resolution). The hash is not part of identity; it is a property of the artifact bytes, assigned at publish time. This is the opposite of a content-addressed store where the hash is the identity. The reasoning is stated in Design framing.
+
+### Content addressing
+
+**Hash function: BLAKE3.** Three reasons drove the choice. First, performance: BLAKE3 is 5 to 10 times faster than SHA-256 on modern x86-64 CPUs, using AVX2 and AVX-512 SIMD with a portable C fallback on other architectures. At artifact sizes up to 100 MB, the difference is user-visible during publish and fetch. Second, tree hashing: BLAKE3's Merkle tree structure means the hash can be verified incrementally. This is not used in v1.1 (the whole blob is hashed at once), but the capability exists for future streaming verification without a protocol change. Third, cryptographic strength: BLAKE3 is derived from BLAKE2, which was a SHA-3 finalist and has received substantially more cryptanalysis than SHA-256's alternatives. For this system's threat model (integrity against disk corruption and operator error, not adversarial hash collision), BLAKE3 is more than sufficient. The system has no regulatory requirement for FIPS-certified algorithms, which is the only context in which SHA-256 would be preferable. SHA-256 was considered and rejected on performance grounds.
+
+The output is 256 bits (32 bytes), encoded as lowercase hex in the metadata table and in RPC responses (64 characters).
+
+**What is hashed.** The raw artifact bytes exactly as provided by the worker in the `artifact.publish` call. No envelope, no framing, no metadata prepended. The bytes are hashed as-is. For structured content types, the worker is responsible for producing canonical serialization before publishing; the artifact layer neither validates nor transforms the content.
+
+**Hash assignment.** The orchestrator computes the hash at publish time, after receiving the full artifact data from the worker. It is stored in the `artifact_metadata.hash` column and returned to the publishing worker in the RPC response.
+
+**Verification on fetch.** When a worker calls `artifact.fetch`, the orchestrator resolves the descriptor to the stored metadata, retrieves the bytes (from the inline BLOB if present, from disk otherwise), re-computes BLAKE3 over the retrieved bytes, and compares the result to the stored hash. On mismatch the fetch returns a `verification_failed` error and the orchestrator logs an ERROR-level audit event with the descriptor, stored hash, and computed hash. On match the bytes are returned. This means every fetch re-verifies integrity. The cost is one BLAKE3 computation per fetch; at BLAKE3 throughput (multiple GB/s on modern CPUs) and v1.1 artifact sizes, this is negligible.
+
+**Relationship to the version field.** The hash changes on every publish, even to the same descriptor. The version field is set by the worker or planner and not updated by the artifact layer. Version is a semantic pointer; hash is a content pointer. A consumer that wants to verify it received the right bytes should compare the returned hash, not the version string.
+
+### RPC method specifications
+
+All three methods are worker-to-orchestrator calls over the bidirectional JSON-RPC 2.0 channel specified in the Worker RPC protocol section. All are capability-checked by the orchestrator's RPC dispatcher before the handler executes.
+
+**artifact.publish**
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "artifact.publish",
+  "params": {
+    "descriptor": {
+      "namespace": "bundle",
+      "name": "test-results",
+      "version": "v1",
+      "content_type": "application/json"
+    },
+    "data": "<base64-encoded bytes>"
+  },
+  "id": 1
+}
+
+Response (success):
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "published": true,
+    "hash": "a1b2c3d4e5f67890...",
+    "size_bytes": 12345
+  },
+  "id": 1
+}
+```
+
+Error codes. `-32001 capability_denied`: the worker's manifest `rpc.artifact_access.writes` has no pattern matching this descriptor. The response includes the failing descriptor and the list of granted write patterns. `-32002 artifact_too_large`: data size exceeds the per-artifact limit of 100 MB. `-32003 storage_full`: per-bundle or global storage cap exceeded; publish rejected even though this artifact individually is within limits. `-32004 invalid_descriptor`: descriptor fails structural validation (unrecognized namespace value, empty name, malformed content type). `-32005 namespace_violation`: worker attempting to publish to a namespace it cannot access, such as another bundle's namespace or the global namespace without explicit grant. `-32602 invalid_params`: the `data` field is missing, not valid base64, or otherwise malformed.
+
+Side effects of a successful publish, executed in order:
+1. Compute BLAKE3 over the raw bytes.
+2. If `len(data) <= inline_threshold`, store bytes as a BLOB in the metadata row. Otherwise, write bytes to `memory/artifacts/hashes/<hash[0:2]>/<hash>` where `<hash[0:2]>` is the first two hex characters of the hash.
+3. INSERT or UPDATE (UPSERT) the `artifact_metadata` row keyed on `(namespace, name, version)`.
+4. INSERT a row into `artifact_refs` with the bundle id, producer node id, descriptor JSON, and current timestamp.
+5. Enqueue a `new_artifact` event into the executor's event queue.
+6. Write an `audit_log` entry: `{event_type: "artifact_published", subject_type: "worker", subject_id: <worker_id>, payload_json: {descriptor, hash, size_bytes}}`.
+
+Steps 3, 4, and 6 are inside a single SQLite transaction. Step 2 for on-disk artifacts is outside the transaction (disk writes cannot participate); the crash recovery section addresses the resulting non-atomic boundary. Step 5 is an in-memory operation.
+
+The capability check on publish proceeds as follows. The concrete descriptor is extracted from the request. The worker's manifest `rpc.artifact_access.writes` patterns are loaded. The descriptor is matched against each pattern using the algorithm in the capability pattern matching subsection below. If no pattern matches, `capability_denied` is returned. Two additional namespace checks are applied beyond pattern matching: if the descriptor namespace is `global`, at least one matching pattern must explicitly list `namespace: global` (a pattern with `namespace: "*"` does not suffice); if the descriptor namespace is `bundle`, the orchestrator verifies that it resolves to the calling worker's own bundle (a worker cannot publish into another bundle's namespace even with a matching pattern).
+
+**artifact.fetch**
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "artifact.fetch",
+  "params": {
+    "descriptor": {
+      "namespace": "bundle",
+      "name": "test-results",
+      "version": "v1",
+      "content_type": "application/json"
+    }
+  },
+  "id": 2
+}
+
+Response (success):
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "data": "<base64-encoded bytes>",
+    "hash": "a1b2c3d4e5f67890...",
+    "size_bytes": 12345
+  },
+  "id": 2
+}
+```
+
+Error codes. `-32001 capability_denied`: the worker's manifest `rpc.artifact_access.reads` has no pattern matching this descriptor. `-32006 artifact_not_found`: no artifact with this descriptor has ever been published. `-32007 artifact_gc_d`: the artifact existed but has been garbage collected; the response includes the `gc_d_at` timestamp and the reason (`bundle_terminated`, `retention_expired`, `explicit_delete`). `-32008 verification_failed`: the stored bytes' BLAKE3 hash does not match the stored hash; this is an integrity violation and a system-level alarm, not a worker-level error.
+
+The capability check on fetch matches the concrete descriptor against the worker's `rpc.artifact_access.reads` patterns. The same matching algorithm applies, without the additional namespace restrictions that writes carry (reads are less dangerous).
+
+Fetch resolution algorithm:
+1. Query `artifact_metadata` WHERE namespace = descriptor.namespace AND name = descriptor.name AND version = descriptor.version.
+2. If no row: return `artifact_not_found`.
+3. If a row exists and `gc_d_at` is not null: return `artifact_gc_d` with the timestamp and reason from the metadata row.
+4. Read bytes: from `inline_data` if non-NULL, from the disk path otherwise.
+5. Compute BLAKE3 over the retrieved bytes. Compare to `artifact_metadata.hash`.
+6. On match: return bytes, hash, and size.
+7. On mismatch: return `verification_failed` and log the ERROR audit event.
+
+**artifact.list**
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "artifact.list",
+  "params": {
+    "namespace": "bundle",
+    "name_pattern": "test-*"
+  },
+  "id": 3
+}
+
+Response (success):
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "artifacts": [
+      {
+        "descriptor": {
+          "namespace": "bundle",
+          "name": "test-results",
+          "version": "v1",
+          "content_type": "application/json"
+        },
+        "hash": "a1b2c3d4e5f67890...",
+        "size_bytes": 12345,
+        "published_at": 1715030400
+      }
+    ]
+  },
+  "id": 3
+}
+```
+
+Parameters. `namespace` is optional; it defaults to the calling worker's bundle namespace. `name_pattern` is optional; if omitted, all artifacts in the namespace are returned (subject to the filtering rule below).
+
+Error codes. `-32001 capability_denied`: the worker's RPC methods grant does not include `artifact.list` (this is checked via the RPC methods grant, not via `artifact_access.reads`, since listing is a metadata operation). `-32004 invalid_descriptor`: `name_pattern` is a malformed glob expression.
+
+The response includes only artifacts whose descriptors match at least one of the worker's `rpc.artifact_access.reads` patterns. A worker cannot use `artifact.list` to discover artifacts it lacks permission to fetch. This is a security property: listing must not become a side channel for capability enumeration.
+
+The `artifact.list` RPC method grant is separate from `artifact_access.reads`. A worker may be able to fetch individual artifacts (granted via reads patterns) but not list them all (no `artifact.list` in `rpc.methods`), or vice versa. In practice, most worker manifests will grant both or neither.
+
+### Capability pattern matching
+
+The `rpc.artifact_access.reads` and `writes` fields in the capability manifest hold lists of **descriptor patterns**. A pattern is a partial descriptor where each field supports glob-style wildcards:
+
+```yaml
+rpc:
+  artifact_access:
+    reads:
+      - namespace: bundle
+        name: "test-results-*"
+        version: "*"
+        content_type: "application/json"
+      - namespace: global
+        name: "**"
+        version: "*"
+        content_type: "*"
+```
+
+The `**` wildcard means "any characters, including path separators" (analogous to globstar). A single `*` means "any characters within a single name segment." The distinction exists so hierarchical artifact naming conventions can be adopted later without changing the pattern language. In v1.1, names are flat strings and both wildcards behave identically.
+
+Matching algorithm for a pattern P against a concrete descriptor D:
+1. `namespace_match`: P.namespace equals D.namespace, or P.namespace equals `"*"`.
+2. `name_match`: glob(P.name, D.name). Case-sensitive.
+3. `version_match`: glob(P.version, D.version). If P.version is omitted or null, treat as `"*"`.
+4. `content_type_match`: glob(P.content_type, D.content_type). If P.content_type is omitted or null, treat as `"*"`.
+5. The pattern matches if and only if all four fields match.
+
+Glob syntax. `*` matches any sequence of characters within a single path segment. `**` matches any sequence of characters including path separators. `?` matches exactly one character. `[abc]` is a character class; `[!abc]` a negated class. No brace expansion, no extglob. The syntax is intentionally a subset of standard shell globs to keep the implementation auditable.
+
+Implementation is a single Python function `glob_match(pattern: str, value: str) -> bool`, roughly 40 lines, that compiles the pattern to a regex and caches the compiled form. It does not need a third-party library. The function is small enough to audit for ReDoS (catastrophic backtracking in user-supplied patterns is a risk with naive regex compilation from globs; the implementation should use a non-backtracking strategy or bound match time).
+
+Namespace write restrictions, stated here for completeness: a worker can write to `namespace: bundle` only for its own bundle; a worker can write to `namespace: task` only for its own task; a worker can write to `namespace: global` only if its write patterns explicitly include `namespace: global`. These are enforced by the `artifact.publish` handler, not by the pattern matcher. The pattern matcher answers only "does this descriptor match this pattern." The handler layers the namespace rules on top.
+
+### Notification mechanism
+
+When `artifact.publish` succeeds, the artifact layer constructs a `new_artifact` event and enqueues it into the executor's event queue:
+
+```json
+{
+  "event_type": "new_artifact",
+  "descriptor_json": "{\"namespace\":\"bundle\",\"name\":\"test-results\",\"version\":\"v1\",\"content_type\":\"application/json\"}",
+  "published_at": 1715030400,
+  "producer_node_id": "bundle-abc:node-3"
+}
+```
+
+The executor's event pump receives this on the next tick. Processing:
+1. Query `artifact_refs` for rows matching the descriptor JSON in the event.
+2. For each matching row, find the successor nodes of `producer_node_id` in `dag_edges`.
+3. For each successor, re-evaluate the `pending` to `ready` eligibility: the successor may become ready if this artifact was its last unsatisfied input dependency.
+4. Transition ready nodes and dispatch as usual.
+
+The artifact layer does not query `dag_edges`, does not know about node readiness, and does not mutate executor state. It only emits an event. The executor's existing machinery (the event pump, the ready-set scheduler) handles the rest. The single-mutator property is preserved.
+
+The notification is fire-and-forget from the artifact layer's perspective. If the event queue is full or the pump is backed up, the publish still succeeds (the artifact is stored and committed). The event waits in the queue. This is safe because the reconciler (run on orchestrator startup) recomputes the ready set from the current DAG state and `artifact_refs`; missed or delayed notifications do not cause permanent stalls. The event queue is sized comfortably for the artifact volume v1.1 will see (hundreds of artifacts per bundle, not thousands per second).
+
+### Storage layer
+
+**Physical layout on the local filesystem:**
+
+```
+memory/
+  artifacts/
+    hashes/
+      00/
+        a1b2c3d4e5f67890...
+      01/
+        f3e4d5c6b7a80912...
+      ...
+      ff/
+        0a1b2c3d4e5f67890...
+```
+
+Sharding by the first two hex characters of the BLAKE3 hash creates 256 top-level directories. The shard key is derived from the hash, which is uniformly distributed, so shards fill evenly. A flat directory was considered and rejected because even modest artifact counts (tens of thousands) degrade common filesystem operations when stored in a single directory.
+
+File names are the full 64-character lowercase hex hash. No file extension. The `artifact_metadata.content_type` column is the authoritative source for how to interpret the bytes.
+
+**Inline threshold: 4096 bytes.** The value was chosen for three reasons. First, 4 KB matches a typical OS page size, aligning with I/O patterns. Second, the most common small artifacts (JSON test results, status blobs, YAML config fragments) are typically in the hundreds to low thousands of bytes, well within 4 KB. Third, inline artifacts benefit from SQLite's atomicity: a crash during publish either commits the full metadata row with the BLOB or commits nothing. There is no orphan window for inline artifacts, unlike on-disk artifacts where the file write and the metadata commit are not atomic.
+
+**Per-artifact size limit: 100 MB.** This is larger than any reasonable single artifact in v1.1 (worker reports, test outputs, code patches, configuration bundles, small binary assets) and small enough to keep garbage collection practical. It is also small enough that base64 encoding in JSON-RPC is tolerable (roughly 150 MB on the wire for 100 MB of data; see the streaming decision and deferred items). If a bundle needs to pass data larger than 100 MB between workers, it should use the git worktree, which workers share via the orchestrator-mediated branch merge specified in Bundle lifecycle: execution and integration, not via the artifact layer. The artifact layer is for structured data, not bulk file transfer.
+
+**Per-bundle storage cap: 1 GB.** Summed across all artifacts in that bundle's namespace. This is a soft cap: when a bundle exceeds its cap, the artifact layer runs a sweep of that namespace to collect eligible artifacts before rejecting the publish. If GC cannot free enough space (all artifacts are still referenced or within their retention window), the publish is rejected with `storage_full`. In practice, a bundle producing 1 GB of artifacts is producing an unusually large volume of structured output.
+
+**Global storage cap: 50 GB** (configurable in `settings.json` under `artifacts.global_storage_cap_bytes`). Summed across all global artifacts. Same soft-cap semantics: the GC sweep runs first; if that fails, publishes are rejected. The default of 50 GB is sized to leave comfortable headroom on the 30 GB box; the actual disk has more space than RAM, but 50 GB ensures the artifact store never becomes the dominant disk consumer.
+
+**The ArtifactStore interface.** The abstract interface that lets `LocalFilesystemArtifactStore` (v1.1) and a future `S3ArtifactStore` (k8s) plug in without changes to manifests, RPC handlers, or executor logic:
+
+```python
+class ArtifactStore(ABC):
+    @abstractmethod
+    async def put(self, descriptor: ArtifactDescriptor, data: bytes) -> str:
+        """Store artifact bytes. Returns BLAKE3 hex hash. Raises on failure."""
+        ...
+
+    @abstractmethod
+    async def get(self, descriptor: ArtifactDescriptor) -> Optional[bytes]:
+        """Retrieve artifact bytes by descriptor. Returns None if not found."""
+        ...
+
+    @abstractmethod
+    async def get_by_hash(self, hash: str) -> Optional[bytes]:
+        """Retrieve artifact bytes by hash. Returns None if not found."""
+        ...
+
+    @abstractmethod
+    async def delete(self, descriptor: ArtifactDescriptor) -> bool:
+        """Delete artifact by descriptor. Returns True if deleted."""
+        ...
+
+    @abstractmethod
+    async def delete_by_hash(self, hash: str) -> bool:
+        """Delete artifact by hash. Returns True if deleted."""
+        ...
+
+    @abstractmethod
+    async def exists(self, descriptor: ArtifactDescriptor) -> bool:
+        """Check whether an artifact with this descriptor exists."""
+        ...
+
+    @abstractmethod
+    async def list(self, namespace: str,
+                   name_pattern: Optional[str] = None) -> List[ArtifactMetadata]:
+        """List artifact metadata in a namespace, optionally filtered by glob."""
+        ...
+
+    @abstractmethod
+    async def get_metadata(self, descriptor: ArtifactDescriptor
+                          ) -> Optional[ArtifactMetadata]:
+        """Get metadata for an artifact."""
+        ...
+
+    @abstractmethod
+    async def total_size(self, namespace: str) -> int:
+        """Total bytes stored in a namespace. Used for cap enforcement."""
+        ...
+
+    @abstractmethod
+    async def sweep_orphans(self) -> int:
+        """Remove on-disk artifact files with no metadata row.
+        Returns count removed."""
+        ...
+```
+
+**LocalFilesystemArtifactStore.** `put`: if `len(data) <= inline_threshold`, UPDATE `artifact_metadata` with `inline_data = data`. Otherwise, write to `self.root / "hashes" / hash[0:2] / hash`, then UPDATE or INSERT the metadata row with `inline_data = NULL`. `get`: resolve descriptor to metadata; if `inline_data` is non-NULL return it; otherwise read from the disk path, verify the hash, and return the bytes. `get_by_hash`: query metadata by hash, same retrieval logic. `delete`: remove the metadata row and, if on disk, unlink the file. `list`: SELECT from `artifact_metadata` filtered by namespace and optional name pattern (translated from glob to SQL LIKE). `sweep_orphans`: list all files under `hashes/`, cross-reference with `artifact_metadata.hash`, unlink files with no matching metadata row.
+
+A future `S3ArtifactStore` implements the same interface. `put` writes to an S3 bucket with key `artifacts/<hash[0:2]>/<hash>`. `get` issues an S3 GetObject. `sweep_orphans` lists S3 objects and cross-references. The orchestrator's artifact layer code does not change; only the concrete store class changes at startup based on configuration.
+
+### Metadata schema
+
+The artifact layer adds one table to the SQLite schema:
+
+```sql
+CREATE TABLE artifact_metadata (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  namespace TEXT NOT NULL CHECK(namespace IN ('bundle', 'global', 'task')),
+  name TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT '',
+  content_type TEXT NOT NULL,
+  hash TEXT NOT NULL,                -- BLAKE3 lowercase hex, 64 chars
+  size_bytes INTEGER NOT NULL,
+  inline_data BLOB,                  -- NULL if stored on disk
+  producer_node_id TEXT,             -- dag_nodes.id or NULL
+  producer_worker_id TEXT,           -- workers.id or NULL
+  bundle_id TEXT,                    -- bundles.id, NULL for global artifacts
+  task_id TEXT,                      -- worker-scoped task identifier
+  ref_count INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  published_at INTEGER NOT NULL,
+  expires_at INTEGER,                -- NULL for permanent
+  gc_eligible_at INTEGER,            -- computed by GC policy
+  gc_d_at INTEGER,                   -- NULL if still alive
+  UNIQUE(namespace, name, version)
+);
+
+CREATE INDEX idx_artifact_metadata_hash ON artifact_metadata(hash);
+CREATE INDEX idx_artifact_metadata_bundle ON artifact_metadata(bundle_id);
+CREATE INDEX idx_artifact_metadata_ns_name ON artifact_metadata(namespace, name);
+CREATE INDEX idx_artifact_metadata_gc ON artifact_metadata(gc_eligible_at)
+    WHERE gc_eligible_at IS NOT NULL AND gc_d_at IS NULL;
+```
+
+Field notes. `version` defaults to the empty string rather than NULL so the UNIQUE constraint works consistently; a missing version in the descriptor is normalized to `""`. `producer_node_id` and `producer_worker_id` are nullable because artifacts injected from outside the DAG (bundle inputs provided by the planner) have no producer node, and artifacts produced by the system itself (verification reports generated by the QA agent post-execution) have a producer node but not necessarily a worker. `bundle_id` is the owning bundle; for `namespace: global` it is NULL. `task_id` is the producing task for provenance. `ref_count` is the number of active consumers (workers currently in `ready` or `running` state that declare this artifact as an input). `gc_eligible_at` is set when the artifact becomes logically eligible for collection; it may be NULL for global artifacts that are not time-expiring. `gc_d_at` is set when the artifact is physically deleted; it acts as the tombstone that distinguishes "never existed" from "was collected" in fetch error responses.
+
+**Relationship with the executor's `artifact_refs`.** The two tables serve different purposes. `artifact_metadata` is the artifact layer's source of truth: it owns the storage, the hash, the GC lifecycle, and the full provenance. `artifact_refs` (specified in the DAG executor section) is the executor's join table: it answers the single question "has a predecessor of the current node published an artifact matching this descriptor?" The executor queries `artifact_refs` by `bundle_id` and `descriptor_json`; it never reads `artifact_metadata`. The artifact layer reads and writes `artifact_metadata` and inserts into `artifact_refs`; it never queries `artifact_refs`. Both inserts happen in the same SQLite transaction, so a published artifact is visible to the executor atomically.
+
+The two tables carry redundant data (descriptor fields appear in both). This is acceptable because `artifact_refs` is a read-optimized join table with a narrow, fixed query pattern and no GC concerns. Denormalization keeps the executor's queries simple and independent of the artifact layer's schema evolution.
+
+For artifacts declared as DAG inputs but produced outside the DAG (bundle inputs provided by the planner at planning time), an `artifact_metadata` row exists but there may be no corresponding `artifact_refs` row, since `artifact_refs` only tracks artifacts produced by DAG nodes. The executor handles this case by checking `artifact_metadata` as a fallback when `artifact_refs` has no match. This fallback is limited to entry node inputs; all other artifacts must flow through the DAG and will have `artifact_refs` entries.
+
+### Lifecycle and garbage collection
+
+**When artifacts become eligible for collection:**
+
+Task-scoped artifacts become eligible when the producing task's worker terminates (clean exit, failure, or kill). `gc_eligible_at` is set to `worker_ended_at + task_retention_seconds`, with a default retention of 86400 seconds (24 hours). The 24-hour window allows the worker's own retry attempts and brief forensic inspection.
+
+Bundle-scoped artifacts become eligible when the bundle reaches a terminal state (`complete`, `failed`, `rejected`). `gc_eligible_at` is set to `bundle_ended_at + bundle_retention_seconds`. The default retention is 604800 seconds (7 days) for `complete` and `rejected` bundles, and 2592000 seconds (30 days) for `failed` bundles. The extended retention for failed bundles preserves forensic artifacts for post-mortem analysis without requiring operator intervention.
+
+Global artifacts do not become eligible by time. They persist until explicitly deleted or until the global storage cap triggers LRU eviction. A global artifact with `ref_count = 0` and no `gc_eligible_at` is still alive; it is collected only under storage pressure.
+
+**Collection condition.** An artifact is collected when `gc_eligible_at IS NOT NULL AND gc_eligible_at <= now() AND gc_d_at IS NULL AND ref_count = 0`. For global artifacts under cap pressure, the condition is relaxed to also consider `ref_count = 0` global artifacts without `gc_eligible_at`, ordered by `published_at` ascending (oldest first). This is the only case where a non-expired artifact is collected.
+
+**Reference count maintenance.** `ref_count` is incremented when a worker node is dispatched: the executor reads the node's `inputs.artifacts` list from the DAG node spec and increments the ref_count for each declared input artifact in the same SQLite transaction that transitions the node from `ready` to `running`. It is decremented when the worker completes (any terminal state): the executor decrements the ref_count for all input artifacts in the same transaction that transitions the node to `completed`, `failed`, `skipped`, or `cancelled`. If a node is skipped before dispatch, its ref_count was never incremented, so no decrement is needed.
+
+On orchestrator crash recovery, the reconciler walks `dag_nodes` in state `running` (which become `failed` per the kill-all policy) and decrements the ref_count of their input artifacts as part of the reconciliation transaction. This guarantees ref_count consistency across crashes: every increment that was committed is paired with exactly one decrement, either from normal node completion or from crash reconciliation.
+
+**When GC runs.** Four triggers. First, on every bundle terminal state transition: the artifact layer sweeps that bundle's namespace, sets `gc_eligible_at` for all artifacts based on the bundle terminal state and retention policy, then collects any that are already past their window. Second, on every worker terminal state transition: the artifact layer sweeps that task's namespace and collects expired task-scoped artifacts. Third, a periodic background sweep runs hourly (configurable) across all namespaces: collects eligible artifacts, sweeps orphaned bytes, and enforces the global storage cap. Fourth, on `artifact.publish` when caps are near: before accepting a publish, the artifact layer checks whether the target namespace would exceed its cap and runs an immediate sweep to free space if so.
+
+**Retention overrides.** The reviewer can pin a bundle via the MCP surface or CLI (`studio bundle retain <bundle-id> <duration>`), which extends retention for that bundle's artifacts. Pinned artifacts have their `gc_eligible_at` set to the pin expiry. Pins are recorded in `approval_decisions` with `decision = 'retain'`.
+
+**Orphaned byte cleanup.** Files under `memory/artifacts/hashes/` with no corresponding `artifact_metadata` row are orphans. They arise when the orchestrator crashes between writing a file and committing its metadata row, or when a metadata row is deleted but the file unlink fails (disk full, permission change). The `sweep_orphans` method runs during the periodic background sweep, not on the critical path of publish or fetch.
+
+**Behavior when a referenced artifact has been collected.** `artifact.fetch` returns error `-32007 artifact_gc_d` with the `gc_d_at` timestamp and the reason. The worker treats this as a fatal input error and surfaces it in `worker.final_report` with a structured error containing the missing descriptor. The executor distinguishes `artifact_gc_d` from `artifact_not_found` in its error classification. `artifact_not_found` signals a malformed DAG (a node declared an input that no predecessor promised to produce). `artifact_gc_d` signals a system-level timing issue (the retention window was too short for the bundle's execution duration) and surfaces differently to the reviewer.
+
+### The secrets.fetch RPC
+
+The Worker environment section states the intent to migrate from env-var secret delivery to RPC-fetched short-lived credentials. This subsection specifies that protocol. Secrets are a degenerate kind of artifact: they are named, capability-checked, fetched over RPC, never persisted in worker state, and have their own audit trail rather than artifact metadata rows.
+
+**Method: `secrets.fetch`** (worker-to-orchestrator).
+
+```
+Request:
+{
+  "jsonrpc": "2.0",
+  "method": "secrets.fetch",
+  "params": {
+    "name": "github-app-installation-token"
+  },
+  "id": 4
+}
+
+Response (success):
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "value": "ghs_xxxxxxxxxxxxxxxxxxxx",
+    "expires_at": 1715116800
+  },
+  "id": 4
+}
+```
+
+**Authentication.** The orchestrator identifies the calling worker from the RPC connection binding, established at connection setup with the one-time `STUDIO_WORKER_TOKEN` specified in Worker RPC protocol, Authentication. No additional authentication is needed for `secrets.fetch`; the connection identity is the worker identity.
+
+**Capability binding.** The orchestrator loads the calling worker's manifest and checks the `secrets` grant list for an entry matching `name`. Three conditions must hold: a grant exists with the same name; the grant is part of the worker's currently active capability set (not revoked, not expired); and the grant's delivery mechanism is compatible with `secrets.fetch`. If the grant specifies `delivery: rpc`, the fetch proceeds. If the grant specifies `delivery: env` or `delivery: file`, those are resolved at worker spawn time and the orchestrator may still serve a `secrets.fetch` for them (the worker wants to refresh a value it already has), but the default is that `delivery: rpc` is the explicit opt-in. If any condition fails, the orchestrator returns `-32001 capability_denied` with a message naming the missing grant.
+
+**Delivery format.** The secret value is returned as a plain string in the `value` field. It never touches disk in the worker environment. The worker receives it in the RPC response handler and can hold it in a local variable. The secret lives only in the worker's process memory for the lifetime of that variable. Workers should discard the variable after use (Python `del`; the next GC cycle collects the string), but the protocol does not enforce this. The defense-in-depth is process isolation: the worker's memory is private to its namespace via bubblewrap. `expires_at` is a Unix timestamp; it may be null for secrets without a known expiry.
+
+**Audit trail.** Every `secrets.fetch` call appends a line to `memory/audit/credential-use.jsonl`, extending the file format specified in Persistence and audit:
+
+```json
+{
+  "worker_id": "ulid",
+  "bundle_id": "ulid",
+  "task_id": "task-node-3",
+  "secret_name": "github-app-installation-token",
+  "purpose": "github_auth",
+  "method": "secrets.fetch",
+  "timestamp": 1715030400
+}
+```
+
+The `secret_name` is recorded, never the value. The `purpose` comes from the manifest grant. The `method` field distinguishes RPC-fetched secrets from env-var delivery (`method: "env"`) and file delivery (`method: "file"`), which existing audit entries use.
+
+**Short-lived and long-lived secrets.** `secrets.fetch` is designed for short-lived credentials. The primary v1.1 use case is the GitHub App installation token: the orchestrator calls the GitHub API to generate an installation token (1-hour expiry) on demand, caches it, and returns it. The worker uses it and discards it. For long-lived secrets (API keys that do not rotate), `env` and `file` delivery mechanisms from the manifest are more appropriate. `secrets.fetch` can serve them too, but the worker would need to call it repeatedly with no refresh benefit. If a secret has a known expiry, the orchestrator includes `expires_at` in the response; workers should re-fetch before expiry.
+
+**Refresh and rotation.** Refresh is initiated by the worker calling `secrets.fetch` again for the same name. The orchestrator may return the same value (if still valid) or a new one (if rotation is due). Rotation policy is the orchestrator's responsibility. For GitHub App installation tokens, the orchestrator caches tokens per installation and serves them until 5 minutes before expiry, then generates a new one on the next fetch. Workers see a consistent value per fetch. If a secret has been revoked at its source (the GitHub App's private key was rotated), the orchestrator's next attempt to generate a token fails, and `secrets.fetch` returns `-32009 secret_unavailable` with a message and a `retryable` boolean. If the name does not exist in the orchestrator's secret store, the error is `-32010 secret_not_found`.
+
+Error codes for `secrets.fetch`: `-32001 capability_denied` (worker lacks a secrets grant for this name, or the grant's delivery mechanism is not compatible); `-32009 secret_unavailable` (the secret store cannot produce this secret, with `retryable: true` for transient upstream failures and `retryable: false` for permanent revocation); `-32010 secret_not_found` (the name does not exist); `-32602 invalid_params` (the `name` field is missing or empty).
+
+### Crash recovery and consistency
+
+A publish spans the artifact layer, the SQLite database, the filesystem, and the executor's event queue. The operations are:
+
+1. Worker sends `artifact.publish` RPC.
+2. Orchestrator receives data, computes BLAKE3 hash.
+3. Orchestrator writes bytes (to disk for large artifacts, to SQLite BLOB for inline).
+4. Orchestrator UPSERTs `artifact_metadata` and INSERTs into `artifact_refs` in one SQLite transaction.
+5. Orchestrator enqueues `new_artifact` into the executor's event queue.
+6. Orchestrator returns success response to the worker.
+
+Four crash scenarios:
+
+**Crash during steps 1 or 2 (data in flight, nothing stored).** The worker's RPC call fails with a connection error. Following the DAG executor's retry policy, the worker retries the publish. No state exists to clean up.
+
+**Crash during step 3 (bytes stored, metadata not committed).** For inline artifacts, the BLOB write is inside the SQLite transaction, so the rollback on restart removes it. For on-disk artifacts, the file exists on disk but the metadata transaction rolled back; no metadata row exists. The file is orphaned. The periodic background sweep's `sweep_orphans` cleans it. The worker retries the publish. The retry writes the same bytes to the same file path (overwrite, same as a no-op) and this time the metadata transaction commits.
+
+**Crash during step 4 (SQLite committed, notification not sent).** The artifact exists in both `artifact_metadata` and `artifact_refs`. The `new_artifact` event was never enqueued, or was enqueued in memory and lost. On restart, the reconciler recomputes the ready set from `dag_nodes` state and `artifact_refs`. The artifact is visible in `artifact_refs`, so the ready-set computation picks it up and unblocks any successors. No special recovery code needed; the reconciler's existing logic handles this.
+
+**Crash during steps 5 or 6 (notification enqueued, response not sent).** The artifact is fully published. The in-memory event is lost. Same recovery as above: the reconciler picks up the artifact via ready-set recomputation. The worker did not receive the response and treats the publish as failed. On retry, it re-publishes. The re-publish is an UPSERT on `(namespace, name, version)`, making it idempotent. The hash is deterministic (same bytes produce the same hash). The file on disk is the same, and overwriting it is a no-op.
+
+**The non-atomic boundary** between disk writes and SQLite commits is accepted. A two-phase commit protocol spanning disk and SQLite was considered and rejected as disproportionate for a single-process system where the failure window is a crash, not a network partition. The recovery mechanisms (worker idempotent retry, reconciler ready-set recomputation, orphan sweep) handle the boundary correctly. The design converges: every publish either fully commits or is retried until it does.
+
+**Idempotency of publish.** `artifact.publish` is idempotent by design. The hash is deterministic. The UPSERT on the unique descriptor key means re-publishing to the same descriptor overwrites the previous mapping. If the bytes are identical (worker retried with the same output), the hash is identical and the file on disk is unchanged. If the bytes differ (worker produced different output on retry), the hash differs and the metadata row is updated. Consumers that resolved the descriptor before the retry may see the old bytes if they fetch before the update. This is acceptable because worker retries are rare and the artifact is versioned by descriptor; if consumers need a specific immutable snapshot, they should declare an explicit version in the descriptor. The `"latest"` semantics for reused versions correctly reflect that a re-publish changes what `"latest"` points to.
+
+### Integration with DAG validation
+
+The Task DAG schema section specifies validation rule 4: every artifact a task reads is either external (provided as bundle input) or written by some predecessor in the DAG; no reads from the future.
+
+**Static enforcement at DAG validation time.** The schema validator builds a dependency graph from the DAG. It collects all `outputs.artifacts[*].ref` descriptors (what nodes promise to produce) and all `inputs.artifacts[*].ref` descriptors (what nodes declare they will consume). For each input artifact, if the namespace is `global` or the artifact is marked as external in the input spec, the check is skipped (the artifact is assumed to pre-exist). Otherwise, the validator finds all ancestor nodes (transitive predecessors through `dag_edges`) that list this descriptor in their outputs. Validation uses literal field comparison, not glob matching, because node specs declare concrete descriptors; patterns exist only in the capability manifest. If no ancestor publishes the artifact: validation error. If an ancestor publishes it but a non-ancestor does too (a sibling or a node in an unrelated branch): validation warning, because the static structure suggests an ordering ambiguity even if the runtime scheduler will sort it out.
+
+**Dynamic enforcement at runtime.** The executor does not re-run full DAG validation (it trusts the validated DAG). It enforces artifact dependencies through scheduling: a node in `pending` state does not transition to `ready` until all its declared input artifacts exist in `artifact_refs` or, for entry nodes only, in `artifact_metadata` (for bundle inputs injected outside the DAG). If a node declares an input artifact that no predecessor publishes, the node stays `pending` forever. The 8-hour stalled-bundle detector from the Review Deck v1 spec catches this as a stall, surfaces it, and the bundle eventually fails. This is defense-in-depth: static validation catches malformed DAGs before execution; runtime scheduling catches dynamic situations where a predecessor promised to publish but failed to (the worker crashed with no retries remaining, the gate evaluated to false and the producing branch was skipped).
+
+### Streaming decision
+
+v1.1 does not support streaming for artifact transfer. The 100 MB per-artifact limit makes single-message base64-encoded JSON-RPC transfer acceptable, if inefficient. The 33% base64 overhead and the encode and decode CPU cost are tolerable at v1.1 throughput (hundreds of artifacts per bundle, not thousands per second).
+
+Streaming becomes necessary when artifacts routinely exceed 100 MB or when the base64 overhead becomes a measurable bottleneck on the orchestrator's event loop. The criteria for "routinely" and "measurable" are empirical; the first contact with real workloads will answer them.
+
+A design sketch for streaming is provided so the path is clear when the time comes. `artifact.stream_put(descriptor, total_size_bytes)` returns `{stream_id, chunk_size}`. The worker sends chunks over a binary side channel (raw TCP with length-prefixed frames, separate from the JSON-RPC control channel). The final chunk signals completion; the orchestrator computes the hash and returns it. `artifact.stream_get(descriptor)` returns `{stream_id, total_size_bytes, chunk_size}`; the orchestrator sends chunks over the binary side channel. Hash verification happens at the end when the worker computes the hash of the assembled bytes and compares to the returned hash. The binary side channel is the right substrate for streaming because JSON-RPC 2.0 has no streaming primitive and base64 is unacceptable for multi-GB transfers. This sketch is deferred in full; the single-message publish and fetch specified here are sufficient for v1.1.
+
+### Testing strategy
+
+Three layers, following the pattern established in the DAG executor's testing strategy.
+
+**MockArtifactStore** implements the `ArtifactStore` interface with an in-memory dictionary. It supports configurable delays (simulate slow disk), configurable failures (disk full, verification failure, orphan injection), and direct inspection of stored artifacts for test assertions. It is the primary test backend for executor tests that need artifact interactions.
+
+**Property-based tests on content addressing.** For any random bytes, `hash = BLAKE3(bytes)`, `put(descriptor, bytes)`, `get(descriptor)` returns the same bytes and the same hash. For any two different byte sequences, their BLAKE3 hashes differ (with overwhelming probability; the test asserts inequality for a large random sample). For any artifact fetch, the hash is re-verified; a mock that flips a bit in the stored bytes triggers `verification_failed`. For any descriptor pattern P and concrete descriptor D, `glob_match(P, D)` is consistent: if P matches D, each field matches individually; if P does not match D, at least one field fails.
+
+**GC determinism tests.** Create artifacts with known expiration times, advance a virtual clock, run the GC sweep, assert exactly the expected artifacts are collected. Verify that `ref_count > 0` prevents collection even when `gc_eligible_at` is in the past. Verify orphan cleanup: create files on disk with no metadata rows, run `sweep_orphans`, assert they are removed. Verify cap enforcement: publish artifacts until the cap is exceeded, assert GC is triggered and space is reclaimed or publishes are rejected.
+
+**Replay tests** using `artifact_metadata` and `audit_log` traces, analogous to the DAG executor's replay tests. A trace of publishes and fetches replayed against the artifact store verifies refactor correctness.
+
+No real filesystem I/O in unit tests except when specifically testing `LocalFilesystemArtifactStore`. The test suite runs on CI without special filesystem setup.
+
+### Open questions and flagged decisions
+
+**Inline threshold of 4096 bytes.** The reasoning (page-size alignment, common small-artifact sizes) is sound, but the value should be revisited after observing actual artifact size distributions in the first few dozen bundles. It is configurable and easy to change.
+
+**Retention windows.** The 7-day default for complete and rejected bundles and the 30-day default for failed bundles are calibrated to an assumed operator review cadence. If the operator routinely ignores forensic artifacts or post-mortems happen much faster or slower, these numbers should move. Both are configurable.
+
+**Global artifact default TTL.** Global artifacts currently live forever until cap-evicted or explicitly deleted. A configurable default TTL (for example, 90 days) would prevent unbounded accumulation without surprising workers, since workers that need a global artifact indefinitely should be rare. The current "forever" default is safe but may produce operational surprise when the global cap is hit and artifacts start disappearing.
+
+**Version immutability.** Currently re-publishing to any version string overwrites. Making non-`"latest"` versions immutable (rejecting re-publishes with a new `version_immutable` error) would prevent accidental overwrites and make the version field a meaningful stability signal. This is a v1.2 design question; v1.1 accepts the current overwrite semantics.
+
+**`artifact.list` pagination.** At v1.1 scale (hundreds of artifacts per bundle), a single unpaginated response is fine. If dynamic expansion routinely produces thousands of artifacts, pagination becomes necessary. The design slot is straightforward (add `limit` and `cursor` parameters to the request).
+
+**`secrets.fetch` purpose filter.** The worker currently requests by name only. If the same secret name is granted for multiple purposes in the manifest, the orchestrator resolves to the first matching grant. The worker cannot say "give me the `github_auth` version." This is fine for v1.1 since most secrets have a single purpose.
+
+**Credential-use audit aggregation for `secrets.fetch`.** Workers that refresh short-lived tokens every hour produce one audit line per hour per worker. This could become noisy for long-running bundles with many workers. An aggregation window (log a summary every N fetches) is a future refinement.
+
+### Rejected alternatives
+
+**SHA-256 as the content hash.** Considered. Rejected in favor of BLAKE3. SHA-256 is more widely recognized and has FIPS certification, but the performance delta (5 to 10 times slower) is real at artifact scale, and the system has no regulatory requirement for FIPS-certified algorithms. BLAKE3's cryptographic strength is sufficient for a threat model concerned with integrity against corruption and error rather than adversarial hash collision. Its tree-hashing structure is also forward-looking for streaming verification.
+
+**Content hash embedded in the descriptor.** Considered. Rejected because descriptors are declared before bytes exist. Embedding the hash would require a two-phase declaration (declare intent, publish bytes, update the descriptor with the hash), breaking the property that a reviewer sees the complete artifact topology in the DAG before execution begins.
+
+**All artifacts stored inline in SQLite.** Considered. Rejected because SQLite BLOB performance degrades with very large values, and storing multiple GBs of artifacts in a single SQLite file makes backup and corruption recovery harder. The 4 KB inline threshold captures the common case while keeping the database small and fast.
+
+**All artifacts stored on disk, no inline.** Considered. Rejected because small artifacts benefit from SQLite's atomic transactions (a crash during publish of a 2 KB JSON blob produces no orphan file; the transaction simply rolls back). Single-file backup is also simpler when small artifacts are included.
+
+**Pure reference-counting GC, no time-based expiry.** Considered. Rejected because global artifacts with no declared consumers would never be collected, leading to unbounded storage growth. Time-based expiry coupled with cap-pressure LRU eviction solves this.
+
+**Pure mark-and-sweep GC.** Considered. Rejected because the star topology means the orchestrator owns every artifact reference. Reference counts are always accurate and do not require a separate mark phase. Mark-and-sweep exists to address distributed systems where reference counts can drift; that failure mode is not applicable here.
+
+**Immediate GC on bundle termination, no retention window.** Considered. Rejected because forensic value is real. When a bundle fails, the operator needs the artifacts to understand why. A 7-day or 30-day retention window costs disk space that is bounded and cheap, and provides substantial operational value.
+
+**Two-phase commit protocol for artifact publish spanning disk and SQLite.** Considered. Rejected as disproportionate for a single-process system. The failure window is an orchestrator crash (not a network partition), and the recovery mechanisms (worker idempotent retry, reconciler ready-set recomputation, orphan sweep) handle the non-atomic boundary correctly.
+
+**Worker-to-worker artifact handoff bypassing the orchestrator.** Previously rejected in Bundle lifecycle: execution and integration for peer-to-peer worker communication generally. Re-stated here as applying specifically to artifact transfer. The reasoning is unchanged: it breaks the capability model, explodes the security surface, and complicates k8s deployment.
+
+**`artifact.request` and `worker.prepare_handoff` as the artifact transfer mechanism.** These methods are protocol-reserved stubs in the Worker RPC protocol section. They were designed before the artifact protocol was fully specified. With `artifact.publish` and `artifact.fetch` now specified, these methods are superseded. They should be removed from the RPC method list since they were never implemented and the new methods fully replace them.
+
+### Deferred items
+
+These items replace the current "Artifact protocol details" entry in the v1.1 Deferred items section:
+
+**Artifact streaming (stream_put and stream_get).** Deferred until artifact sizes routinely exceed 100 MB or base64 overhead becomes a bottleneck. The design sketch is in the streaming decision subsection.
+
+**Version immutability enforcement.** Making non-`"latest"` versions reject re-publishes would prevent accidental overwrites. Flagged in open questions for a v1.2 design pass.
+
+**Artifact signing.** Content hashing provides integrity; signing would provide non-repudiation. Valuable for compliance use cases but not in v1.1.
+
+**Transparent compression at the ArtifactStore layer.** Can be added without RPC or schema changes; not needed at v1.1 throughput.
+
+**`artifact.list` pagination.** Needed when artifact counts exceed the single-response practical limit. Not at v1.1 scale.
+
+**Binary side channel for artifact data.** If JSON-RPC base64 overhead becomes a bottleneck, a separate binary channel alongside the JSON-RPC control channel is the natural path. Coupled with the streaming decision.
+
+**Cross-bundle artifact sharing semantics.** The `namespace: global` pathway is the architectural home but the design for cross-bundle read grants, namespace collision policies, and global artifact lifecycle when multiple bundles reference the same artifact is not specified. Deferred under cross-bundle dependencies.
+
+**Global artifact default TTL.** Whether global artifacts should have a configurable default expiry rather than living forever. Flagged in open questions.
+
+**Credential-use audit aggregation for `secrets.fetch`.** Workers refreshing short-lived tokens every hour produce one audit entry per hour per worker. Aggregation is a future refinement.
+
+**Artifact-level immutability and pinning flags.** A `pinned` flag and an `immutable` flag on `artifact_metadata` rows, settable at publish time or by the reviewer, would give more granular retention and integrity control. Not in v1.1.
 
 ## Bundle lifecycle: planning and approval
 
@@ -1089,7 +1663,7 @@ The post-decision feedback loop is broader than originally scoped. It started as
 
 These are known gaps. Each will need its own design pass before it's implementation-ready.
 
-**Artifact protocol details.** RPC method semantics for artifact read and write (`artifact.publish`, `artifact.fetch`, `artifact.list`), content-addressing scheme for global artifacts, garbage collection policy for bundle-scoped and task-scoped artifacts, the `secrets.fetch` RPC method semantics. Multiple parts of v1.1 reference artifact descriptors and the executor specifies the minimum interface it needs (the `artifact_refs` join table and a notification channel for new-publication events), but the full lifecycle isn't specified.
+**Artifact protocol deferred items.** The following items are deferred from the Artifact Protocol section: artifact streaming (stream_put and stream_get); version immutability enforcement for non-"latest" artifact descriptors; artifact signing for non-repudiation; transparent compression at the ArtifactStore layer; `artifact.list` pagination; a binary side channel for artifact data transfer; cross-bundle artifact sharing semantics; a configurable default TTL for global artifacts; credential-use audit trail aggregation for `secrets.fetch`; artifact-level immutability and pinning metadata flags.
 
 **Bundle-level input/output schema.** Bundles take inputs (the user's request) and produce outputs (the result). The task-level input/output is formalized in the task DAG node spec; bundle-level is not. Should mirror task spec.
 
@@ -1295,9 +1869,9 @@ The prior conversation accumulated several silent supersessions and scope creeps
 
 **Areas the next design phase should plan to address.**
 
-The DAG executor is the next major design chunk. Everything from decomposition onward is a constraint on it; nothing builds on top of it yet because it doesn't exist. The deferred items list above includes all of its sub-questions.
+The DAG executor and artifact protocol, the two largest deferred chunks from the initial v1.1 consolidation, are now specified. The remaining deferred items are narrower in scope; the largest is the bundle-level input/output schema, followed by the schema versioning policy and the capability manifest review UX.
 
-The artifact protocol is the second major chunk. Multiple parts of v1.1 reference artifact descriptors but the lifecycle (creation, retention, garbage collection, capability scoping) isn't specified. The `secrets.fetch` RPC is a specific instance.
+The next major architectural addition beyond the deferred items is the k8s deployment target and its associated work (Helm chart, NetworkPolicies, PodSecurityStandards, image signing, S3-backed artifact store), which is gated on the k8s milestone rather than on design completion.
 
 A migration plan from v1 numerics to v1.1 (when v1.1 actually reaches a state that wants to revisit them) should be laid down before the surrounding system gets larger. If those numerics drift, they should drift deliberately.
 
