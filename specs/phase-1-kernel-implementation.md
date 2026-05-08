@@ -12,7 +12,7 @@ Phase 1 is scoped to the following components from the v1.1 spec:
 - Task DAG schema: linear DAGs only (no branches, no aggregation, no expansion)
 - DAG executor: node lifecycle (`pending → ready → running → completed/failed`), FIFO scheduling, heartbeat liveness
 - Bundle state machine: 12 enum values defined, 8 transition handlers implemented (see below)
-- CLI surface: `studio submit`, `studio approve`, `studio show`, `studio status`
+- CLI surface: `studio submit`, `studio approve`, `studio reject`, `studio list`, `studio show`, `studio show-worker`, `studio kill`, `studio status`
 
 Phase 1 explicitly excludes: the bundler agent, pre-execution review tracks (adversarial, security, QA), the approval matrix evaluator, MCP and GitHub Issues surfaces, mid-flight steering (Pause/Redirect/Abort/Rollback), dynamic expansion, aggregator nodes, gate nodes, and the artifact protocol layer. Worker-to-worker artifact transfer uses the git worktree instead.
 
@@ -99,20 +99,22 @@ The kernel auto-populates `bundle_id` (ULID), `filed_at`, `subject.id`, and `tas
 
 ## 2. Bundle state machine (Phase 1 subset)
 
-Define all 12 `BundleState` enum values from the spec. Phase 1 implements transition handlers for these 8 transitions:
+Define all 12 `BundleState` enum values from the spec. Phase 1 implements transition handlers for these 9 transitions:
 
-| # | From | Trigger | To | Actor |
-|---|------|---------|----|-------|
-| 1 | (none) | `bundle_input_received` | `PROPOSED` | Orchestrator |
-| 1a | `PROPOSED` | `kernel_direct_approval` | `APPROVED` | Reviewer |
-| 6 | `APPROVED` | `execution_started` | `IN_PROGRESS` | Orchestrator |
-| 9 | `IN_PROGRESS` | `all_exit_nodes_terminal` | `VERIFYING` | Orchestrator |
-| 17 | `VERIFYING` | `verification_passed` | `COMPLETE` | Orchestrator |
-| 19 | `VERIFYING` | `verification_failed_no_rollback` | `FAILED` | Orchestrator |
-| 5 | `IN_REVIEW` | `approval_matrix_rejected` | `REJECTED` | Reviewer |
-| 25 | `IN_PROGRESS` | `bundle_failed_during_execution` | `FAILED` | Orchestrator |
+| # | From | Trigger | To | Actor | Side effects | RPC notifications |
+|---|------|---------|----|-------|-------------|-------------------|
+| 1 | (none) | `bundle_input_received` | `PROPOSED` | Orchestrator | INSERT `bundles`, INSERT `dag_nodes`, INSERT `dag_edges`, INSERT `audit_log` | (none) |
+| 1a | `PROPOSED` | `kernel_direct_approval` | `APPROVED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.approved_at`, UPDATE `bundles.approved_by`, INSERT `approval_decisions`, INSERT `audit_log` | (none) |
+| 1b | `PROPOSED` | `kernel_direct_rejection` | `REJECTED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `approval_decisions`, INSERT `audit_log` | (none) |
+| 6 | `APPROVED` | `execution_started` | `IN_PROGRESS` | Orchestrator | UPDATE `bundles.state`, INSERT `audit_log` | (none) |
+| 9 | `IN_PROGRESS` | `all_exit_nodes_terminal` | `VERIFYING` | Orchestrator | UPDATE `bundles.state`, INSERT `audit_log` | (none) |
+| 17 | `VERIFYING` | `verification_passed` | `COMPLETE` | Orchestrator | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | (none) |
+| 19 | `VERIFYING` | `verification_failed_no_rollback` | `FAILED` | Orchestrator | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | (none) |
+| 25 | `IN_PROGRESS` | `bundle_failed_during_execution` | `FAILED` | Orchestrator | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | (none) |
 
 Transition 1a (`PROPOSED → APPROVED`) is marked `[PHASE-1-ONLY]`. It exists only when `kernel_mode = true` (set at orchestrator startup). In Phase 2 (full system mode), this transition is removed and `bundler_completed` (transition 2) is the only legal path out of `PROPOSED`.
+
+**Transition 1b** (`PROPOSED → REJECTED`) [PHASE-1-ONLY]: Mirrors transition 1a. Allows the reviewer to reject a submitted bundle directly from the CLI (`studio reject <id>`) without entering the review flow. Legal only when `kernel_mode = true`. Removed in Phase 2 when the bundler and approval matrix exist.
 
 The remaining 4 enum values (`IN_REVIEW`, `PAUSED`, `REDIRECTING`, `PARKED`) are defined in the enum but never reached in Phase 1 execution. Their presence prevents a schema migration in Phase 2.
 
@@ -407,7 +409,7 @@ Reconciliation is idempotent. Running it twice on the same SQLite state produces
 
 ## 9. CLI surface
 
-Three commands:
+Seven commands:
 
 **`studio submit <path>`**
 Reads the submission JSON, validates it, creates a `bundles` row in `PROPOSED` state, and prints the bundle ID.
@@ -423,6 +425,22 @@ $ studio approve 01JXYZ...
 Bundle 01JXYZ... approved. Starting execution.
 ```
 
+**`studio reject <bundle-id>`**
+Executes transition 1b (`PROPOSED → REJECTED`). Legal only when `kernel_mode = true` and bundle is in `PROPOSED` state. Prompts for an optional reason string; if none given, records `"rejected via CLI"`.
+```
+$ studio reject 01JXYZ...
+Bundle 01JXYZ... rejected.
+```
+
+**`studio list`**
+Lists all non-terminal bundles with state, age, and first line of idea. Sorted by `created_at` descending. Accepts `--state <state>` to filter and `--json` for machine-readable output.
+```
+$ studio list
+ID              STATE        AGE     IDEA
+01JXYZ...       IN_PROGRESS  4m      Build a hello-world web server
+01JABC...       PROPOSED     12m     Add logging to API
+```
+
 **`studio show <bundle-id>`**
 Reads `bundles` and `dag_nodes` for the bundle and prints a status report:
 ```
@@ -431,6 +449,29 @@ Bundle: 01JXYZ...
 State: IN_PROGRESS
 Idea: Build a hello-world web server
 Nodes: 3 total, 1 completed, 1 running, 1 pending
+```
+
+**`studio show-worker <worker-id>`**
+Shows worker detail: state, current phase from last heartbeat, time since last heartbeat, tail of last 20 log lines from `audit_log` for this worker, exit reason if terminal.
+```
+$ studio show-worker w_01JXYZ...
+Worker:       w_01JXYZ...
+Bundle:       01JXYZ...
+State:        running
+Phase:        writing-code
+Last hb:      23s ago
+Log (last 20 lines):
+  [info] Wrote src/main.py
+  [info] Running tests...
+```
+
+**`studio kill <bundle-id>`**
+Aborts an in-progress bundle. Sends SIGTERM to all running worker processes, waits up to 30 seconds for clean exit, then SIGKILL. Transitions `workers.state` to `killed`. Transitions `bundles.state` to `failed` with `exit_reason = "killed_by_reviewer"`. Legal from `IN_PROGRESS` only.
+```
+$ studio kill 01JXYZ...
+Sending SIGTERM to 1 worker(s)...
+Worker w_01JXYZ... killed.
+Bundle 01JXYZ... failed.
 ```
 
 **`studio status`**
@@ -496,6 +537,17 @@ $ systemctl start studio-orchestrator
 ```
 
 Verification: `workers` row is `failed` with `exit_reason = 'orchestrator_crash'`, `dag_nodes` row is `failed` with `failure_reason = 'worker_killed_on_crash'`, `bundles.state = 'failed'`.
+
+### Bundle 5: Rejection
+```
+$ studio submit tests/fixtures/hello-world-bundle.json
+Bundle submitted: <id>
+
+$ studio reject <id>
+Bundle <id> rejected.
+```
+
+Verification: `bundles.state = 'rejected'`, `bundles.completed_at` is set, an `approval_decisions` row exists with `decision = 'rejected'` and `surface = 'cli'`.
 
 ## 11. Test fixtures
 
