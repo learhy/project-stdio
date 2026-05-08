@@ -845,3 +845,109 @@ The rollback bundle gets its own Verification Plan, produced by the QA agent dur
 - **Successful rollback:** The original bundle stays in `COMPLETE` (it was shipped; the net is zero after rollback but the record is accurate). The rollback event is appended to the original bundle's `steering_events`. The rollback bundle completes with `outcome: shipped`.
 - **Failed rollback:** The original bundle is annotated with `rollback_failed: true` in `outcome_json`. The reviewer is paged via the notification surface. The rollback bundle completes with `outcome: failed`. This is the worst case: bad code shipped, and the undo failed too. The reviewer must intervene manually.
 - **Auto-rollback (verification-driven):** The original bundle transitions through `VERIFYING → IN_PROGRESS` (Transition 20) during rollback execution. When the rollback bundle completes, the original bundle transitions to `FAILED` (the original work failed verification, even though rollback repaired it). The original bundle's `outcome_json.verification.rollback_triggered` is `true` and `rollback_bundle_id` points to the rollback bundle. Terminal state: `FAILED` for the original, `COMPLETE` (or `FAILED`) for the rollback.
+
+---
+
+## Ratified open questions
+
+The following open questions from the v1.1 spec were put to the PM and decided. These are recorded as resolved; they should be removed from the Open Questions section when this design is integrated.
+
+### Pre-execution review ordering: confirmed
+
+**Decision.** Pre-execution review tracks (adversarial critique, security review, QA verification planning) run before the approval matrix. Their outputs feed the matrix decision. Auto-ship is gated on their results. This ordering is ratified.
+
+**Spec reference.** Open questions: "Pre-execution review ordering" — the sentence "(This ordering was inferred during consolidation; the prior conversation didn't make it explicit. Confirm.)" in Bundle lifecycle: planning and approval is now resolved. Remove the parenthetical.
+
+**How this interacts with the state machine.** The flow is: `PROPOSED → IN_REVIEW` (bundler completes, review tracks dispatch) → review tracks run → `IN_REVIEW → APPROVED` or `IN_REVIEW → REJECTED` (approval matrix evaluates, consuming review track outputs). See Transition 2, 4, 5 in the state machine.
+
+### Modification re-scoring: yes, always
+
+**Decision.** When a bundle is modified via `/modify`, the bundler re-scores complexity and risk. If the new score changes the approval tier, the new tier applies. The prior score is preserved in the audit log for calibration.
+
+**Spec reference.** Open questions: "Modification request re-scoring" — marked as "Not committed." Now committed: re-score always.
+
+**Implementation detail.** The prior score is stored in `bundles.outcome_json.steering_events` as part of each modification event:
+```json
+{
+  "action": "modify",
+  "at": "<ISO8601>",
+  "by": "<actor>",
+  "note": "<instructions>",
+  "score_delta": {
+    "complexity": {"from": 3, "to": 5},
+    "risk": {"from": 1, "to": 2},
+    "tier": {"from": "approve-with-summary", "to": "full-review"}
+  }
+}
+```
+
+### Steering vocabulary: all four verbs ratified
+
+**Decision.** Pause, Redirect, Abort, and Rollback are all ratified as specified in this document.
+
+**Spec reference.** Open questions: "Mid-flight steering vocabulary acceptance" — flagged as "Open question: ratify, revise, or expand." Now ratified. The verbs were originally noted as "Claude-recommended after the reviewer explicitly said 'I honestly do not know the answer'" and "folded into the spec without being explicitly ratified." That status is now resolved.
+
+### Default action for summary-tier timeouts: default-hold across the board
+
+**Decision.** Regardless of risk cell, the default when the PM does not respond within the configured window is **hold** (require explicit response). This applies until the calibration loop has accumulated enough history to justify auto-approve on specific cells. The PM can change individual cells in `settings.json`.
+
+**Spec reference.** Open questions: "Default action for summary-tier timeouts" — the previous default was "default-approve after 4 hours for low-risk cells, default-hold for moderate-risk." Now changed to "default-hold across the board."
+
+**Implementation.** The `settings.json` field `approval.default_action` changes from `"approve"` (for low-risk) to `"hold"` for all summary cells. The per-cell override structure remains so the PM can selectively re-enable auto-approve later:
+```json
+{
+  "approval": {
+    "summary_tier_default_action": "hold",
+    "default_action_overrides": {
+      "low_risk_low_complexity": "hold",
+      "low_risk_moderate_complexity": "hold",
+      "moderate_risk_low_complexity": "hold"
+    },
+    "summary_timeout_hours": 4
+  }
+}
+```
+
+---
+
+## Resolved items
+
+Every gap, open question, and deferred item this document closes, referenced by the exact name used in the v1.1 spec:
+
+**From Deferred items:**
+- `Bundle-level input/output schema` — Resolved by: Bundle input schema and Bundle output schema sections.
+- `Two-tier repo boundary` (specifically the `target:` field) — Resolved by: The `target:` field section (decision rule, boundary, mechanics, cross-target policy).
+- `Modification during pause: executor's role in re-planning` — Resolved by: Redirect mechanics (re-planning flow ratified, snapshot definition, replay provenance).
+
+**From Open questions and flagged decisions:**
+- `Mid-flight steering vocabulary acceptance` — Ratified by PM: all four verbs accepted.
+- `Pre-execution review ordering` — Ratified by PM: confirmed, review tracks before approval matrix.
+- `Modification request re-scoring` — Ratified by PM: yes, always re-score.
+- `Default action for summary-tier timeouts` — Ratified by PM: default-hold across the board.
+- `Cooldown duration for the highest-risk tier` — Resolved by: 1 hour, with 24-hour carve-out for bundles flagged `irreversible` (defined in target field section, approval matrix cooldown spec).
+- `Multi-surface action ordering and race resolution` — Resolved by: first-write-wins via SQLite serialization, conflict error with context (specified in Bundle lifecycle: planning and approval, Default actions/cooldown/race section in the main spec).
+- `Two-tier repo target: field semantics` — Resolved by: The `target:` field section (complete specification).
+
+---
+
+## Remaining open
+
+Items this document could not resolve, with specific blockers:
+
+1. **`irreversible` flag formal schema slot.** The concept is introduced (bundles where rollback is not machine-executable get a 24-hour cooldown instead of 1 hour). The exact schema field in the bundle proposal, its population by the bundler, and its surfacing in the reviewer's UI are deferred. Blocker: needs a schema design pass to add the field to `bundle_output.proposal` and the approval matrix evaluator. Provisional: the field is a boolean `irreversible: bool` in the proposal, default `false`, set by the bundler based on the Verification Plan's `rollback_plan.machine_executable` flag.
+
+2. **Abbreviated review threshold on Redirect.** When a bundle is redirected, the pre-execution review tracks examine "only the delta" from the prior review. The threshold for "delta is large enough to warrant full re-review" is not formally specified. Blocker: needs calibration data on how often abbreviated review misses issues. Provisional: review track agents self-escalate when the delta exceeds their confidence threshold. A formal threshold (e.g., "more than 30% of DAG nodes changed") is a future refinement.
+
+3. **Auto-rollback eligibility for medium-stakes bundles.** Auto-rollback on QA failure is currently restricted to Low-stakes bundles. Expanding to medium-stakes is gated on empirical rollback reliability data. Blocker: no production data exists in v1.1. Provisional: Low-stakes only until rollback bundles demonstrate >95% success rate over at least 20 rollbacks.
+
+4. **Parked bundle lifecycle.** The `PARKED` terminal state exists in the state machine but the workflow around it (how parked bundles are discovered in the review surface, whether they auto-expire, how they are resumed) is not specified. Blocker: needs a separate design pass on parked-bundle UX. Not blocking implementation of the state machine transition itself.
+
+---
+
+## New drift detected
+
+No new contradictions or ambiguities were discovered in the existing spec while writing this document. The existing spec's Drift detected during consolidation section already covers the known supersessions. The four gaps this document closes were explicitly flagged as deferred or open; resolving them does not introduce drift.
+
+One item of note, not drift but worth flagging for the integration pass:
+
+**State machine sketch in Architecture section.** The ASCII diagram in the Architecture section (lines 177-189 in the current spec) shows 8 states and approximately 12 transitions. This document specifies 12 states and 25 transitions. The Architecture section's sketch should be replaced with a reference to the full specification in Bundle lifecycle: execution and integration during the integration pass. The sketch is not wrong (all depicted transitions remain legal) but it is incomplete. The SQLite schema comment for `bundles.state` must also be updated from the current `proposed|approved|in_progress|verifying|complete|failed|rejected` to the full 12-state enum.
