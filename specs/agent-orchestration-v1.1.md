@@ -106,7 +106,7 @@ CREATE TABLE workers (
   id TEXT PRIMARY KEY,
   bundle_id TEXT NOT NULL REFERENCES bundles(id),
   task_index INTEGER NOT NULL,
-  state TEXT NOT NULL,             -- pending|running|complete|failed|killed|connection_lost
+  state TEXT NOT NULL,             -- pending|running|paused|complete|failed|killed|connection_lost
   pid INTEGER,
   started_at INTEGER,
   last_heartbeat INTEGER,
@@ -202,6 +202,8 @@ Terminal states (`complete`, `parked`, `failed`, `rejected`, `aborted`) permit n
 
 The full reconciliation protocol with edge cases (worker completing during crash, aggregator cancellation in-flight) is specified in the DAG executor section under Checkpointing and crash recovery.
 
+Phase 1 note: in Phase 1 (kernel-mode without bundler, MCP, or GitHub Issues), Step 1's paused-worker branch is a no-op (no Phase 1 code path produces `paused` workers), and Step 4 (replay unread approval decisions) is a no-op (the `approval_requests` table is unused). The implementing agent writes the reconciliation logic for all steps; the Phase 1 execution path never hits the paused or approval-replay branches.
+
 ## Worker runner abstraction
 
 Workers don't run as plain processes. They run inside an isolation boundary, and the boundary is enforced by an interface called `WorkerRunner`. Two implementations are envisioned: `LocalBwrapWorkerRunner` for v1.1, and `K8sJobWorkerRunner` as a future implementation. Both produce a `WorkerHandle` that the rest of the orchestrator talks to identically.
@@ -226,7 +228,9 @@ A few k8s-specific concerns are out of scope for the v1.1 implementation but are
 
 **Per-worker resource limits**, configurable per worker class via the capability manifest, with these defaults [PROVISIONAL: sized to the 30 GB dev box, need validation against real worker memory profiles]: 4 GB RAM, 2 CPU, 10 GB disk. There is no global wall-clock kill in v1.1; that policy was originally specified but replaced with heartbeat-based liveness plus learned p95 timeouts per worker class, because Ollama Cloud iteration latency is meaningfully slower than frontier-API iteration latency and a single global timeout proved hard to set right. [PROVISIONAL] First-run timeout defaults are 2 hours for small tasks, 4 hours for medium, 8 hours for large. These must survive first contact with real workloads before being ratified.
 
-**Heartbeats** are emitted on every state transition, with a maximum interval of 60 minutes [PROVISIONAL: needs empirical validation against observed Ollama Cloud iteration latency; the 60-minute value may be too long for fast tasks and too short for models with multi-minute think phases]. Each heartbeat includes a `phase` field with values `thinking`, `tool-call`, `writing-code`, `running-tests`, or `idle`, so that "slow but alive" is distinguishable from "wedged." A worker that crosses 2x its expected timeout surfaces as a capability-board entry suggesting model upgrade or task decomposition, rather than being auto-killed.
+**Heartbeats** are emitted on every state transition, with a maximum interval of 60 minutes [PROVISIONAL: needs empirical validation against observed Ollama Cloud iteration latency; the 60-minute value may be too long for fast tasks and too short for models with multi-minute think phases]. Each heartbeat includes a `phase` field with values `starting`, `thinking`, `tool-call`, `writing-code`, `running-tests`, or `idle`. The `starting` value is the canonical first heartbeat emitted after worker spawn, before the worker begins meaningful work; it signals that the worker process is alive and the RPC connection is established. All other values describe the worker's current activity, so that "slow but alive" is distinguishable from "wedged." A worker that crosses 2x its expected timeout surfaces as a capability-board entry suggesting model upgrade or task decomposition, rather than being auto-killed.
+
+**Heartbeat-driven worker state updates.** On receiving a `worker.heartbeat` notification, the orchestrator always updates `workers.last_heartbeat` to the current timestamp. On the first heartbeat received from a worker in `pending` state, the orchestrator additionally transitions `workers.state` from `pending → running`. This is the mechanism by which a newly-spawned worker signals that it is alive and has established its RPC connection. Subsequent heartbeats from a worker already in `running`, `paused`, or `connection_lost` state update only `last_heartbeat`. A heartbeat from a worker in a terminal state (`complete`, `failed`, `killed`) is logged as a warning and ignored for state-update purposes.
 
 **Filesystem layout.** The bundle's feature branch is checked out into the runner workspace. Each worker gets its own git worktree on a sub-branch of the feature branch, which is what the per-worker-tree-per-worker-branch decision means in concrete terms. Workers read the entire repo but write only within their assigned subdirectory; this is enforced by orchestrator review of commits, not by filesystem permissions, because tying it to file permissions is too brittle. Persistent caches mount from the host: language package caches (`~/.npm`, `~/.cache/pip`, `~/go/pkg`, `~/.cargo`), Docker layer cache, build artifacts where safe.
 
@@ -306,7 +310,7 @@ Request:
   "jsonrpc": "2.0",
   "method": "worker.heartbeat",
   "params": {
-    "phase": "thinking" | "tool-call" | "writing-code" | "running-tests" | "idle",
+    "phase": "starting" | "thinking" | "tool-call" | "writing-code" | "running-tests" | "idle",
     "progress": "<human-readable summary>",
     "current_step": "<string or null>",
     "estimated_completion_seconds": <int or null>
@@ -368,13 +372,25 @@ Response (denied):
 
 **`cap.check`** — Fast path for already-granted capabilities. Returns synchronously.
 
+`op_descriptor` format: `<category>.<operation>[:<resource>]` where category is one of `filesystem`, `network`, `process`, `secrets`, `rpc`, `resources`. The resource segment is optional and category-dependent.
+
+Examples:
+- `filesystem.write:/work/src/main.py` — check write permission for a specific path
+- `filesystem.read:/work/src/config` — check read permission for a path
+- `network.egress:api.github.com:443` — check egress to a host:port
+- `process.exec:/usr/bin/git` — check binary execution permission
+- `rpc.method:artifact.publish` — check RPC method invocation permission
+- `rpc.artifact_access.read:bundle:test-results:*` — check artifact read pattern
+
+The dispatcher parses the category prefix, extracts the operation and resource, and dispatches to the appropriate category-specific capability check against the worker's manifest.
+
 ```
 Request:
 {
   "jsonrpc": "2.0",
   "method": "cap.check",
   "params": {
-    "op_descriptor": "<string naming the operation>"
+    "op_descriptor": "<category>.<operation>[:<resource>]"
   },
   "id": <int>
 }
@@ -2482,6 +2498,7 @@ The bundle state machine is the authoritative source for what transitions are le
 | # | From | Trigger | To | Actor | SQLite writes | Event enqueued |
 |---|------|---------|----|-------|---------------|----------------|
 | 1 | (none) | `bundle_input_received` | `PROPOSED` | Orchestrator | INSERT `bundles` row, INSERT `audit_log` | (none) |
+| 1a | `PROPOSED` | `kernel_direct_approval` | `APPROVED` | Reviewer | UPDATE `bundles.state`, UPDATE `bundles.approved_at`, UPDATE `bundles.approved_by`, INSERT `approval_decisions`, INSERT `audit_log` | (none) |
 | 2 | `PROPOSED` | `bundler_completed` | `IN_REVIEW` | Bundler agent | UPDATE `bundles.state`, UPDATE `bundles.proposal_json`, INSERT `audit_log`, INSERT pre-execution track dispatch records | `review_tracks_dispatched` |
 | 3 | `IN_REVIEW` | `review_tracks_completed` | `PROPOSED` | Review track agent (on finding blocking issue) | UPDATE `bundles.state`, UPDATE `bundles.concerns_json`, INSERT `audit_log` | (none) |
 | 4 | `IN_REVIEW` | `approval_matrix_approved` | `APPROVED` | Orchestrator (auto) or Reviewer (manual) | UPDATE `bundles.state`, UPDATE `bundles.approved_at`, UPDATE `bundles.approved_by`, INSERT `approval_decisions`, INSERT `audit_log` | (none) |
@@ -2508,6 +2525,8 @@ The bundle state machine is the authoritative source for what transitions are le
 | 25 | `IN_PROGRESS` | `bundle_failed_during_execution` | `FAILED` | Orchestrator (on unrecoverable DAG failure) | UPDATE `bundles.state`, UPDATE `bundles.completed_at`, UPDATE `bundles.outcome_json`, INSERT `audit_log` | (none; in-flight workers left running per executor design) |
 
 **Transitions requiring special attention:**
+
+**Transition 1a** (`PROPOSED → APPROVED`) [PHASE-1-ONLY]: This transition exists in v1.1 Phase 1, when the bundler agent is not yet implemented. It allows the human reviewer to approve a bundle directly from the CLI surface (`studio approve <id>`) without the bundler producing a proposal or pre-execution review running. The transition is removed in Phase 2 when the bundler exists; at that point `bundler_completed` (transition 2) becomes the only legal path out of `PROPOSED`. The state machine validates this transition only when a `kernel_mode` flag is set at orchestrator startup; in full system mode the transition is treated as illegal with reason "Bundle has not been reviewed. Wait for pre-execution review and approval."
 
 **Transition 3** (`IN_REVIEW → PROPOSED`): Triggered when a review track finds a blocking issue and the bundler must revise. Not the same as `/modify` (which is reviewer-initiated). The review track agent sets `bundles.concerns_json` with the blocking finding.
 
@@ -2571,6 +2590,8 @@ The state machine validates by checking membership in a frozenset of `(from_stat
 **Surface observability.** SQLite: `bundles.state` is the authoritative source, updated in the same transaction as the transition. MCP: `studio://bundles/{id}` reads state directly. GitHub Issues: on every state transition, the bundle's issue is updated — body appends a transition timeline entry `"[{timestamp}] {from_state} → {to_state} by {actor} via {surface}"` and labels are swapped (old state label removed, new added: `state/proposed`, `state/in-review`, etc.). CLI: `studio show <bundle-id>` displays current state and transition history from `audit_log`.
 
 **Implementation notes.** The state machine does NOT mutate executor state directly. It enqueues events (`bundle_pause_requested`, `bundle_abort_requested`, etc.) into the executor's event queue. The executor's event pump picks up these events on the next tick and performs the executor-level actions. The bundle state machine and the DAG executor communicate through the event queue and SQLite, not through direct method calls. The two state spaces (bundle state and DAG node states) are in separate tables and are not locked together.
+
+The implementing agent defines all 12 enum values in `BundleState` (Python `StrEnum`) even though Phase 1 implements transition handlers for only a subset. The unused values (`redirecting`, `verifying`, `parked`) are valid future states defined in the schema. Their presence at definition time prevents a migration when Phase 2 adds the bundler, QA agent, and redirecting machinery. Phase 2 adds transition handlers; it does not add new enum values.
 
 ### Mid-flight steering mechanics
 
@@ -3321,35 +3342,44 @@ Broken or vague cross-references corrected:
 
 No half-specified behavior was moved to the Deferred Items section during this pass. The four items that appeared to be half-specified (secrets.fetch protocol, reducer registry, expression sublanguage grammar) were discovered to already be fully specified in later sections of the document. Their earlier "deferred" labels were stale. These were corrected to cross-references rather than split into the Deferred Items section, since the behavior was already fully specified elsewhere.
 
+### Phase 1 readiness fixes (2026-05-08)
+
+After the initial editorial pass, a Phase 1 readiness assessment identified three blocking issues and four non-blocking ambiguities. The following fixes were applied:
+
+**Fixed blocking issues:**
+1. **[workers.state schema]** Added `paused` to `workers.state` schema comment. Full enumeration: `pending|running|paused|complete|failed|killed|connection_lost`. The `running -> paused` transition occurs in the worker row when pause completes, matching the `dag_nodes` state transition.
+2. **[Bundle state machine]** Added kernel-mode transition: `PROPOSED → APPROVED` (trigger: `kernel_direct_approval`, actor: Reviewer). This transition exists in v1.1 Phase 1 only, when the bundler agent is not yet implemented. It is removed in Phase 2 when the bundler exists and `bundler_completed` becomes the only path from `PROPOSED`. The transition is marked `[PHASE-1-ONLY]` in the transition table.
+3. **[Worker RPC protocol, cap.check]** Specified `op_descriptor` structured format: `<category>.<operation>[:<resource>]`. Examples: `filesystem.write:/work/src/main.py`, `network.egress:api.github.com:443`, `process.exec:/usr/bin/git`, `rpc.method:artifact.publish`. The dispatcher parses the category prefix and dispatches to the appropriate category-specific capability check.
+
+**Fixed non-blocking ambiguities:**
+4. **[worker.heartbeat phase enum]** Added `starting` to the heartbeat phase enum. Full set: `starting | thinking | tool-call | writing-code | running-tests | idle`. The `starting` value is the canonical first heartbeat emitted after worker spawn, before the worker begins meaningful work.
+5. **[worker.heartbeat state updates]** Specified that `worker.heartbeat` updates `workers.last_heartbeat` on every call. On the first heartbeat received from a worker in `pending` state, it additionally transitions `workers.state` from `pending → running`. Subsequent heartbeats from a worker already in `running` state only update `last_heartbeat`.
+6. **[Crash recovery Phase 1 no-ops]** Step 1's "paused" branch: in Phase 1, no transition produces paused workers, so this branch is a no-op. Step 4 (replay approval decisions): in Phase 1, the `approval_requests` table is unused (no MCP, no GitHub Issues surface), so this step is a no-op. The implementing agent writes the reconciliation logic for all steps but the Phase 1 execution path never hits the paused or approval-replay branches.
+7. **[State machine enum completeness]** The implementing agent defines all 12 enum values in `BundleState` (Python `StrEnum`) even though Phase 1 implements only 8 transition handlers. The unused values (`redirecting`, `verifying`, `parked`) are valid future states and their presence prevents a schema migration when Phase 2 adds the bundler, QA agent, and redirecting machinery.
+
 ### Gaps found but not filled
 
 The following are design gaps that an implementing agent would encounter. They need a design pass before implementation can proceed. None were filled during this editorial pass.
 
-**1. Workers table missing `paused` state.**
-- **Location**: Architecture section, SQLite schema comment at `workers.state` (currently `pending|running|complete|failed|killed|connection_lost`).
-- **Which agent hits it**: The agent implementing the WorkerRunner or the pause/resume mechanics.
-- **Question**: When a bundle pauses, workers stay alive and idle, waiting for `worker.resume()`. Their DAG nodes transition to `paused` state. Should the `workers` table also have a `paused` state, or should paused workers remain in `running` state? If they remain `running`, the crash recovery kill-all in step 1 can't distinguish "worker was actively running" from "worker was paused," and both get marked `failed` with `orchestrator_crash`. If they get a `paused` state, the reconciler could potentially resume them instead of killing them (though the current ratified policy is kill-all regardless).
-- **Recommendation**: Add `paused` to the `workers.state` schema comment and define the transition `running -> paused` on the worker row when pause completes. The reconciler still kills paused workers, but the audit trail is cleaner and the state accurately reflects reality.
-
-**2. `irreversible` flag formal schema slot.**
+**1. `irreversible` flag formal schema slot.**
 - **Location**: Bundle lifecycle: planning and approval (cooldown carve-out). The Deferred items section already lists this as deferred.
 - **Which agent hits it**: The agent implementing the approval matrix evaluator and the bundle output schema.
 - **Question**: Where exactly in the bundle proposal schema does the `irreversible` flag live? Is it a field on the proposal (`proposal.irreversible: bool`) or a property derived from the verification plan's rollback assessment? The approval matrix cooldown logic needs to read it; the bundle output schema needs to serialize it.
 - **Recommendation**: Add `irreversible: bool` to the `bundle_output.proposal` block and to the `bundles` table as a column. Default `false`. Set by the bundler during planning. The approval matrix evaluator reads `bundles.irreversible` to determine cooldown duration (1 hour vs. 24 hours).
 
-**3. Mermaid rendering caching not specified.**
+**2. Mermaid rendering caching not specified.**
 - **Location**: Open questions, "Mermaid rendering frequency."
 - **Which agent hits it**: The agent implementing the MCP resource handlers and GitHub comment updates.
 - **Question**: The spec says mermaid rendering "is cheap enough to re-render on every MCP resource fetch." For large DAGs with hundreds of nodes (possible after aggressive expansion), "cheap enough" may not hold. Should the implementing agent add caching, or should it re-render unconditionally and defer caching until a performance problem is observed?
 - **Recommendation**: The implementing agent should re-render unconditionally in v1.1 and add a `TODO` comment marking the spot for a state-hash-based cache. The cache invalidation key is the max `node_state_history.id` for the bundle's DAG. This is a 10-line optimization deferred until needed.
 
-**4. Approve-with-summary tier default action contradiction.**
+**3. Approve-with-summary tier default action contradiction.**
 - **Location**: Bundle lifecycle: planning and approval.
 - **Which agent hits it**: The agent implementing the approval matrix evaluator and the timer-based auto-action logic.
 - **Question**: The approval matrix table description says "Default if reviewer doesn't respond in the configured window: low-risk cells default-approve after 4 hours; moderate-risk cells default-hold." But the "Default actions, cooldown durations" subsection says "PM ratified: default-hold across the board" and the `settings.json` snippet shows all actions set to `"hold"`. Which is authoritative?
 - **Recommendation**: The "default-hold across the board" ratification is authoritative. The matrix table description should be updated to say "Default action: hold (require explicit response). The per-cell overrides in settings.json start at hold and may be changed to approve after the calibration loop has accumulated enough history." This is a spec bug, not an editorial ambiguity.
 
-**5. Gate human-approval default timeout.**
+**4. Gate human-approval default timeout.**
 - **Location**: Deferred items, "Human-approval gate timeout."
 - **Which agent hits it**: The agent implementing gate node mechanics and the stalled-bundle detector.
 - **Question**: The spec does not specify a default timeout for `human_approval` gates. The 8-hour stalled-bundle detector catches the case indirectly. An implementing agent needs to know what value to use for `approval_timeout` on gate creation.
