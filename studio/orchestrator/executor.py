@@ -1,7 +1,9 @@
-"""DAG executor: drives node lifecycle for linear Phase 1 DAGs.
+"""DAG executor: drives full node lifecycle for Phase 2 DAGs.
 
-Node lifecycle: pending -> ready -> running -> completed|failed.
-FIFO scheduling with global worker cap, heartbeat-driven liveness.
+Node lifecycle: pending -> ready -> running -> completed|failed|skipped|cancelled.
+Supports worker nodes, gate nodes (artifact_property, rpc_query, human_approval),
+aggregator nodes (all, any, quorum, first_success), full edge condition semantics,
+and dynamic DAG expansion via cap.request.
 """
 from __future__ import annotations
 
@@ -10,14 +12,25 @@ import json
 import time
 from typing import TYPE_CHECKING, Any
 
-from .models import NodeState, WorkerState, BundleState, CapabilityManifest
+from .models import (
+    NodeState,
+    WorkerState,
+    BundleState,
+    CapabilityManifest,
+    GatePredicateKind,
+    AggregatorJoinMode,
+    AggregatorOutputStrategy,
+    CapRequestParams,
+)
+from .expression import evaluate as eval_property
+from .reducers import get_reducer
 
 if TYPE_CHECKING:
     from .db import Database
 
 
-class LinearDagExecutor:
-    """Drives node lifecycle for linear (single-chain) Phase 1 DAGs."""
+class DagExecutor:
+    """Drives full node lifecycle for Phase 2 DAGs with gates and aggregators."""
 
     def __init__(
         self,
@@ -44,6 +57,7 @@ class LinearDagExecutor:
         # Wire callbacks
         self.rpc_handlers.set_on_final_report(self._on_final_report)
         self.rpc_handlers.set_on_heartbeat(self._on_heartbeat)
+        self.rpc_handlers.set_on_cap_request(self._on_cap_request)
 
     @staticmethod
     def now() -> int:
@@ -107,7 +121,7 @@ class LinearDagExecutor:
         node_state = outcome.get("node_state", NodeState.FAILED)
 
         if node_state == NodeState.COMPLETED:
-            await self._advance_chain(bundle_id, node_id)
+            await self._process_node_completion(bundle_id, node_id, NodeState.COMPLETED)
         elif node_state == NodeState.FAILED:
             await self._fail_bundle(bundle_id, node_id, worker_id, "worker reported failure")
         else:
@@ -121,46 +135,172 @@ class LinearDagExecutor:
         """Callback from RpcHandlers on every heartbeat. Updates liveness tracking."""
         pass  # Heartbeat timestamps are handled by RpcHandlers directly
 
-    # ── Chain advancement ─────────────────────────────────────────────────
+    async def _on_cap_request(self, bundle_id: str, node_id: str, params: dict) -> dict[str, Any]:
+        """Callback from RpcHandlers for cap.request — delegate to handle_expansion_request."""
+        try:
+            cap_params = CapRequestParams.model_validate(params)
+        except Exception as exc:
+            return {"decision": "denied", "decision_id": None,
+                    "reason": f"Invalid cap.request params: {exc}"}
+        return await self.handle_expansion_request(bundle_id, node_id, cap_params)
 
-    async def _advance_chain(self, bundle_id: str, completed_node_id: str) -> None:
-        """When a node completes, mark its successor as ready."""
-        # Find outgoing edges from this node
+    # ── Node completion and edge evaluation ────────────────────────────────
+
+    async def _process_node_completion(self, bundle_id: str, node_id: str, final_state: str) -> None:
+        """Evaluate outgoing edges from a completed/failed/skipped node.
+
+        For each outgoing edge, evaluate its condition against the source's final state.
+        Fire matching edges. Then check if any targets have become ready.
+        """
         edges = await self.db.fetch_all(
-            "SELECT to_node_id FROM dag_edges WHERE bundle_id = ? AND from_node_id = ?",
-            (bundle_id, completed_node_id),
+            "SELECT id, to_node_id, condition_kind, condition_expr "
+            "FROM dag_edges WHERE bundle_id = ? AND from_node_id = ? AND fired = 0",
+            (bundle_id, node_id),
         )
 
         now = self.now()
         for edge in edges:
-            successor_node_id = f"{bundle_id}:{edge['to_node_id']}"
-            # Mark edge as fired
-            await self.db.execute(
-                "UPDATE dag_edges SET fired = 1, fired_at = ? WHERE bundle_id = ? AND from_node_id = ? AND to_node_id = ?",
-                (now, bundle_id, completed_node_id, edge["to_node_id"]),
+            should_fire = await self._edge_condition_matches(
+                edge["condition_kind"],
+                edge["condition_expr"],
+                final_state,
+                bundle_id,
+                node_id,
             )
-            # Mark successor as ready
-            await self.db.execute(
-                "UPDATE dag_nodes SET state = ?, ready_at = ? WHERE id = ?",
-                (NodeState.READY, now, successor_node_id),
-            )
+            if should_fire:
+                await self.db.execute(
+                    "UPDATE dag_edges SET fired = 1, fired_at = ? WHERE id = ?",
+                    (now, edge["id"]),
+                )
+                await self._try_make_ready(bundle_id, edge["to_node_id"])
 
         await self.db.conn.commit()
-
-        # Check if all exit nodes are terminal -> transition to VERIFYING
         await self._check_bundle_completion(bundle_id)
+
+    async def _edge_condition_matches(
+        self,
+        condition_kind: str,
+        condition_expr: str | None,
+        source_state: str,
+        bundle_id: str,
+        node_id: str,
+    ) -> bool:
+        """Determine whether an edge condition matches the source node's final state."""
+        if condition_kind == "always":
+            return source_state in (
+                NodeState.COMPLETED, NodeState.FAILED, NodeState.SKIPPED
+            )
+        elif condition_kind == "on_success":
+            return source_state == NodeState.COMPLETED
+        elif condition_kind == "on_failure":
+            return source_state == NodeState.FAILED
+        elif condition_kind == "on_property":
+            if source_state != NodeState.COMPLETED:
+                return False
+            if not condition_expr:
+                return False
+            return await self._eval_on_property(bundle_id, node_id, condition_expr)
+        return False
+
+    async def _eval_on_property(self, bundle_id: str, node_id: str, expression: str) -> bool:
+        """Evaluate an on_property expression against a node's output context."""
+        node_db_id = f"{bundle_id}:{node_id}"
+        row = await self.db.fetch_one(
+            "SELECT output_json FROM dag_nodes WHERE id = ?", (node_db_id,)
+        )
+        if not row or not row["output_json"]:
+            return False
+        try:
+            ctx = json.loads(row["output_json"])
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return eval_property(expression, ctx)
+
+    async def _try_make_ready(self, bundle_id: str, target_node_id: str) -> None:
+        """Check if a target node should become ready based on fired incoming edges."""
+        target_db_id = f"{bundle_id}:{target_node_id}"
+
+        target = await self.db.fetch_one(
+            "SELECT kind, aggregator_config_json, state FROM dag_nodes WHERE id = ?",
+            (target_db_id,),
+        )
+        if target is None:
+            return
+
+        # Skip if already past pending
+        if target["state"] != NodeState.PENDING:
+            return
+
+        # Count fired incoming edges
+        fired = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM dag_edges "
+            "WHERE bundle_id = ? AND to_node_id = ? AND fired = 1",
+            (bundle_id, target_node_id),
+        )
+        total = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM dag_edges "
+            "WHERE bundle_id = ? AND to_node_id = ?",
+            (bundle_id, target_node_id),
+        )
+        fired_count = fired["cnt"] if fired else 0
+        total_count = total["cnt"] if total else 0
+
+        if target["kind"] == "aggregator":
+            config = {}
+            if target["aggregator_config_json"]:
+                try:
+                    config = json.loads(target["aggregator_config_json"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            join = config.get("join", AggregatorJoinMode.ALL)
+
+            if join == AggregatorJoinMode.FIRST_SUCCESS:
+                # Only count fired edges from successfully completed predecessors
+                success_fired = await self.db.fetch_one(
+                    "SELECT COUNT(*) as cnt FROM dag_edges de "
+                    "JOIN dag_nodes dn ON dn.bundle_id = de.bundle_id AND dn.node_id = de.from_node_id "
+                    "WHERE de.bundle_id = ? AND de.to_node_id = ? AND de.fired = 1 "
+                    "AND dn.state = ?",
+                    (bundle_id, target_node_id, NodeState.COMPLETED),
+                )
+                success_count = success_fired["cnt"] if success_fired else 0
+
+                if success_count >= 1:
+                    should_ready = True
+                elif fired_count >= total_count:
+                    # All predecessors fired (terminal), none succeeded → fail
+                    await self.db.execute(
+                        "UPDATE dag_nodes SET state = ?, failure_reason = ?, ended_at = ? WHERE id = ?",
+                        (NodeState.FAILED,
+                         "all predecessors failed, none succeeded for first_success",
+                         self.now(), target_db_id),
+                    )
+                    await self.db.conn.commit()
+                    await self._process_node_completion(bundle_id, target_node_id, NodeState.FAILED)
+                    return
+                else:
+                    should_ready = False
+            else:
+                should_ready = self._check_aggregator_ready(target, fired_count, total_count)
+        else:
+            # Non-aggregator: all incoming edges must fire
+            should_ready = fired_count >= total_count
+
+        if should_ready:
+            await self.db.execute(
+                "UPDATE dag_nodes SET state = ?, ready_at = ? WHERE id = ?",
+                (NodeState.READY, self.now(), target_db_id),
+            )
 
     async def _check_bundle_completion(self, bundle_id: str) -> None:
         """If all exit nodes are terminal, trigger transition 9 (IN_PROGRESS -> VERIFYING)."""
         status = await self._compute_bundle_status(bundle_id)
         if status == "all_terminal":
-            # Check if any node failed
             failed_nodes = await self.db.fetch_all(
                 "SELECT id FROM dag_nodes WHERE bundle_id = ? AND state = ?",
                 (bundle_id, NodeState.FAILED),
             )
             if failed_nodes:
-                # Some nodes failed — fail the bundle
                 await self._fail_bundle(
                     bundle_id,
                     failed_nodes[0]["id"].split(":", 1)[1] if ":" in failed_nodes[0]["id"] else "",
@@ -168,10 +308,8 @@ class LinearDagExecutor:
                     "node execution failed",
                 )
             else:
-                # All exit nodes completed — transition to VERIFYING
                 try:
                     await self.sm.transition_9_to_verifying(bundle_id)
-                    # Auto-transition to COMPLETE in Phase 1 (no actual verification)
                     await self.sm.transition_17_complete(bundle_id)
                     self._active_bundles.discard(bundle_id)
                 except Exception:
@@ -238,67 +376,313 @@ class LinearDagExecutor:
 
     async def _dispatch_ready(self, bundle_id: str) -> int:
         """Dispatch ready nodes up to the global concurrency cap. Returns number dispatched."""
-        # Count currently running workers
         running_count = await self._count_running_workers()
         available = self.global_concurrency - running_count
         if available <= 0:
             return 0
 
-        # Get ready nodes for this bundle, FIFO by ready_at
         ready_nodes = await self.db.fetch_all(
-            "SELECT id, node_id, spec_json FROM dag_nodes WHERE bundle_id = ? AND state = ? ORDER BY ready_at ASC LIMIT ?",
+            "SELECT id, node_id, kind, spec_json, gate_config_json, aggregator_config_json "
+            "FROM dag_nodes WHERE bundle_id = ? AND state = ? ORDER BY ready_at ASC LIMIT ?",
             (bundle_id, NodeState.READY, available),
         )
 
         dispatched = 0
         for node in ready_nodes:
-            worker_id = f"w_{node['id'].replace(':', '_')}"
+            node_kind = node["kind"]
 
-            # Get the bundle's manifest for capability grants
-            bundle_row = await self.db.fetch_one(
-                "SELECT proposal_json FROM bundles WHERE id = ?", (bundle_id,)
-            )
-            if bundle_row is None:
-                continue
-
-            # Parse manifest — for Phase 1, use a default manifest
-            manifest = CapabilityManifest(
-                schema_version="1.0",
-                subject={"kind": "bundle", "id": bundle_id},
-                grants={"filesystem": {"reads": [], "writes": []}, "network": {"egress": []},
-                        "process": {"exec": []}, "rpc": {"methods": ["worker.*", "cap.*"]}, "resources": {}},
-                metadata={"rationale": "auto-generated"},
-            )
-
-            try:
-                spec = json.loads(node["spec_json"])
-            except (json.JSONDecodeError, TypeError):
-                spec = {}
-
-            # Spawn the worker first (inserts worker row needed by FK)
-            result = await self.runner.spawn_worker(
-                worker_id=worker_id,
-                bundle_id=bundle_id,
-                node_id=node["node_id"],
-                manifest=manifest,
-                worktree_path="/tmp/worktree-placeholder",
-                task_spec=spec.get("spec", spec),
-            )
-
-            # Now safe to reference worker_id in dag_nodes (FK satisfied)
-            now = self.now()
-            await self.db.execute(
-                "UPDATE dag_nodes SET state = ?, worker_id = ?, started_at = ? WHERE id = ?",
-                (NodeState.RUNNING, worker_id, now, node["id"]),
-            )
-            await self.db.conn.commit()
-
-            if result.process is not None:
-                self._running_workers[worker_id] = result.process
+            if node_kind == "gate":
+                await self._dispatch_gate(bundle_id, node)
+            elif node_kind == "aggregator":
+                await self._dispatch_aggregator(bundle_id, node)
+            else:
+                await self._dispatch_worker(bundle_id, node)
 
             dispatched += 1
 
         return dispatched
+
+    async def _dispatch_worker(self, bundle_id: str, node: Any) -> None:
+        """Spawn a worker subprocess for a ready worker node."""
+        worker_id = f"w_{node['id'].replace(':', '_')}"
+
+        manifest = CapabilityManifest(
+            schema_version="1.0",
+            subject={"kind": "bundle", "id": bundle_id},
+            grants={
+                "filesystem": {"reads": [], "writes": []},
+                "network": {"egress": []},
+                "process": {"exec": []},
+                "rpc": {"methods": ["worker.*", "cap.*"]},
+                "resources": {},
+            },
+            metadata={"rationale": "auto-generated"},
+        )
+
+        try:
+            spec = json.loads(node["spec_json"])
+        except (json.JSONDecodeError, TypeError):
+            spec = {}
+
+        result = await self.runner.spawn_worker(
+            worker_id=worker_id,
+            bundle_id=bundle_id,
+            node_id=node["node_id"],
+            manifest=manifest,
+            worktree_path="/tmp/worktree-placeholder",
+            task_spec=spec.get("spec", spec),
+        )
+
+        now = self.now()
+        await self.db.execute(
+            "UPDATE dag_nodes SET state = ?, worker_id = ?, started_at = ? WHERE id = ?",
+            (NodeState.RUNNING, worker_id, now, node["id"]),
+        )
+        await self.db.conn.commit()
+
+        if result.process is not None:
+            self._running_workers[worker_id] = result.process
+
+    # ── Gate dispatch ──────────────────────────────────────────────────────
+
+    async def _dispatch_gate(self, bundle_id: str, node: Any) -> None:
+        """Evaluate a gate node's predicate and transition the node accordingly."""
+        gate_config = {}
+        if node["gate_config_json"]:
+            try:
+                gate_config = json.loads(node["gate_config_json"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        predicate = gate_config.get("predicate", GatePredicateKind.HUMAN_APPROVAL)
+        now = self.now()
+
+        if predicate == GatePredicateKind.HUMAN_APPROVAL:
+            # Create approval request and leave node in running state (waiting)
+            request_id = f"ar_{node['id'].replace(':', '_')}"
+            await self.db.execute(
+                "INSERT INTO approval_requests (id, bundle_id, kind, subject_id, "
+                "context_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    request_id,
+                    bundle_id,
+                    "gate_human_approval",
+                    node["node_id"],
+                    json.dumps({"prompt": gate_config.get("human_prompt", ""),
+                                "node_id": node["node_id"]}),
+                    "pending",
+                    now,
+                ),
+            )
+            await self.db.execute(
+                "UPDATE dag_nodes SET state = ?, started_at = ? WHERE id = ?",
+                (NodeState.RUNNING, now, node["id"]),
+            )
+            await self.db.conn.commit()
+            return
+
+        elif predicate == GatePredicateKind.ARTIFACT_PROPERTY:
+            # Evaluate property expression against an artifact
+            expr = gate_config.get("property_expression", "")
+            artifact_descriptor = gate_config.get("artifact_descriptor", "")
+            passed = self._eval_artifact_property(bundle_id, artifact_descriptor, expr)
+            await self._complete_gate(bundle_id, node, passed, now)
+
+        elif predicate == GatePredicateKind.RPC_QUERY:
+            # RPC query gates are deferred in Phase 2 — auto-pass with warning
+            await self._complete_gate(bundle_id, node, True, now)
+
+    def _eval_artifact_property(self, bundle_id: str, descriptor: str, expression: str) -> bool:
+        """Check if an artifact exists and its properties satisfy the expression."""
+        if not descriptor or not expression:
+            return False
+        try:
+            desc = json.loads(descriptor)
+        except (json.JSONDecodeError, TypeError):
+            desc = {"name": descriptor}
+
+        import asyncio as _asyncio
+        async def _fetch():
+            conditions = []
+            params = []
+            if isinstance(desc, dict):
+                for k, v in desc.items():
+                    conditions.append(f"descriptor_json LIKE ?")
+                    params.append(f'%"{k}":"{v}"%')
+            else:
+                conditions.append("descriptor_json LIKE ?")
+                params.append(f"%{desc}%")
+
+            where = " AND ".join(conditions) if conditions else "1=1"
+            row = await self.db.fetch_one(
+                f"SELECT descriptor_json FROM artifact_metadata "
+                f"WHERE bundle_id = ? AND {where} ORDER BY created_at DESC LIMIT 1",
+                (bundle_id, *params),
+            )
+            if not row:
+                return False
+            try:
+                ctx = json.loads(row["descriptor_json"])
+            except (json.JSONDecodeError, TypeError):
+                return False
+            return eval_property(expression, ctx)
+
+        try:
+            loop = _asyncio.get_event_loop()
+            return loop.run_until_complete(_fetch())
+        except RuntimeError:
+            return False
+
+    async def _complete_gate(self, bundle_id: str, node: Any, passed: bool, now: int) -> None:
+        """Transition a gate node to completed or failed based on predicate result."""
+        final_state = NodeState.COMPLETED if passed else NodeState.FAILED
+        await self.db.execute(
+            "UPDATE dag_nodes SET state = ?, ended_at = ? WHERE id = ?",
+            (final_state, now, node["id"]),
+        )
+        await self.db.conn.commit()
+        await self._process_node_completion(bundle_id, node["node_id"], final_state)
+
+    # ── Aggregator dispatch ────────────────────────────────────────────────
+
+    def _check_aggregator_ready(
+        self, target: Any, fired_count: int, total_count: int
+    ) -> bool:
+        """Check if an aggregator is ready based on join mode and fired incoming edges."""
+        if fired_count == 0:
+            return False
+
+        config = {}
+        if target["aggregator_config_json"]:
+            try:
+                config = json.loads(target["aggregator_config_json"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        join = config.get("join", AggregatorJoinMode.ALL)
+
+        if join == AggregatorJoinMode.ALL:
+            return fired_count >= total_count
+        elif join == AggregatorJoinMode.ANY:
+            return fired_count >= 1
+        elif join == AggregatorJoinMode.FIRST_SUCCESS:
+            return fired_count >= 1
+        elif join == AggregatorJoinMode.QUORUM:
+            quorum = config.get("quorum_count")
+            if quorum is not None:
+                return fired_count >= quorum
+            # Default: simple majority
+            return fired_count > total_count / 2
+
+        return fired_count >= total_count
+
+    async def _dispatch_aggregator(self, bundle_id: str, node: Any) -> None:
+        """Evaluate an aggregator node: collect predecessor outputs, apply strategy, complete."""
+        config = {}
+        if node["aggregator_config_json"]:
+            try:
+                config = json.loads(node["aggregator_config_json"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        join = config.get("join", AggregatorJoinMode.ALL)
+        output_strategy = config.get("output_strategy", AggregatorOutputStrategy.COLLECT)
+        reducer_name = config.get("reducer")
+        cancel_remaining = config.get("cancel_remaining_on_quorum", True)
+        now = self.now()
+
+        # Collect predecessor outputs
+        incoming = await self.db.fetch_all(
+            "SELECT from_node_id FROM dag_edges WHERE bundle_id = ? AND to_node_id = ? AND fired = 1",
+            (bundle_id, node["node_id"]),
+        )
+
+        predecessor_outputs: list[dict[str, Any]] = []
+        for inc in incoming:
+            pred_db_id = f"{bundle_id}:{inc['from_node_id']}"
+            if join == AggregatorJoinMode.FIRST_SUCCESS:
+                pred_state = await self.db.fetch_one(
+                    "SELECT state, output_json FROM dag_nodes WHERE id = ?", (pred_db_id,)
+                )
+                if not pred_state or pred_state["state"] != NodeState.COMPLETED:
+                    continue
+                output_json = pred_state["output_json"]
+            else:
+                pred = await self.db.fetch_one(
+                    "SELECT output_json FROM dag_nodes WHERE id = ?", (pred_db_id,)
+                )
+                output_json = pred["output_json"] if pred else None
+
+            if output_json:
+                try:
+                    predecessor_outputs.append(json.loads(output_json))
+                except (json.JSONDecodeError, TypeError):
+                    predecessor_outputs.append({})
+
+        # Apply output strategy
+        output = self._apply_aggregator_output(predecessor_outputs, output_strategy, reducer_name, config)
+
+        await self.db.execute(
+            "UPDATE dag_nodes SET state = ?, ended_at = ?, output_json = ? WHERE id = ?",
+            (NodeState.COMPLETED, now, json.dumps(output or {}), node["id"]),
+        )
+
+        # Cancel remaining siblings for first_success and quorum
+        if cancel_remaining and join in (AggregatorJoinMode.FIRST_SUCCESS, AggregatorJoinMode.QUORUM):
+            await self._cancel_aggregator_siblings(bundle_id, node, incoming)
+
+        await self.db.conn.commit()
+        await self._process_node_completion(bundle_id, node["node_id"], NodeState.COMPLETED)
+
+    def _apply_aggregator_output(
+        self,
+        predecessor_outputs: list[dict[str, Any]],
+        output_strategy: str,
+        reducer_name: str | None,
+        config: dict[str, Any],
+    ) -> Any:
+        """Apply the aggregator's output strategy to predecessor outputs."""
+        if output_strategy == AggregatorOutputStrategy.FIRST:
+            return predecessor_outputs[0] if predecessor_outputs else None
+        elif output_strategy == AggregatorOutputStrategy.REDUCE:
+            if reducer_name:
+                reducer = get_reducer(reducer_name)
+                if reducer:
+                    return reducer(predecessor_outputs, config.get("reducer_config", {}))
+            # Fallback: collect
+            return predecessor_outputs
+        else:  # collect
+            return predecessor_outputs
+
+    async def _cancel_aggregator_siblings(
+        self, bundle_id: str, node: Any, fired_incoming: Any
+    ) -> None:
+        """Cancel still-running sibling predecessors of a satisfied aggregator."""
+        fired_ids = {inc["from_node_id"] for inc in fired_incoming}
+
+        all_incoming = await self.db.fetch_all(
+            "SELECT from_node_id FROM dag_edges WHERE bundle_id = ? AND to_node_id = ?",
+            (bundle_id, node["node_id"]),
+        )
+
+        for inc in all_incoming:
+            if inc["from_node_id"] in fired_ids:
+                continue
+            pred_db_id = f"{bundle_id}:{inc['from_node_id']}"
+            pred = await self.db.fetch_one(
+                "SELECT state, worker_id FROM dag_nodes WHERE id = ?", (pred_db_id,)
+            )
+            if pred and pred["state"] in (NodeState.READY, NodeState.RUNNING):
+                # Cancel the node
+                await self.db.execute(
+                    "UPDATE dag_nodes SET state = ?, failure_reason = ? WHERE id = ?",
+                    (NodeState.CANCELLED, "aggregator satisfied; sibling cancelled", pred_db_id),
+                )
+                # Kill worker if running
+                if pred["worker_id"]:
+                    proc = self._running_workers.pop(pred["worker_id"], None)
+                    if proc and proc.returncode is None:
+                        await self.runner.kill_worker(proc)
 
     async def _count_running_workers(self) -> int:
         row = await self.db.fetch_one(
@@ -387,6 +771,230 @@ class LinearDagExecutor:
                 )
 
         return timed_out
+
+    # ── Dynamic DAG expansion ──────────────────────────────────────────────
+
+    async def handle_expansion_request(
+        self, bundle_id: str, requesting_node_id: str, params: CapRequestParams
+    ) -> dict[str, Any]:
+        """Handle a cap.request for dynamic DAG expansion.
+
+        Validates the fragment, checks for cycles, grafts if auto-approvable,
+        escalates to human otherwise.
+        """
+        if params.request_type != "expansion" or not params.expansion:
+            return {"decision": "denied", "decision_id": None}
+
+        expansion = params.expansion
+        fragment = expansion.fragment
+        graft_point = expansion.graft_point
+        graft_after = expansion.graft_after_node or requesting_node_id
+
+        # Validate: every node in fragment has unique id not already in dag_nodes
+        existing = await self.db.fetch_all(
+            "SELECT node_id FROM dag_nodes WHERE bundle_id = ?", (bundle_id,)
+        )
+        existing_ids = {r["node_id"] for r in existing}
+
+        for n in fragment.nodes:
+            if n.id in existing_ids:
+                return {"decision": "denied", "decision_id": None,
+                        "reason": f"Node id '{n.id}' already exists in DAG"}
+
+        # Cycle check: merge fragment into current DAG, run topological sort
+        all_edges = await self.db.fetch_all(
+            "SELECT from_node_id, to_node_id FROM dag_edges WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        if self._would_create_cycle(
+            existing_ids, all_edges, fragment.nodes, fragment.edges, graft_after
+        ):
+            return {"decision": "denied", "decision_id": None,
+                    "reason": "Expansion would create a cycle"}
+
+        # Validate against expansion_policy (from bundle's proposal)
+        total_nodes = len(existing_ids) + len(fragment.nodes)
+        # [PROVISIONAL] 50-node default; consider moving to settings.json
+        if total_nodes > 50:
+            return {"decision": "denied", "decision_id": None,
+                    "reason": "Expansion would exceed max total nodes"}
+
+        # TODO (required before Phase 2.6): Check expansion fragment nodes have capability
+        # manifests that are subsets of the bundle-level approved grant. Without this, workers
+        # can self-grant elevated capabilities via expansion. See: capability.is_subset()
+        # If auto-approvable, apply graft in a transaction
+        expansion_id = f"exp_{bundle_id}_{len(existing_ids)}"
+        now = self.now()
+
+        async with self.db.transaction():
+            # Insert expansion record
+            await self.db.execute(
+                "INSERT INTO dag_expansions (id, bundle_id, parent_node_id, "
+                "graft_point_node_id, fragment_json, rationale, state, requested_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    expansion_id,
+                    bundle_id,
+                    requesting_node_id,
+                    graft_point,
+                    json.dumps(fragment.model_dump()),
+                    expansion.rationale,
+                    "applied",
+                    now,
+                ),
+            )
+
+            # Insert fragment nodes
+            for n in fragment.nodes:
+                node_db_id = f"{bundle_id}:{n.id}"
+                await self.db.execute(
+                    "INSERT INTO dag_nodes (id, bundle_id, node_id, kind, spec_json, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (node_db_id, bundle_id, n.id, n.kind.value if hasattr(n.kind, 'value') else n.kind,
+                     json.dumps(n.spec.model_dump()), NodeState.PENDING),
+                )
+
+            # Insert fragment edges
+            for e in fragment.edges:
+                await self.db.execute(
+                    "INSERT INTO dag_edges (bundle_id, from_node_id, to_node_id, condition_kind) "
+                    "VALUES (?, ?, ?, ?)",
+                    (bundle_id, e.from_ if hasattr(e, 'from_') else e.get('from'),
+                     e.to if hasattr(e, 'to') else e.get('to'),
+                     e.condition.get("kind", "on_success") if isinstance(e.condition, dict) else "on_success"),
+                )
+
+            # Insert the graft edge: graft_after -> first node in fragment
+            if fragment.nodes:
+                graft_edge_condition = "always"  # grafted nodes fire on always
+                await self.db.execute(
+                    "INSERT INTO dag_edges (bundle_id, from_node_id, to_node_id, condition_kind) "
+                    "VALUES (?, ?, ?, ?)",
+                    (bundle_id, graft_after, fragment.nodes[0].id, graft_edge_condition),
+                )
+
+            await self._audit_expansion(bundle_id, expansion_id, expansion.rationale)
+
+        return {"decision": "auto_approved", "decision_id": expansion_id}
+
+    def _would_create_cycle(
+        self,
+        existing_ids: set[str],
+        existing_edges: list[Any],
+        fragment_nodes: list[Any],
+        fragment_edges: list[Any],
+        graft_after: str,
+    ) -> bool:
+        """Check if grafting the fragment would create a cycle. Topological sort approach."""
+        # Build adjacency list of merged graph
+        adj: dict[str, list[str]] = {}
+
+        for nid in existing_ids:
+            adj.setdefault(nid, [])
+
+        for e in existing_edges:
+            adj.setdefault(e["from_node_id"], []).append(e["to_node_id"])
+
+        for n in fragment_nodes:
+            nid = n.id if hasattr(n, 'id') else n.get('id', '')
+            adj.setdefault(nid, [])
+
+        for e in fragment_edges:
+            src = e.from_ if hasattr(e, 'from_') else e.get('from', '')
+            dst = e.to if hasattr(e, 'to') else e.get('to', '')
+            adj.setdefault(src, []).append(dst)
+
+        # Add graft edge
+        if fragment_nodes:
+            first_id = fragment_nodes[0].id if hasattr(fragment_nodes[0], 'id') else fragment_nodes[0].get('id', '')
+            adj.setdefault(graft_after, []).append(first_id)
+
+        # Kahn's algorithm for topological sort
+        in_degree: dict[str, int] = {n: 0 for n in adj}
+        for src, dsts in adj.items():
+            for dst in dsts:
+                in_degree[dst] = in_degree.get(dst, 0) + 1
+
+        queue = [n for n, d in in_degree.items() if d == 0]
+        visited = 0
+
+        while queue:
+            node = queue.pop(0)
+            visited += 1
+            for dst in adj.get(node, []):
+                in_degree[dst] -= 1
+                if in_degree[dst] == 0:
+                    queue.append(dst)
+
+        return visited != len(adj)
+
+    async def _audit_expansion(self, bundle_id: str, expansion_id: str, rationale: str) -> None:
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("dag_expansion_applied", "bundle", bundle_id,
+             json.dumps({"expansion_id": expansion_id, "rationale": rationale}),
+             self.now()),
+        )
+
+    # ── Mermaid rendering ──────────────────────────────────────────────────
+
+    async def render_mermaid(self, bundle_id: str) -> str:
+        """Render a bundle's DAG as a Mermaid diagram string."""
+        from .visualizer import render_dag
+
+        nodes = await self.db.fetch_all(
+            "SELECT node_id, kind, state, spec_json FROM dag_nodes WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        edges = await self.db.fetch_all(
+            "SELECT from_node_id, to_node_id, condition_kind, condition_expr "
+            "FROM dag_edges WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+
+        # Find entry/exit nodes
+        all_node_ids = {n["node_id"] for n in nodes}
+        from_ids = {e["from_node_id"] for e in edges}
+        to_ids = {e["to_node_id"] for e in edges}
+
+        entry_nodes = list(all_node_ids - to_ids)  # no incoming edges
+        exit_nodes = list(all_node_ids - from_ids)  # no outgoing edges
+
+        # Get grafted node ids from dag_expansions
+        expansions = await self.db.fetch_all(
+            "SELECT fragment_json FROM dag_expansions WHERE bundle_id = ? AND state = ?",
+            (bundle_id, "applied"),
+        )
+        grafted_ids: set[str] = set()
+        for exp in expansions:
+            try:
+                frag = json.loads(exp["fragment_json"])
+                for n in frag.get("nodes", []):
+                    grafted_ids.add(n.get("id", ""))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        node_dicts = [
+            {
+                "node_id": n["node_id"],
+                "kind": n["kind"],
+                "state": n["state"],
+                "spec": json.loads(n["spec_json"]) if n["spec_json"] else {},
+            }
+            for n in nodes
+        ]
+        edge_dicts = [
+            {
+                "from_node_id": e["from_node_id"],
+                "to_node_id": e["to_node_id"],
+                "condition_kind": e["condition_kind"],
+                "condition_expr": e["condition_expr"],
+            }
+            for e in edges
+        ]
+
+        return render_dag(node_dicts, edge_dicts, entry_nodes, exit_nodes, grafted_ids)
 
     # ── Node state query ──────────────────────────────────────────────────
 

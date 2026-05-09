@@ -208,12 +208,59 @@ class DAGNode(BaseModel):
     spec: TaskSpec = Field(default_factory=TaskSpec)
 
 
+class EdgeConditionKind(StrEnum):
+    ON_SUCCESS = "on_success"
+    ON_FAILURE = "on_failure"
+    ALWAYS = "always"
+    ON_PROPERTY = "on_property"
+
+
 class DAGEdge(BaseModel):
     from_: str = Field(alias="from")
     to: str
     condition: dict[str, str] = Field(default_factory=lambda: {"kind": "on_success"})
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+# ── Gate and aggregator models ────────────────────────────────────────────────
+
+class GatePredicateKind(StrEnum):
+    ARTIFACT_PROPERTY = "artifact_property"
+    RPC_QUERY = "rpc_query"
+    HUMAN_APPROVAL = "human_approval"
+
+
+class GateConfig(BaseModel):
+    predicate: GatePredicateKind
+    artifact_descriptor: str | None = None
+    property_expression: str | None = None
+    rpc_method: str | None = None
+    rpc_params: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: int = 3600
+    human_prompt: str = ""
+
+
+class AggregatorJoinMode(StrEnum):
+    ALL = "all"
+    ANY = "any"
+    QUORUM = "quorum"
+    FIRST_SUCCESS = "first_success"
+
+
+class AggregatorOutputStrategy(StrEnum):
+    COLLECT = "collect"
+    FIRST = "first"
+    REDUCE = "reduce"
+
+
+class AggregatorConfig(BaseModel):
+    join: AggregatorJoinMode = AggregatorJoinMode.ALL
+    quorum_count: int | None = None
+    cancel_remaining_on_quorum: bool = True
+    output_strategy: AggregatorOutputStrategy = AggregatorOutputStrategy.COLLECT
+    reducer: str | None = None
+    reducer_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExpansionPolicy(BaseModel):
@@ -238,6 +285,109 @@ class TaskDAG(BaseModel):
     exit_nodes: list[str] = Field(default_factory=list)
     expansion_policy: ExpansionPolicy = Field(default_factory=ExpansionPolicy)
     metadata: DAGMetadata = Field(default_factory=DAGMetadata)
+
+
+# ── on_property expression AST ────────────────────────────────────────────────
+
+class PropExpr(BaseModel):
+    """Base for on_property expression nodes. Discriminated by 'type' field."""
+
+    type: str
+
+
+class FieldAccess(PropExpr):
+    type: Literal["field_access"] = "field_access"
+    field: str
+
+
+class StringLiteral(PropExpr):
+    type: Literal["string_literal"] = "string_literal"
+    value: str
+
+
+class IntegerLiteral(PropExpr):
+    type: Literal["integer_literal"] = "integer_literal"
+    value: int
+
+
+class BooleanLiteral(PropExpr):
+    type: Literal["boolean_literal"] = "boolean_literal"
+    value: bool
+
+
+class Comparison(PropExpr):
+    type: Literal["comparison"] = "comparison"
+    left: PropExpr
+    op: Literal["eq", "neq", "gt", "gte", "lt", "lte"]
+    right: PropExpr
+
+
+class ContainsOp(PropExpr):
+    type: Literal["contains"] = "contains"
+    haystack: PropExpr
+    needle: str
+
+
+class MatchesOp(PropExpr):
+    type: Literal["matches"] = "matches"
+    value: PropExpr
+    pattern: str
+
+
+class BooleanCombinator(PropExpr):
+    type: Literal["and", "or", "not"] = "and"
+    operands: list[PropExpr] = Field(default_factory=list)
+
+
+# ── Dynamic expansion models ──────────────────────────────────────────────────
+
+class DAGFragment(BaseModel):
+    nodes: list[DAGNode] = Field(default_factory=list)
+    edges: list[DAGEdge] = Field(default_factory=list)
+
+
+class ExpansionRequest(BaseModel):
+    fragment: DAGFragment = Field(default_factory=DAGFragment)
+    graft_point: str = ""
+    graft_after_node: str = ""
+    rationale: str = ""
+
+
+class CapRequestParams(BaseModel):
+    """Params for cap.request RPC method — expansion or capability-grant request."""
+    request_type: Literal["expansion", "capability_grant"] = "expansion"
+    expansion: ExpansionRequest | None = None
+    requested_scope: dict[str, Any] | None = None
+    rationale: str = ""
+
+
+class CapRequestResult(BaseModel):
+    decision: Literal["auto_approved", "escalated", "denied"]
+    decision_id: str | None = None
+
+
+# ── Retry policy ──────────────────────────────────────────────────────────────
+
+class RetryPolicy(BaseModel):
+    max_attempts: int = 1
+    backoff: Literal["immediate", "linear", "exponential"] = "immediate"
+    delay_seconds: int = 0
+
+
+# ── Artifact metadata ─────────────────────────────────────────────────────────
+
+class ArtifactMetadata(BaseModel):
+    bundle_id: str
+    hash_: str = Field(alias="hash")
+    descriptor_json: str = "{}"
+    content_type: str = "application/octet-stream"
+    size_bytes: int = 0
+    scope: Literal["bundle", "task", "global"] = "bundle"
+    producer_node_id: str | None = None
+    created_at: int = 0
+    expires_at: int | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 # ── Bundle input models ──────────────────────────────────────────────────────

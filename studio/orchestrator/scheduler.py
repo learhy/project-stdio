@@ -18,7 +18,7 @@ class Scheduler:
     def __init__(
         self,
         db: "Database",
-        executor: Any,  # LinearDagExecutor
+        executor: Any,  # DagExecutor
         dispatch_interval: float = 1.0,
         heartbeat_check_interval: float = 10.0,
     ) -> None:

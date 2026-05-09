@@ -106,6 +106,8 @@ CREATE TABLE IF NOT EXISTS dag_nodes (
   kind TEXT NOT NULL,
   spec_json TEXT NOT NULL,
   task_manifest_id TEXT,
+  gate_config_json TEXT,
+  aggregator_config_json TEXT,
   state TEXT NOT NULL,
   worker_id TEXT REFERENCES workers(id),
   ready_at INTEGER,
@@ -170,6 +172,22 @@ CREATE TABLE IF NOT EXISTS approval_requests (
   decided_surface TEXT,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS artifact_metadata (
+  hash TEXT NOT NULL,
+  bundle_id TEXT NOT NULL REFERENCES bundles(id),
+  descriptor_json TEXT NOT NULL DEFAULT '{}',
+  content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  scope TEXT NOT NULL DEFAULT 'bundle',
+  producer_node_id TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER,
+  PRIMARY KEY (hash, bundle_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_metadata_bundle ON artifact_metadata(bundle_id);
+CREATE INDEX IF NOT EXISTS idx_artifact_metadata_producer ON artifact_metadata(bundle_id, producer_node_id);
 
 CREATE TABLE IF NOT EXISTS artifact_refs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
