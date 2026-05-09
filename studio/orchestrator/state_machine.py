@@ -20,6 +20,7 @@ _LEGAL_TRANSITIONS: frozenset[tuple[str, str]] = frozenset({
     (BundleState.PROPOSED, BundleState.IN_REVIEW),    # 2: start pre-execution review
     (BundleState.PROPOSED, BundleState.APPROVED),    # 1a: kernel approve (bootstrapping)
     (BundleState.PROPOSED, BundleState.REJECTED),    # 1b: kernel reject (bootstrapping)
+    (BundleState.PROPOSED, BundleState.FAILED),      # 1c: bundler planning failure
     (BundleState.IN_REVIEW, BundleState.APPROVED),    # 4: review passed
     (BundleState.IN_REVIEW, BundleState.REJECTED),    # rejection during review
     (BundleState.APPROVED, BundleState.IN_PROGRESS), # 6: execution start
@@ -365,6 +366,22 @@ class BundleStateMachine:
             )
             await self._audit("bundle_planning_complete", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.IN_REVIEW})
+
+    async def transition_bundler_failed(self, bundle_id: str, reason: str) -> None:
+        """Transition 1c: PROPOSED -> FAILED. Trigger: bundler worker failure."""
+        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.FAILED, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.FAILED)
+
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE bundles SET state = ? WHERE id = ?",
+                (BundleState.FAILED, bundle_id),
+            )
+            await self._audit("bundle_bundler_failed", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.FAILED, "reason": reason})
 
     # ── Transition 4: review passed (IN_REVIEW -> APPROVED) ────────────
 

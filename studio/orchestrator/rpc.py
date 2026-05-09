@@ -201,6 +201,7 @@ class RpcHandlers:
         self._on_heartbeat: Callable[[str, str], Awaitable[None]] | None = None
         self._on_cap_request: Callable[[str, str, dict], Awaitable[dict[str, Any]]] | None = None
         self._on_bundler_report: Callable[[str, dict], Awaitable[None]] | None = None
+        self._on_bundler_failure: Callable[[str, str], Awaitable[None]] | None = None
         self._artifact_store: "ArtifactStore | None" = None
         self._secret_store: "SecretStore | None" = None
 
@@ -219,6 +220,10 @@ class RpcHandlers:
     def set_on_bundler_report(self, cb: Callable[[str, dict], Awaitable[None]]) -> None:
         """Callback: on_bundler_report(bundle_id, proposal_dict)."""
         self._on_bundler_report = cb
+
+    def set_on_bundler_failure(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
+        """Callback: on_bundler_failure(bundle_id, reason)."""
+        self._on_bundler_failure = cb
 
     def set_artifact_store(self, store: "ArtifactStore") -> None:
         self._artifact_store = store
@@ -321,8 +326,11 @@ class RpcHandlers:
             )
             await self.db.conn.commit()
 
-            if self._on_bundler_report and outcome == "success":
-                await self._on_bundler_report(binding.bundle_id, proposal)
+            if outcome == "success":
+                if self._on_bundler_report:
+                    await self._on_bundler_report(binding.bundle_id, proposal)
+            elif self._on_bundler_failure:
+                await self._on_bundler_failure(binding.bundle_id, summary)
 
             return {"accepted": True, "bundler": True}
 

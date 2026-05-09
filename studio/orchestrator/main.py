@@ -66,6 +66,11 @@ class Orchestrator:
                      bundle_id, proposal.get("complexity_score"),
                      proposal.get("risk_score"), proposal.get("target"))
 
+    async def _on_bundler_failure(self, bundle_id: str, reason: str) -> None:
+        """Callback from RpcHandlers when a bundler worker reports failure."""
+        await self.sm.transition_bundler_failed(bundle_id, reason)
+        logger.warning("Bundler failed for bundle %s: %s", bundle_id, reason)
+
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -86,6 +91,7 @@ class Orchestrator:
         # Wire bundler final_report callback: when bundler completes, merge
         # proposal + DAG into the bundle and transition PROPOSED -> IN_REVIEW.
         self.handlers.set_on_bundler_report(self._on_bundler_report)
+        self.handlers.set_on_bundler_failure(self._on_bundler_failure)
 
         # 4. Worker runner (use noop for testing if bwrap unavailable)
         if os.environ.get("STUDIO_TEST_MODE") == "1":

@@ -304,6 +304,106 @@ class TestBundlerStateMachine:
                      if "INSERT INTO dag_edges" in str(c[0][0])]
         assert len(edge_calls) == 1
 
+    @pytest.mark.asyncio
+    async def test_transition_bundler_failed(self):
+        from studio.orchestrator.state_machine import BundleStateMachine, BundleState
+
+        db = MagicMock()
+        db.execute = AsyncMock()
+        db.fetch_one = AsyncMock(return_value={"state": BundleState.PROPOSED})
+        db.conn = MagicMock()
+        db.conn.commit = AsyncMock()
+        db.transaction = MagicMock()
+        db.transaction.return_value.__aenter__ = AsyncMock()
+        db.transaction.return_value.__aexit__ = AsyncMock()
+
+        sm = BundleStateMachine(db, kernel_mode=False)
+        await sm.transition_bundler_failed("01STUCK", "LLM parse failure")
+
+        update_calls = [c for c in db.execute.call_args_list
+                       if "UPDATE bundles" in str(c[0][0])]
+        assert len(update_calls) == 1
+        assert update_calls[0][0][1][0] == BundleState.FAILED
+        assert update_calls[0][0][1][1] == "01STUCK"
+
+
+class TestBundlerFailureCallback:
+    """Tests for bundler failure detection in handle_final_report."""
+
+    @pytest.mark.asyncio
+    async def test_bundler_failure_triggers_callback(self):
+        from studio.orchestrator.rpc import RpcHandlers, WorkerBinding
+
+        db = MagicMock()
+        db.execute = AsyncMock()
+        db.fetch_one = AsyncMock(return_value=None)
+        db.conn = MagicMock()
+        db.conn.commit = AsyncMock()
+
+        handlers = RpcHandlers(db)
+        failure_cb = AsyncMock()
+        handlers.set_on_bundler_failure(failure_cb)
+        handlers.set_on_bundler_report(AsyncMock())
+
+        binding = WorkerBinding(
+            worker_id="bundler_01FAIL",
+            bundle_id="01FAIL",
+            node_id="bundler",
+            rpc_methods=["worker.*"],
+            reader=MagicMock(),
+            writer=MagicMock(),
+        )
+
+        result = await handlers.handle_final_report(binding, {
+            "outcome": "failure",
+            "summary": "Failed to parse LLM response as structured JSON proposal",
+            "errors": ["LLM response could not be parsed as JSON"],
+        }, 1)
+
+        assert result["accepted"] is True
+        assert result["bundler"] is True
+        failure_cb.assert_called_once_with("01FAIL", "Failed to parse LLM response as structured JSON proposal")
+
+    @pytest.mark.asyncio
+    async def test_bundler_success_does_not_trigger_failure_callback(self):
+        from studio.orchestrator.rpc import RpcHandlers, WorkerBinding
+
+        db = MagicMock()
+        db.execute = AsyncMock()
+        db.fetch_one = AsyncMock(return_value=None)
+        db.conn = MagicMock()
+        db.conn.commit = AsyncMock()
+
+        handlers = RpcHandlers(db)
+        success_cb = AsyncMock()
+        failure_cb = AsyncMock()
+        handlers.set_on_bundler_report(success_cb)
+        handlers.set_on_bundler_failure(failure_cb)
+
+        binding = WorkerBinding(
+            worker_id="bundler_01OK",
+            bundle_id="01OK",
+            node_id="bundler",
+            rpc_methods=["worker.*"],
+            reader=MagicMock(),
+            writer=MagicMock(),
+        )
+
+        result = await handlers.handle_final_report(binding, {
+            "outcome": "success",
+            "summary": "Planned successfully",
+            "proposal": {
+                "complexity_score": 3,
+                "risk_score": 2,
+                "concerns": ["Test concern"],
+            },
+        }, 1)
+
+        assert result["accepted"] is True
+        assert result["bundler"] is True
+        success_cb.assert_called_once()
+        failure_cb.assert_not_called()
+
 
 class TestBundlerWorker:
     """Unit tests for BundlerWorker execution logic."""
