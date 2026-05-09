@@ -781,7 +781,7 @@ class TestAcceptanceFirstSuccessCancellation:
         ]
         db_mock.fetch_one = AsyncMock()
         db_mock.fetch_one.side_effect = [
-            {"output_json": '{"result": "done"}'},  # n1 output
+            {"state": NodeState.COMPLETED, "output_json": '{"result": "done"}'},  # n1: completed
             {"state": NodeState.RUNNING, "worker_id": "w_n2"},  # n2: running
             {"state": NodeState.RUNNING, "worker_id": "w_n3"},  # n3: running
             {"cnt": 0},  # _dispatch_ready: running count
@@ -802,6 +802,57 @@ class TestAcceptanceFirstSuccessCancellation:
                         if "UPDATE dag_nodes" in str(c[0][0])
                         and NodeState.CANCELLED in str(c[0][1])]
         assert len(cancel_calls) == 2
+
+
+class TestAcceptanceFirstSuccessFailedPredecessor:
+    """FIRST_SUCCESS must only fire on successful predecessors, not failed ones."""
+
+    @pytest.fixture
+    def executor(self, db_mock, sm_mock, runner_mock, rpc_handlers_mock, conn_mgr_mock):
+        return DagExecutor(
+            db=db_mock, sm=sm_mock, runner=runner_mock,
+            rpc_handlers=rpc_handlers_mock, conn_mgr=conn_mgr_mock,
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_worker_fails_second_succeeds_aggregator_fires_on_second(self, executor, db_mock):
+        """FIRST_SUCCESS ignores failed predecessor, fires when a success arrives."""
+        # Simulate: n1 failed (edge fired with always), n2 succeeds (edge fires)
+        # After n1 failure: _try_make_ready sees 0 successful, not all fired → not ready
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"kind": "aggregator", "aggregator_config_json": '{"join": "first_success"}', "state": NodeState.PENDING},
+            {"cnt": 1},  # fired count
+            {"cnt": 2},  # total count
+            {"cnt": 0},  # success_fired count (n1 failed)
+        ]
+
+        await executor._try_make_ready("b1", "agg-1")
+
+        # Aggregator should NOT be marked ready (first predecessor failed)
+        ready_calls = [c for c in db_mock.execute.call_args_list
+                       if "UPDATE dag_nodes" in str(c[0][0])
+                       and NodeState.READY in str(c[0][1])]
+        assert len(ready_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_all_predecessors_fail_aggregator_fails(self, executor, db_mock):
+        """When all predecessors fail and none succeed, FIRST_SUCCESS aggregator fails."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"kind": "aggregator", "aggregator_config_json": '{"join": "first_success"}', "state": NodeState.PENDING},
+            {"cnt": 2},  # fired count (all fired)
+            {"cnt": 2},  # total count
+            {"cnt": 0},  # success_fired count (all failed)
+        ]
+
+        await executor._try_make_ready("b1", "agg-1")
+
+        # Aggregator should be marked FAILED
+        failed_calls = [c for c in db_mock.execute.call_args_list
+                        if "UPDATE dag_nodes" in str(c[0][0])
+                        and NodeState.FAILED in str(c[0][1])]
+        assert len(failed_calls) == 1
 
 
 class TestAcceptanceOnPropertyEdge:

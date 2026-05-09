@@ -181,6 +181,11 @@ class TestEvaluator:
     def test_in_op_false(self):
         assert evaluate('"z" in ["a", "b"]', {}) is False
 
+    def test_field_name_starting_with_in_parses_as_path(self):
+        # "incoming" and "inline" are field accesses, not the "in" operator
+        assert evaluate("incoming > 5", {"incoming": 10}) is True
+        assert evaluate("inline == true", {"inline": True}) is True
+
     def test_matches_regex(self):
         assert evaluate('name matches "^test-\\d+$"', {"name": "test-42"}) is True
 

@@ -246,7 +246,42 @@ class DagExecutor:
         total_count = total["cnt"] if total else 0
 
         if target["kind"] == "aggregator":
-            should_ready = self._check_aggregator_ready(target, fired_count, total_count)
+            config = {}
+            if target["aggregator_config_json"]:
+                try:
+                    config = json.loads(target["aggregator_config_json"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            join = config.get("join", AggregatorJoinMode.ALL)
+
+            if join == AggregatorJoinMode.FIRST_SUCCESS:
+                # Only count fired edges from successfully completed predecessors
+                success_fired = await self.db.fetch_one(
+                    "SELECT COUNT(*) as cnt FROM dag_edges de "
+                    "JOIN dag_nodes dn ON dn.bundle_id = de.bundle_id AND dn.node_id = de.from_node_id "
+                    "WHERE de.bundle_id = ? AND de.to_node_id = ? AND de.fired = 1 "
+                    "AND dn.state = ?",
+                    (bundle_id, target_node_id, NodeState.COMPLETED),
+                )
+                success_count = success_fired["cnt"] if success_fired else 0
+
+                if success_count >= 1:
+                    should_ready = True
+                elif fired_count >= total_count:
+                    # All predecessors fired (terminal), none succeeded → fail
+                    await self.db.execute(
+                        "UPDATE dag_nodes SET state = ?, failure_reason = ?, ended_at = ? WHERE id = ?",
+                        (NodeState.FAILED,
+                         "all predecessors failed, none succeeded for first_success",
+                         self.now(), target_db_id),
+                    )
+                    await self.db.conn.commit()
+                    await self._process_node_completion(bundle_id, target_node_id, NodeState.FAILED)
+                    return
+                else:
+                    should_ready = False
+            else:
+                should_ready = self._check_aggregator_ready(target, fired_count, total_count)
         else:
             # Non-aggregator: all incoming edges must fire
             should_ready = fired_count >= total_count
@@ -565,19 +600,24 @@ class DagExecutor:
         predecessor_outputs: list[dict[str, Any]] = []
         for inc in incoming:
             pred_db_id = f"{bundle_id}:{inc['from_node_id']}"
-            pred = await self.db.fetch_one(
-                "SELECT output_json FROM dag_nodes WHERE id = ?", (pred_db_id,)
-            )
-            if pred and pred["output_json"]:
+            if join == AggregatorJoinMode.FIRST_SUCCESS:
+                pred_state = await self.db.fetch_one(
+                    "SELECT state, output_json FROM dag_nodes WHERE id = ?", (pred_db_id,)
+                )
+                if not pred_state or pred_state["state"] != NodeState.COMPLETED:
+                    continue
+                output_json = pred_state["output_json"]
+            else:
+                pred = await self.db.fetch_one(
+                    "SELECT output_json FROM dag_nodes WHERE id = ?", (pred_db_id,)
+                )
+                output_json = pred["output_json"] if pred else None
+
+            if output_json:
                 try:
-                    predecessor_outputs.append(json.loads(pred["output_json"]))
+                    predecessor_outputs.append(json.loads(output_json))
                 except (json.JSONDecodeError, TypeError):
                     predecessor_outputs.append({})
-
-        # If first_success, find the first successful predecessor
-        if join == AggregatorJoinMode.FIRST_SUCCESS:
-            # The first fired edge that has a completed predecessor
-            pass  # predecessor_outputs is already in fire order
 
         # Apply output strategy
         output = self._apply_aggregator_output(predecessor_outputs, output_strategy, reducer_name, config)
@@ -774,11 +814,14 @@ class DagExecutor:
 
         # Validate against expansion_policy (from bundle's proposal)
         total_nodes = len(existing_ids) + len(fragment.nodes)
-        # For now, allow up to 50 nodes; expansion_policy will be wired in 2.3
+        # [PROVISIONAL] 50-node default; consider moving to settings.json
         if total_nodes > 50:
             return {"decision": "denied", "decision_id": None,
                     "reason": "Expansion would exceed max total nodes"}
 
+        # TODO (required before Phase 2.6): Check expansion fragment nodes have capability
+        # manifests that are subsets of the bundle-level approved grant. Without this, workers
+        # can self-grant elevated capabilities via expansion. See: capability.is_subset()
         # If auto-approvable, apply graft in a transaction
         expansion_id = f"exp_{bundle_id}_{len(existing_ids)}"
         now = self.now()
