@@ -1,0 +1,44 @@
+[Unit]
+Description=Studio Orchestrator — Agent orchestration kernel
+Documentation=https://github.com/learhy/studio
+After=network.target
+
+[Service]
+Type=simple
+User=studio
+Group=studio
+ExecStart=/usr/bin/studio-orchestrator
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/studio /run/studio
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+# Runtime directories
+RuntimeDirectory=studio
+StateDirectory=studio
+WorkingDirectory=/var/lib/studio
+
+# Environment
+Environment=STUDIO_ORCH_DB_PATH=/var/lib/studio/state.db
+Environment=STUDIO_ORCH_SOCKET_PATH=/run/studio/orchestrator.sock
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=studio-orchestrator
+
+[Install]
+WantedBy=multi-user.target

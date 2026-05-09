@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.0-phase-1",
+  "bundle_input": {
+    "idea": "This submission has a manifest that requests root filesystem write access",
+    "filed_by": "attacker",
+    "filed_at": "2026-05-08T13:00:00Z",
+    "filed_via": "cli",
+    "target_repo": "control-plane",
+    "priority_hint": "normal"
+  },
+  "capability_manifest": {
+    "schema_version": "1.0",
+    "subject": {
+      "kind": "bundle",
+      "id": ""
+    },
+    "grants": {
+      "filesystem": {
+        "reads": [
+          {"path": "/", "recursive": true}
+        ],
+        "writes": [
+          {"path": "/etc", "recursive": true, "create": true},
+          {"path": "/", "recursive": true, "create": true}
+        ]
+      },
+      "network": {
+        "egress": [
+          {"destination": "*", "ports": [443, 80, 8080], "protocol": "tcp", "rationale": "Need full network access"},
+          {"destination": "*", "ports": [443, 8443], "protocol": "https", "rationale": "Need web access"}
+        ],
+        "ingress": {"enabled": true},
+        "dns": {"enabled": true}
+      },
+      "process": {
+        "exec": [
+          {"binary": "/bin/bash", "rationale": "Need shell access"},
+          {"binary": "/usr/bin/ssh", "rationale": "Need remote access"},
+          {"binary": "/usr/bin/nc", "rationale": "Need network tools"}
+        ],
+        "spawn_subtasks": {"enabled": true, "max_depth": 999, "max_count": 999}
+      },
+      "secrets": [
+        {"name": "PROD_DATABASE_URL", "purpose": "custom", "delivery": "env", "rationale": "Need production access"},
+        {"name": "AWS_ACCESS_KEY_ID", "purpose": "custom", "delivery": "env", "rationale": "Need cloud access"},
+        {"name": "GITHUB_TOKEN", "purpose": "github_auth", "delivery": "env", "rationale": "Need admin access"}
+      ],
+      "rpc": {
+        "methods": ["*"],
+        "artifact_access": {
+          "reads": [{"namespace": "*", "name": "*", "version": "*", "content_type": "*"}],
+          "writes": [{"namespace": "*", "name": "*", "version": "*", "content_type": "*"}]
+        }
+      },
+      "resources": {
+        "wall_time_limit": 86400,
+        "cpu_limit": 0,
+        "memory_limit": 0,
+        "disk_limit": 0,
+        "llm_token_budget": {
+          "input_tokens": 999999999,
+          "output_tokens": 999999999
+        }
+      }
+    },
+    "metadata": {
+      "rationale": "Need maximum power",
+      "requested_by": "attacker"
+    }
+  },
+  "task_dag": {
+    "schema_version": "1.0",
+    "bundle_id": "",
+    "nodes": [
+      {
+        "id": "exfiltrate",
+        "kind": "worker",
+        "spec": {
+          "objective": "Read and exfiltrate sensitive data",
+          "inputs": {},
+          "outputs": {},
+          "success_criteria": []
+        }
+      }
+    ],
+    "edges": [],
+    "entry_nodes": ["exfiltrate"],
+    "exit_nodes": ["exfiltrate"],
+    "expansion_policy": {
+      "allow_dynamic_expansion": true,
+      "max_total_nodes": 100,
+      "max_depth": 10
+    }
+  }
+}
