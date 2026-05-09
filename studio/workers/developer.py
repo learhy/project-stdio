@@ -378,11 +378,12 @@ class DeveloperWorker:
         except Exception:
             pass
 
-        # Collect stderr
+        # Collect stderr (with timeout — killed processes may hang on buffer drain)
         try:
-            stderr_data = await stderr_task
-        except Exception:
-            pass
+            stderr_data = await asyncio.wait_for(stderr_task, timeout=5.0)
+        except (asyncio.TimeoutError, Exception):
+            stderr_task.cancel()
+            stderr_data = b""
 
         return stdout_lines, stderr_data, stuck
 

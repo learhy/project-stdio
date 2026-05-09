@@ -154,6 +154,15 @@ class LocalBwrapWorkerRunner:
             err = stderr.decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"git worktree add failed: {err}")
 
+        # Set bot author identity so commits are attributed correctly
+        for key, value in [("user.name", "studio-agents[bot]"), ("user.email", "studio-agents@learhy.net")]:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", path, "config", key, value,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+
     def _build_bwrap_args(
         self,
         manifest: CapabilityManifest,
