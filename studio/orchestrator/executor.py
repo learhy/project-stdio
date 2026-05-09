@@ -337,7 +337,6 @@ class DagExecutor:
                 target_spec = None
             if not await self._artifact_inputs_available(bundle_id, target_node_id, target_spec):
                 return
-                return
 
             await self.db.execute(
                 "UPDATE dag_nodes SET state = ?, ready_at = ? WHERE id = ?",

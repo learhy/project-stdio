@@ -270,7 +270,9 @@ class LocalFilesystemArtifactStore(ArtifactStore):
         now = self._timestamp()
         size = len(data)
 
-        # Write bytes (inline to BLOB or to disk)
+        # Write bytes (inline to BLOB or to disk).
+        # If a republish changes an artifact from on-disk to inline (or vice versa),
+        # the old disk file becomes an orphan that sweep_orphans() cleans on its next run.
         inline = None
         if size <= self.inline_threshold:
             inline = data
@@ -288,7 +290,8 @@ class LocalFilesystemArtifactStore(ArtifactStore):
                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?)
                    ON CONFLICT(namespace, name, version) DO UPDATE SET
                    hash=excluded.hash, size_bytes=excluded.size_bytes,
-                   inline_data=excluded.inline_data, published_at=excluded.published_at""",
+                   inline_data=excluded.inline_data, published_at=excluded.published_at,
+                   gc_d_at=NULL, gc_eligible_at=NULL""",
                 (descriptor.namespace, descriptor.name, descriptor.version,
                  descriptor.content_type, h, size, inline, now, now),
             )
@@ -511,13 +514,15 @@ class MockArtifactStore(ArtifactStore):
         if self.get_delay > 0:
             await asyncio.sleep(self.get_delay)
         key = self._key(descriptor)
+        meta = self._meta.get(key, {})
+        if meta.get("gc_d_at") is not None:
+            return None  # tombstoned
         data = self._store.get(key)
         if data is None:
             return None
         if self.corrupt_on_fetch:
             data = b"x" + data[1:]
         # Verify hash
-        meta = self._meta.get(key, {})
         stored_hash = meta.get("hash", "")
         computed = self._compute_hash(data)
         if stored_hash and computed != stored_hash:

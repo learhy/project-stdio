@@ -237,6 +237,20 @@ class TestMockArtifactStore:
         assert len(h) == 64
 
 
+    async def test_republish_clears_tombstone(self):
+        store = MockArtifactStore()
+        desc = ArtifactDescriptor(namespace="bundle", name="results")
+        await store.put(desc, b"v1")
+        # Simulate GC having tombstoned the artifact
+        meta = store._meta[store._key(desc)]
+        meta["gc_d_at"] = 1000000
+        meta["gc_eligible_at"] = 999999
+        # Republish — should clear the tombstone
+        h2 = await store.put(desc, b"v2")
+        data = await store.get(desc)
+        assert data == b"v2"
+        assert h2 is not None
+
 class TestSecretStore:
     def test_fetch_existing_secret(self, monkeypatch):
         monkeypatch.setenv("TEST_SECRET", "secret-value-123")
