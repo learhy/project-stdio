@@ -8,13 +8,11 @@ This is the Studio agent orchestration system: a Python async orchestrator that 
 
 ```
 studio/
-  orchestrator/    # kernel: DB, state machine, RPC, executor, runner, CLI
-  workers/         # worker processes: bootstrap + developer stub
-  tests/           # unit tests + fixtures
-  scripts/         # acceptance.sh
-  systemd/         # studio-orchestrator.service
-settings.json      # default configuration
-pyproject.toml     # uv-managed, Python 3.12
+  orchestrator/    # kernel: DB, state machine, RPC, executor, runner, CLI, main
+  workers/         # worker processes: developer worker stub
+  tests/           # unit tests + fixtures + acceptance.sh
+  systemd/         # studio-orchestrator.service (pending)
+pyproject.toml     # Python 3.12, hatchling build
 ```
 
 ## Key invariants
@@ -41,7 +39,7 @@ pyproject.toml     # uv-managed, Python 3.12
 ## Build and test
 
 ```bash
-uv pip install -e ".[dev]"
-pytest studio/tests/ -v
-bash studio/scripts/acceptance.sh
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest studio/tests/ -v    # 278 tests
+STUDIO_TEST_MODE=1 bash studio/tests/acceptance.sh  # 15 acceptance tests
 ```
