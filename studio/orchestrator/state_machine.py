@@ -198,6 +198,33 @@ class BundleStateMachine:
 
             await self._audit("bundle_input_received", "bundle", bundle_id, {"state": BundleState.PROPOSED})
 
+    # ── Transition 1-idea: submit idea-only (bundle_input_received, no DAG) ──
+
+    async def transition_1_submit_idea(self, bundle_id: str, bundle_input: dict) -> None:
+        """Transition 1 (idea-only): (none) -> PROPOSED. No DAG nodes/edges yet.
+
+        The bundler worker will produce the DAG later; this just creates the bundle row
+        with the raw bundle_input as proposal_json so the bundler has context.
+        """
+        _check_legal("(none)", BundleState.PROPOSED)
+
+        repro = bundle_input.get("target_repo", "control-plane")
+        async with self.db.transaction():
+            await self.db.execute(
+                "INSERT INTO bundles (id, repo, state, tier, proposal_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    bundle_id,
+                    repro,
+                    BundleState.PROPOSED,
+                    "pending_review",
+                    json.dumps({"bundle_input": bundle_input}),
+                    self.now(),
+                ),
+            )
+            await self._audit("bundle_input_received", "bundle", bundle_id,
+                            {"state": BundleState.PROPOSED, "mode": "idea_only"})
+
     # ── Transition 1a: kernel approve (PROPOSED -> APPROVED) [PHASE-1-ONLY]
 
     async def transition_1a_approve(self, bundle_id: str, approved_by: str) -> None:
@@ -275,6 +302,68 @@ class BundleStateMachine:
                 (BundleState.IN_REVIEW, bundle_id),
             )
             await self._audit("pre_execution_review_started", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.IN_REVIEW})
+
+    # ── Transition: bundler planning complete -> IN_REVIEW ───────────────
+
+    async def transition_complete_bundler_planning(
+        self, bundle_id: str, proposal: dict
+    ) -> None:
+        """Bundler completed planning: insert DAG, merge proposal, PROPOSED -> IN_REVIEW."""
+        row = await self.db.fetch_one("SELECT state, proposal_json FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.IN_REVIEW, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.IN_REVIEW)
+
+        task_dag = proposal.get("task_dag", {})
+        dag_nodes_raw = task_dag.get("nodes", [])
+        dag_edges_raw = task_dag.get("edges", [])
+
+        async with self.db.transaction():
+            # Merge bundle_input with bundler-produced proposal
+            existing = json.loads(row["proposal_json"] or "{}")
+            merged = {**existing, "proposal": proposal}
+            await self.db.execute(
+                "UPDATE bundles SET proposal_json = ? WHERE id = ?",
+                (json.dumps(merged), bundle_id),
+            )
+
+            # Insert DAG nodes from bundler output
+            for node in dag_nodes_raw:
+                node_id = f"{bundle_id}:{node['id']}"
+                await self.db.execute(
+                    "INSERT INTO dag_nodes (id, bundle_id, node_id, kind, spec_json, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        node_id,
+                        bundle_id,
+                        node["id"],
+                        node.get("kind", "worker"),
+                        json.dumps(node.get("spec", {})),
+                        "pending",
+                    ),
+                )
+
+            # Insert DAG edges
+            for edge in dag_edges_raw:
+                await self.db.execute(
+                    "INSERT INTO dag_edges (bundle_id, from_node_id, to_node_id, condition_kind) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        bundle_id,
+                        edge.get("from", edge.get("from_node_id", "")),
+                        edge.get("to", edge.get("to_node_id", "")),
+                        edge.get("condition", {}).get("kind", "on_success"),
+                    ),
+                )
+
+            # Fire transition to IN_REVIEW
+            await self.db.execute(
+                "UPDATE bundles SET state = ? WHERE id = ?",
+                (BundleState.IN_REVIEW, bundle_id),
+            )
+            await self._audit("bundle_planning_complete", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.IN_REVIEW})
 
     # ── Transition 4: review passed (IN_REVIEW -> APPROVED) ────────────

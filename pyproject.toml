@@ -22,6 +22,7 @@ dev = [
 studio = "studio.orchestrator.cli:main"
 studio-orchestrator = "studio.orchestrator.main:main"
 studio-worker = "studio.workers.worker:main"
+studio-bundler = "studio.workers.bundler:main"
 
 [build-system]
 requires = ["hatchling"]

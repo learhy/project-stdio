@@ -190,6 +190,7 @@ class TestCliHandlers:
         app = MagicMock()
         app.sm = MagicMock()
         app.sm.transition_1_submit = AsyncMock()
+        app.sm.transition_1_submit_idea = AsyncMock()
         app.sm.transition_1a_approve = AsyncMock()
         app.sm.transition_1b_reject = AsyncMock()
         app.sm.transition_6_start_execution = AsyncMock()
@@ -203,6 +204,14 @@ class TestCliHandlers:
         app.db = MagicMock()
         app.db.fetch_all = AsyncMock()
         app.db.fetch_one = AsyncMock()
+        app.db.execute = AsyncMock()
+        app.db.conn = MagicMock()
+        app.db.conn.commit = AsyncMock()
+        app.settings = MagicMock()
+        app.settings.orchestrator = MagicMock()
+        app.settings.orchestrator.socket_path = "/tmp/test.sock"
+        app.settings.ollama_cloud = MagicMock()
+        app.settings.ollama_cloud.base_url = "https://ollama.com/api"
         return app
 
     @pytest.mark.asyncio
@@ -219,13 +228,15 @@ class TestCliHandlers:
         app_mock.sm.transition_1_submit.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_cli_submit_default_repo(self, app_mock):
-        submission = {"bundle_input": {}, "task_dag": {"nodes": [], "edges": []}}
-        result = await _cli_submit(app_mock, {"submission": submission})
+    async def test_cli_submit_idea_only_path(self, app_mock):
+        """Empty task_dag triggers bundle-input-only path with bundler worker."""
+        submission = {"bundle_input": {"idea": "Test idea"}, "task_dag": {"nodes": [], "edges": []}}
+        with patch("studio.orchestrator.main._spawn_bundler", new_callable=AsyncMock):
+            result = await _cli_submit(app_mock, {"submission": submission})
         assert "bundle_id" in result
-        # Verify default repo used
-        call_args = app_mock.sm.transition_1_submit.call_args[0]
-        assert call_args[1] == "control-plane"
+        assert result["mode"] == "planning"
+        app_mock.sm.transition_1_submit_idea.assert_called_once()
+        app_mock.sm.transition_1_submit.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cli_approve_starts_execution(self, app_mock):

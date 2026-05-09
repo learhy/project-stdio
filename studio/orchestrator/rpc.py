@@ -200,6 +200,7 @@ class RpcHandlers:
         self._on_final_report: Callable[[str, str, str, dict], Awaitable[None]] | None = None
         self._on_heartbeat: Callable[[str, str], Awaitable[None]] | None = None
         self._on_cap_request: Callable[[str, str, dict], Awaitable[dict[str, Any]]] | None = None
+        self._on_bundler_report: Callable[[str, dict], Awaitable[None]] | None = None
         self._artifact_store: "ArtifactStore | None" = None
         self._secret_store: "SecretStore | None" = None
 
@@ -214,6 +215,10 @@ class RpcHandlers:
     def set_on_cap_request(self, cb: Callable[[str, str, dict], Awaitable[dict[str, Any]]]) -> None:
         """Callback: on_cap_request(bundle_id, node_id, request_params_dict)."""
         self._on_cap_request = cb
+
+    def set_on_bundler_report(self, cb: Callable[[str, dict], Awaitable[None]]) -> None:
+        """Callback: on_bundler_report(bundle_id, proposal_dict)."""
+        self._on_bundler_report = cb
 
     def set_artifact_store(self, store: "ArtifactStore") -> None:
         self._artifact_store = store
@@ -300,15 +305,35 @@ class RpcHandlers:
 
     async def handle_final_report(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
         outcome = params.get("outcome", "failure")
+        summary = params.get("summary", "")
+        now = self.now()
+
+        # ── Bundler worker: no dag_node, produces proposal + DAG ──
+        if binding.node_id == "bundler":
+            proposal = params.get("proposal", {})
+            await self.db.execute(
+                "UPDATE workers SET state = ?, ended_at = ? WHERE id = ?",
+                (
+                    WorkerState.COMPLETE if outcome == "success" else WorkerState.FAILED,
+                    now,
+                    binding.worker_id,
+                ),
+            )
+            await self.db.conn.commit()
+
+            if self._on_bundler_report and outcome == "success":
+                await self._on_bundler_report(binding.bundle_id, proposal)
+
+            return {"accepted": True, "bundler": True}
+
+        # ── DAG worker ──
         files_changed = params.get("files_changed", [])
         tests_run = params.get("tests_run", 0)
         tests_passed = params.get("tests_passed", 0)
         tests_failed = params.get("tests_failed", 0)
         errors = params.get("errors", [])
-        summary = params.get("summary", "")
 
         node_id = f"{binding.bundle_id}:{binding.node_id}"
-        now = self.now()
 
         if outcome == "success":
             new_node_state = NodeState.COMPLETED

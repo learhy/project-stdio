@@ -2,14 +2,14 @@
 
 ## What this repo is
 
-This is the Studio agent orchestration system: a Python async orchestrator that accepts bundle submissions, drives worker tasks through a DAG executor, enforces capability-based security, and writes outcomes to SQLite. Phase 1 (current) implements the kernel: linear DAGs, CLI-only surface, no bundler/MCP/GitHub Issues.
+This is the Studio agent orchestration system: a Python async orchestrator that accepts bundle submissions, drives worker tasks through a DAG executor, enforces capability-based security, and writes outcomes to SQLite. Phase 2 (current) implements the bundler agent, full DAG executor, and artifact protocol. Pre-execution review tracks and approval matrix follow in later bundles.
 
 ## Layout
 
 ```
 studio/
   orchestrator/    # kernel: DB, state machine, RPC, executor, runner, CLI, main
-  workers/         # worker processes: developer worker stub
+  workers/         # worker processes: developer worker, bundler agent
   tests/           # unit tests + fixtures + acceptance.sh
   systemd/         # studio-orchestrator.service (pending)
 pyproject.toml     # Python 3.12, hatchling build
@@ -24,22 +24,27 @@ pyproject.toml     # Python 3.12, hatchling build
 - **All schema-mutating operations are in transactions.** Atomic multi-table writes.
 - **Worker tokens are single-use, 256-bit random.** Passed via `STUDIO_WORKER_TOKEN` env var.
 
+## Two submit paths
+
+- **Kernel-direct** (Phase 1): submit with `task_dag` present → bundle goes PROPOSED → kernel approve → APPROVED → execution
+- **Bundle-input-only** (Phase 2): submit with just `bundle_input` (no `task_dag`) → bundle goes PROPOSED → bundler worker spawns → bundler produces proposal + DAG → PROPOSED → IN_REVIEW
+
 ## Phase 2 insertion points
 
-- Bundler agent: new agent type, wires into `PROPOSED → IN_REVIEW` (transition 2)
-- Approval matrix: evaluator function, wires into `IN_REVIEW → APPROVED` (transition 4)
+- Bundler agent: implemented in `studio/workers/bundler.py`, wires into idea-only submit → PROPOSED → IN_REVIEW
+- Approval matrix: evaluator function, wires into IN_REVIEW → APPROVED (transition 4) — Bundle 2.4/2.5
 - MCP server: separate process, connects over Unix socket at `/run/studio/orchestrator.sock`
 - GitHub Issues: webhook receiver, writes to `approval_requests` table
 - Mid-flight steering: Pause/Redirect/Abort/Rollback transitions in state machine
-- Gates/aggregators: new node kinds in DAG executor
-- Dynamic expansion: graft handler in executor
-- Artifact protocol: `artifact.publish`/`artifact.fetch`/`artifact.list` RPC methods
+- Gates/aggregators: new node kinds in DAG executor (Bundle 2.1, implemented)
+- Dynamic expansion: graft handler in executor (Bundle 2.1, implemented)
+- Artifact protocol: `artifact.publish`/`artifact.fetch`/`artifact.list` RPC methods (Bundle 2.2, implemented)
 - Network isolation: switch `kernel.network_isolation` from `"permissive"` to `"enforcing"`
 
 ## Build and test
 
 ```bash
 .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest studio/tests/ -v    # 278 tests
+.venv/bin/python -m pytest studio/tests/ -v    # 480 tests
 STUDIO_TEST_MODE=1 bash studio/tests/acceptance.sh  # 15 acceptance tests
 ```

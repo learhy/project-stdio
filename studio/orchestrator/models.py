@@ -411,6 +411,8 @@ class BundleInput(BaseModel):
     filed_by: str = "reviewer"
     filed_at: str = ""
     filed_via: Literal["idea_forum", "cli", "mcp", "github_issue", "agent_generated"] = "cli"
+    # target_hint is the spec-compliant advisory field (Phase 2+ bundler path).
+    # The bundler may override; the override reason appears in proposal.concerns.
     target_hint: str | None = None
     priority_hint: Literal["low", "normal", "high"] | None = None
     deadline: str | None = None
@@ -419,6 +421,8 @@ class BundleInput(BaseModel):
     supersedes_bundle_id: str | None = None
     related_bundle_ids: list[str] = Field(default_factory=list)
     attachments: list[Attachment] = Field(default_factory=list)
+    # target_repo is Phase 1 kernel-direct only. Phase 3 cleanup removes it.
+    # Use target_hint for the bundler path.
     target_repo: str = "control-plane"
 
 
@@ -430,6 +434,27 @@ class Submission(BaseModel):
     bundle_input: BundleInput = Field(default_factory=BundleInput)
     capability_manifest: CapabilityManifest = Field(default_factory=CapabilityManifest)
     task_dag: TaskDAG = Field(default_factory=TaskDAG)
+
+
+# ── Bundle proposal (bundler agent output) ────────────────────────────────────
+
+class BundleProposal(BaseModel):
+    """bundle_output.proposal block produced by the bundler agent (spec lines 2105-2118)."""
+    complexity_score: int = Field(default=0, ge=0, le=10)
+    risk_score: int = Field(default=0, ge=0, le=10)
+    complexity_factors: dict[str, int] = Field(default_factory=dict)
+    risk_factors: dict[str, int] = Field(default_factory=dict)
+    estimated_loc: int = 0
+    estimated_duration_seconds: int = 0
+    estimated_worker_count: int = 0
+    estimated_tokens: int = 0
+    target: str = "control-plane"
+    target_rationale: str = ""
+    concerns: list[str] = Field(default_factory=list)
+    requirements_summary: str = ""
+    rfc_summary: str = ""
+    implementation_plan: str = ""
+    task_dag: dict = Field(default_factory=dict)
 
 
 # ── Settings models ──────────────────────────────────────────────────────────

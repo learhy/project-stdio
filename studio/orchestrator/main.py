@@ -10,8 +10,10 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +59,13 @@ class Orchestrator:
         self._server: asyncio.AbstractServer | None = None
         self._running = False
 
+    async def _on_bundler_report(self, bundle_id: str, proposal: dict) -> None:
+        """Callback from RpcHandlers when a bundler worker sends final_report."""
+        await self.sm.transition_complete_bundler_planning(bundle_id, proposal)
+        logger.info("Bundler planning complete for bundle %s: C=%s R=%s target=%s",
+                     bundle_id, proposal.get("complexity_score"),
+                     proposal.get("risk_score"), proposal.get("target"))
+
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -73,6 +82,10 @@ class Orchestrator:
         self.dispatcher, self.handlers, self.conn_mgr = create_rpc_system(
             self.db, cfg.socket_path, self.sm
         )
+
+        # Wire bundler final_report callback: when bundler completes, merge
+        # proposal + DAG into the bundle and transition PROPOSED -> IN_REVIEW.
+        self.handlers.set_on_bundler_report(self._on_bundler_report)
 
         # 4. Worker runner (use noop for testing if bwrap unavailable)
         if os.environ.get("STUDIO_TEST_MODE") == "1":
@@ -337,10 +350,22 @@ async def _cli_submit(app: Orchestrator, params: dict) -> dict:
     submission = params.get("submission", {})
     bundle_input = submission.get("bundle_input", {})
     task_dag = submission.get("task_dag", {})
-    repo = bundle_input.get("target_repo", "control-plane")
 
     from ulid import ULID
     bundle_id = str(ULID())
+
+    # ── Bundle-input-only path: no pre-built DAG, spawn bundler worker ──
+    if not task_dag or not task_dag.get("nodes"):
+        await app.sm.transition_1_submit_idea(bundle_id, bundle_input)
+        await _spawn_bundler(app, bundle_id, bundle_input)
+        return {
+            "bundle_id": bundle_id,
+            "mode": "planning",
+            "message": "Bundle created in PROPOSED state, bundler agent is planning",
+        }
+
+    # ── Existing kernel-direct path: pre-built DAG present ──
+    repo = bundle_input.get("target_repo", "control-plane")
 
     dag_nodes = []
     for n in task_dag.get("nodes", []):
@@ -360,6 +385,60 @@ async def _cli_submit(app: Orchestrator, params: dict) -> dict:
 
     await app.sm.transition_1_submit(bundle_id, repo, submission, dag_nodes, dag_edges)
     return {"bundle_id": bundle_id}
+
+
+async def _spawn_bundler(app: Orchestrator, bundle_id: str, bundle_input: dict) -> None:
+    """Spawn a bundler worker as a standalone process (not part of a DAG)."""
+    worker_id = f"bundler_{bundle_id}"
+    token = secrets.token_hex(32)
+    now = int(time.time())
+
+    manifest_json = json.dumps({
+        "schema_version": "1.0",
+        "subject": {"kind": "bundle", "id": bundle_id},
+        "grants": {
+            "filesystem": {"reads": [], "writes": []},
+            "network": {"egress": ["*:443"]},
+            "process": {"exec": []},
+            "rpc": {"methods": ["worker.*"]},
+            "resources": {},
+        },
+        "metadata": {"rationale": "bundler worker needs outbound HTTPS for Ollama Cloud API"},
+    })
+
+    await app.db.execute(
+        "INSERT INTO workers (id, bundle_id, node_id, token, manifest_json, state, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (worker_id, bundle_id, "bundler", token, manifest_json, "pending", now),
+    )
+    await app.db.conn.commit()
+
+    worker_env = {
+        **os.environ,
+        "STUDIO_WORKER_TOKEN": token,
+        "STUDIO_SOCKET_PATH": app.settings.orchestrator.socket_path,
+        "STUDIO_WORKER_ID": worker_id,
+        "STUDIO_BUNDLE_ID": bundle_id,
+        "STUDIO_NODE_ID": "bundler",
+        "STUDIO_TASK_SPEC": json.dumps({
+            "idea": bundle_input.get("idea", ""),
+            "bundle_input": bundle_input,
+        }),
+        "OLLAMA_CLOUD_BASE_URL": app.settings.ollama_cloud.base_url,
+    }
+
+    process = await asyncio.create_subprocess_exec(
+        "studio-bundler",
+        env=worker_env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    # Track for cleanup
+    if not hasattr(app, '_bundler_processes'):
+        app._bundler_processes = {}
+    app._bundler_processes[worker_id] = process
+    logger.info("Bundler worker spawned: %s for bundle %s", worker_id, bundle_id)
 
 
 async def _cli_approve(app: Orchestrator, params: dict) -> dict:
