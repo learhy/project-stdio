@@ -16,6 +16,7 @@ def executor_mock():
     ex._active_bundles = {"b1", "b2"}
     ex._dispatch_ready = AsyncMock(return_value=0)
     ex.check_heartbeat_timeouts = AsyncMock(return_value=[])
+    ex.process_artifact_events = AsyncMock(return_value=None)
     return ex
 
 @pytest.fixture

@@ -23,5 +23,15 @@
     "db_path": "/var/lib/studio/state.db",
     "socket_permissions": "0660",
     "socket_owner": "studio:studio"
-  }
+  },
+  "artifacts": {
+    "inline_threshold_bytes": 4096,
+    "global_storage_cap_bytes": 50000000000,
+    "per_bundle_cap_bytes": 1000000000,
+    "per_artifact_limit_bytes": 100000000,
+    "task_retention_seconds": 86400,
+    "bundle_retention_complete_seconds": 604800,
+    "bundle_retention_failed_seconds": 2592000
+  },
+  "secrets_config": []
 }

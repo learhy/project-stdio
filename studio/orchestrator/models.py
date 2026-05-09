@@ -377,17 +377,24 @@ class RetryPolicy(BaseModel):
 # ── Artifact metadata ─────────────────────────────────────────────────────────
 
 class ArtifactMetadata(BaseModel):
-    bundle_id: str
-    hash_: str = Field(alias="hash")
-    descriptor_json: str = "{}"
+    id: int = 0
+    namespace: Literal["bundle", "global", "task"] = "bundle"
+    name: str = ""
+    version: str = ""
     content_type: str = "application/octet-stream"
+    hash: str = ""
     size_bytes: int = 0
-    scope: Literal["bundle", "task", "global"] = "bundle"
+    inline_data: bytes | None = None
     producer_node_id: str | None = None
+    producer_worker_id: str | None = None
+    bundle_id: str | None = None
+    task_id: str | None = None
+    ref_count: int = 0
     created_at: int = 0
+    published_at: int = 0
     expires_at: int | None = None
-
-    model_config = ConfigDict(populate_by_name=True)
+    gc_eligible_at: int | None = None
+    gc_d_at: int | None = None
 
 
 # ── Bundle input models ──────────────────────────────────────────────────────
@@ -458,11 +465,29 @@ class OrchestratorSettings(BaseModel):
     socket_owner: str = "studio:studio"
 
 
+class ArtifactsSettings(BaseModel):
+    inline_threshold_bytes: int = 4096  # [PROVISIONAL]
+    global_storage_cap_bytes: int = 50_000_000_000  # [PROVISIONAL] 50 GB
+    per_bundle_cap_bytes: int = 1_000_000_000  # 1 GB
+    per_artifact_limit_bytes: int = 100_000_000  # 100 MB
+    task_retention_seconds: int = 86400  # [PROVISIONAL] 24h
+    bundle_retention_complete_seconds: int = 604800  # [PROVISIONAL] 7 days
+    bundle_retention_failed_seconds: int = 2592000  # [PROVISIONAL] 30 days
+
+
+class SecretsConfigEntry(BaseModel):
+    name: str
+    env_var: str
+    purpose: str = "custom"
+
+
 class Settings(BaseModel):
     kernel: KernelSettings = Field(default_factory=KernelSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     ollama_cloud: OllamaCloudSettings = Field(default_factory=OllamaCloudSettings)
     orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)
+    artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
+    secrets_config: list[SecretsConfigEntry] = Field(default_factory=list)
 
 
 # ── RPC message models ───────────────────────────────────────────────────────
@@ -526,3 +551,21 @@ class CapCheckParams(BaseModel):
 class CapCheckResult(BaseModel):
     allowed: bool
     capability_id: str | None = None
+
+
+class ArtifactPublishParams(BaseModel):
+    descriptor: dict[str, Any]
+    data: str  # base64-encoded bytes
+
+
+class ArtifactFetchParams(BaseModel):
+    descriptor: dict[str, Any]
+
+
+class ArtifactListParams(BaseModel):
+    namespace: str | None = None
+    name_pattern: str | None = None
+
+
+class SecretsFetchParams(BaseModel):
+    name: str

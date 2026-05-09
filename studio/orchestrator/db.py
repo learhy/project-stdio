@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -174,20 +174,32 @@ CREATE TABLE IF NOT EXISTS approval_requests (
 );
 
 CREATE TABLE IF NOT EXISTS artifact_metadata (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  namespace TEXT NOT NULL CHECK(namespace IN ('bundle', 'global', 'task')),
+  name TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT '',
+  content_type TEXT NOT NULL,
   hash TEXT NOT NULL,
-  bundle_id TEXT NOT NULL REFERENCES bundles(id),
-  descriptor_json TEXT NOT NULL DEFAULT '{}',
-  content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-  size_bytes INTEGER NOT NULL DEFAULT 0,
-  scope TEXT NOT NULL DEFAULT 'bundle',
+  size_bytes INTEGER NOT NULL,
+  inline_data BLOB,
   producer_node_id TEXT,
+  producer_worker_id TEXT,
+  bundle_id TEXT,
+  task_id TEXT,
+  ref_count INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
+  published_at INTEGER NOT NULL,
   expires_at INTEGER,
-  PRIMARY KEY (hash, bundle_id)
+  gc_eligible_at INTEGER,
+  gc_d_at INTEGER,
+  UNIQUE(namespace, name, version)
 );
 
+CREATE INDEX IF NOT EXISTS idx_artifact_metadata_hash ON artifact_metadata(hash);
 CREATE INDEX IF NOT EXISTS idx_artifact_metadata_bundle ON artifact_metadata(bundle_id);
-CREATE INDEX IF NOT EXISTS idx_artifact_metadata_producer ON artifact_metadata(bundle_id, producer_node_id);
+CREATE INDEX IF NOT EXISTS idx_artifact_metadata_ns_name ON artifact_metadata(namespace, name);
+CREATE INDEX IF NOT EXISTS idx_artifact_metadata_gc ON artifact_metadata(gc_eligible_at)
+    WHERE gc_eligible_at IS NOT NULL AND gc_d_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS artifact_refs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -222,8 +234,61 @@ class Database:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(SCHEMA_SQL)
         await self._conn.commit()
+        await self._run_migrations()
         logger.info("Database connected: %s (WAL mode)", self.db_path)
         return self._conn
+
+    async def _run_migrations(self) -> None:
+        """Apply schema migrations based on stored version vs current SCHEMA_VERSION."""
+        row = await self._conn.execute("SELECT version FROM schema_version")
+        stored = await row.fetchone()
+
+        if stored is None:
+            # Brand new database — SCHEMA_SQL just created everything at current version.
+            await self._conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+            )
+            await self._conn.commit()
+            return
+
+        current_version = stored["version"]
+
+        if current_version < 2:
+            # Migration v2: Replace old artifact_metadata with spec-compliant schema.
+            await self._conn.execute("DROP TABLE IF EXISTS artifact_metadata")
+            await self._conn.executescript("""
+                CREATE TABLE artifact_metadata (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  namespace TEXT NOT NULL CHECK(namespace IN ('bundle', 'global', 'task')),
+                  name TEXT NOT NULL,
+                  version TEXT NOT NULL DEFAULT '',
+                  content_type TEXT NOT NULL,
+                  hash TEXT NOT NULL,
+                  size_bytes INTEGER NOT NULL,
+                  inline_data BLOB,
+                  producer_node_id TEXT,
+                  producer_worker_id TEXT,
+                  bundle_id TEXT,
+                  task_id TEXT,
+                  ref_count INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER NOT NULL,
+                  published_at INTEGER NOT NULL,
+                  expires_at INTEGER,
+                  gc_eligible_at INTEGER,
+                  gc_d_at INTEGER,
+                  UNIQUE(namespace, name, version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_artifact_metadata_hash ON artifact_metadata(hash);
+                CREATE INDEX IF NOT EXISTS idx_artifact_metadata_bundle ON artifact_metadata(bundle_id);
+                CREATE INDEX IF NOT EXISTS idx_artifact_metadata_ns_name ON artifact_metadata(namespace, name);
+                CREATE INDEX IF NOT EXISTS idx_artifact_metadata_gc ON artifact_metadata(gc_eligible_at)
+                    WHERE gc_eligible_at IS NOT NULL AND gc_d_at IS NULL;
+            """)
+            await self._conn.execute(
+                "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (2,)
+            )
+            await self._conn.commit()
+            logger.info("Applied migration v2: artifact_metadata schema updated")
 
     async def close(self) -> None:
         if self._conn:
