@@ -225,6 +225,7 @@ class RpcHandlers:
         """Callback: on_bundler_failure(bundle_id, reason)."""
         self._on_bundler_failure = cb
 
+
     def set_artifact_store(self, store: "ArtifactStore") -> None:
         self._artifact_store = store
 
