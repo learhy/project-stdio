@@ -142,56 +142,60 @@ class TestLocalBwrapWorkerRunner:
     @pytest.mark.asyncio
     async def test_spawn_worker_inserts_db_row(self, runner, db_mock):
         manifest = make_manifest()
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
-            mock_proc = MagicMock()
-            mock_spawn.return_value = mock_proc
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
 
-            result = await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
+                result = await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
 
-            # Check DB insert
-            insert_call = db_mock.execute.call_args_list[0]
-            assert "INSERT INTO workers" in insert_call[0][0]
-            assert insert_call[0][1][0] == "w1"
-            assert insert_call[0][1][1] == "b1"
-            assert insert_call[0][1][2] == "n1"
-            # Index 3 = token, 4 = manifest_json, 5 = state
-            assert insert_call[0][1][5] == "pending"  # state
+                # Check DB insert
+                insert_call = db_mock.execute.call_args_list[0]
+                assert "INSERT INTO workers" in insert_call[0][0]
+                assert insert_call[0][1][0] == "w1"
+                assert insert_call[0][1][1] == "b1"
+                assert insert_call[0][1][2] == "n1"
+                assert insert_call[0][1][5] == "pending"
 
-            assert result.worker_id == "w1"
-            assert result.process is mock_proc
-            assert len(result.token) == 64
+                assert result.worker_id == "w1"
+                assert result.process is mock_proc
+                assert len(result.token) == 64
 
     @pytest.mark.asyncio
     async def test_spawn_worker_env_includes_token(self, runner, db_mock):
         manifest = make_manifest()
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
-            mock_proc = MagicMock()
-            mock_spawn.return_value = mock_proc
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
 
-            await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
+                await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
 
-            # Check env vars
-            _, _, kwargs = mock_spawn.mock_calls[0]
-            assert "env" in kwargs
-            env = kwargs["env"]
-            assert "STUDIO_WORKER_TOKEN" in env
-            assert "STUDIO_SOCKET_PATH" in env
-            assert env["STUDIO_WORKER_ID"] == "w1"
+                # Only one call (worker process, no worktree creation in test mode)
+                _, _, kwargs = mock_spawn.mock_calls[0]
+                assert "env" in kwargs
+                env = kwargs["env"]
+                assert "STUDIO_WORKER_TOKEN" in env
+                assert "STUDIO_SOCKET_PATH" in env
+                assert env["STUDIO_WORKER_ID"] == "w1"
+                assert "STUDIO_WORKTREE_PATH" in env
+                assert "STUDIO_BASE_BRANCH" in env
 
     @pytest.mark.asyncio
     async def test_spawn_worker_includes_task_spec_in_env(self, runner, db_mock):
         manifest = make_manifest()
         task_spec = {"objective": "build server", "inputs": {}}
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
-            mock_proc = MagicMock()
-            mock_spawn.return_value = mock_proc
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
 
-            await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt", task_spec=task_spec)
+                await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt", task_spec=task_spec)
 
-            _, _, kwargs = mock_spawn.mock_calls[0]
-            env = kwargs["env"]
-            assert "STUDIO_TASK_SPEC" in env
-            assert "build server" in env["STUDIO_TASK_SPEC"]
+                _, _, kwargs = mock_spawn.mock_calls[0]
+                env = kwargs["env"]
+                assert "STUDIO_TASK_SPEC" in env
+                assert "build server" in env["STUDIO_TASK_SPEC"]
 
     @pytest.mark.asyncio
     async def test_kill_worker_terminate(self, runner):

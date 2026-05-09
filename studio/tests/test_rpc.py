@@ -573,7 +573,7 @@ class TestCreateRpcSystem:
         assert dispatcher is not None
         assert handlers is not None
         assert conn_mgr is not None
-        assert len(dispatcher._handlers) == 16
+        assert len(dispatcher._handlers) == 17
 
     def test_register_all_methods(self, db_mock, tmp_path):
         sp = str(tmp_path / "test.sock")
@@ -585,6 +585,7 @@ class TestCreateRpcSystem:
             "worker.inject_context", "cap.request",
             "artifact.publish", "artifact.fetch", "artifact.list",
             "secrets.fetch", "worker.request_human_input",
+            "worker.poll_human_input",
         }
         assert set(dispatcher._handlers.keys()) == expected
 
