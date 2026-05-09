@@ -1,0 +1,112 @@
+{
+  "schema_version": "1.0-phase-1",
+  "bundle_input": {
+    "idea": "This DAG has a branch: task-A fans out to task-B and task-C, then task-D merges both",
+    "filed_by": "developer",
+    "filed_at": "2026-05-08T14:00:00Z",
+    "filed_via": "cli",
+    "target_repo": "control-plane",
+    "priority_hint": "normal"
+  },
+  "capability_manifest": {
+    "schema_version": "1.0",
+    "subject": {
+      "kind": "bundle",
+      "id": ""
+    },
+    "grants": {
+      "filesystem": {
+        "reads": [
+          {"path": "/usr/lib", "recursive": true}
+        ],
+        "writes": [
+          {"path": "/work", "recursive": true, "create": true}
+        ]
+      },
+      "network": {
+        "egress": [
+          {"destination": "ollama.com", "ports": [443], "protocol": "https", "rationale": "LLM API access"}
+        ],
+        "ingress": {"enabled": false},
+        "dns": {"enabled": true}
+      },
+      "process": {
+        "exec": [
+          {"binary": "/usr/bin/python3", "rationale": "Run scripts"}
+        ],
+        "spawn_subtasks": {"enabled": false}
+      },
+      "rpc": {
+        "methods": ["worker.*", "cap.*"]
+      },
+      "resources": {
+        "wall_time_limit": 3600,
+        "llm_token_budget": {
+          "input_tokens": 200000,
+          "output_tokens": 100000
+        }
+      }
+    },
+    "metadata": {
+      "rationale": "Testing non-linear DAG support (fan-out and fan-in)",
+      "requested_by": "developer"
+    }
+  },
+  "task_dag": {
+    "schema_version": "1.0",
+    "bundle_id": "",
+    "nodes": [
+      {
+        "id": "task-A",
+        "kind": "worker",
+        "spec": {
+          "objective": "Prepare the shared input data",
+          "inputs": {},
+          "outputs": {"files": ["shared_data.json"]},
+          "success_criteria": [{"kind": "file_exists", "path": "shared_data.json"}]
+        }
+      },
+      {
+        "id": "task-B",
+        "kind": "worker",
+        "spec": {
+          "objective": "Process the data path B: generate report",
+          "inputs": {"input_file": "shared_data.json"},
+          "outputs": {"files": ["report.json"]},
+          "success_criteria": [{"kind": "file_exists", "path": "report.json"}]
+        }
+      },
+      {
+        "id": "task-C",
+        "kind": "worker",
+        "spec": {
+          "objective": "Process the data path C: generate visualization",
+          "inputs": {"input_file": "shared_data.json"},
+          "outputs": {"files": ["chart.png"]},
+          "success_criteria": [{"kind": "file_exists", "path": "chart.png"}]
+        }
+      },
+      {
+        "id": "task-D",
+        "kind": "worker",
+        "spec": {
+          "objective": "Merge results from task-B and task-C into final output",
+          "inputs": {"files": ["report.json", "chart.png"]},
+          "outputs": {"files": ["final_bundle.tar.gz"]},
+          "success_criteria": [{"kind": "file_exists", "path": "final_bundle.tar.gz"}]
+        }
+      }
+    ],
+    "edges": [
+      {"from": "task-A", "to": "task-B", "condition": {"kind": "on_success"}},
+      {"from": "task-A", "to": "task-C", "condition": {"kind": "on_success"}},
+      {"from": "task-B", "to": "task-D", "condition": {"kind": "on_success"}},
+      {"from": "task-C", "to": "task-D", "condition": {"kind": "on_success"}}
+    ],
+    "entry_nodes": ["task-A"],
+    "exit_nodes": ["task-D"],
+    "expansion_policy": {
+      "allow_dynamic_expansion": false
+    }
+  }
+}

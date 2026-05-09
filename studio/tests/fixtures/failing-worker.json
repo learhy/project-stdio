@@ -1,0 +1,77 @@
+{
+  "schema_version": "1.0-phase-1",
+  "bundle_input": {
+    "idea": "This worker will fail due to impossible success criteria",
+    "filed_by": "qa-engineer",
+    "filed_at": "2026-05-08T12:00:00Z",
+    "filed_via": "cli",
+    "target_repo": "test-repo",
+    "priority_hint": "low"
+  },
+  "capability_manifest": {
+    "schema_version": "1.0",
+    "subject": {
+      "kind": "bundle",
+      "id": ""
+    },
+    "grants": {
+      "filesystem": {
+        "reads": [
+          {"path": "/usr/lib", "recursive": true}
+        ],
+        "writes": [
+          {"path": "/work", "recursive": true, "create": true}
+        ]
+      },
+      "network": {
+        "egress": [],
+        "ingress": {"enabled": false},
+        "dns": {"enabled": false}
+      },
+      "process": {
+        "exec": [
+          {"binary": "/usr/bin/python3", "rationale": "Run script"}
+        ],
+        "spawn_subtasks": {"enabled": false}
+      },
+      "rpc": {
+        "methods": ["worker.*", "cap.*"]
+      },
+      "resources": {
+        "wall_time_limit": 60,
+        "llm_token_budget": {
+          "input_tokens": 1000,
+          "output_tokens": 1000
+        }
+      }
+    },
+    "metadata": {
+      "rationale": "Minimal capabilities — this worker is expected to fail",
+      "requested_by": "qa-engineer"
+    }
+  },
+  "task_dag": {
+    "schema_version": "1.0",
+    "bundle_id": "",
+    "nodes": [
+      {
+        "id": "doomed-task",
+        "kind": "worker",
+        "spec": {
+          "objective": "Solve the halting problem",
+          "inputs": {},
+          "outputs": {"files": ["solution.py"]},
+          "success_criteria": [
+            {"kind": "halting_problem_solved", "input": "any_turing_machine"}
+          ]
+        }
+      }
+    ],
+    "edges": [],
+    "entry_nodes": ["doomed-task"],
+    "exit_nodes": ["doomed-task"],
+    "expansion_policy": {
+      "allow_dynamic_expansion": false
+    }
+  }
+}

@@ -1,0 +1,104 @@
+{
+  "schema_version": "1.0-phase-1",
+  "bundle_input": {
+    "idea": "Implement a three-step data pipeline: extract, transform, load",
+    "filed_by": "data-team",
+    "filed_at": "2026-05-08T11:00:00Z",
+    "filed_via": "cli",
+    "target_repo": "data-pipeline",
+    "priority_hint": "high"
+  },
+  "capability_manifest": {
+    "schema_version": "1.0",
+    "subject": {
+      "kind": "bundle",
+      "id": ""
+    },
+    "grants": {
+      "filesystem": {
+        "reads": [
+          {"path": "/usr/lib", "recursive": true},
+          {"path": "/data/input", "recursive": false}
+        ],
+        "writes": [
+          {"path": "/work", "recursive": true, "create": true},
+          {"path": "/data/output", "recursive": false, "create": true}
+        ]
+      },
+      "network": {
+        "egress": [
+          {"destination": "ollama.com", "ports": [443], "protocol": "https", "rationale": "LLM API access"},
+          {"destination": "api.database.example.com", "ports": [5432], "protocol": "tcp", "rationale": "Database access"}
+        ],
+        "ingress": {"enabled": false},
+        "dns": {"enabled": true}
+      },
+      "process": {
+        "exec": [
+          {"binary": "/usr/bin/python3", "rationale": "Run ETL scripts"},
+          {"binary": "/usr/bin/pytest", "rationale": "Run tests"}
+        ],
+        "spawn_subtasks": {"enabled": false}
+      },
+      "rpc": {
+        "methods": ["worker.*", "cap.*"]
+      },
+      "resources": {
+        "wall_time_limit": 7200,
+        "llm_token_budget": {
+          "input_tokens": 200000,
+          "output_tokens": 100000
+        }
+      }
+    },
+    "metadata": {
+      "rationale": "Three-node ETL pipeline needs database and filesystem access",
+      "requested_by": "data-team"
+    }
+  },
+  "task_dag": {
+    "schema_version": "1.0",
+    "bundle_id": "",
+    "nodes": [
+      {
+        "id": "extract",
+        "kind": "worker",
+        "spec": {
+          "objective": "Extract raw data from source CSV files in /data/input",
+          "inputs": {"source_dir": "/data/input"},
+          "outputs": {"files": ["raw_data.json"]},
+          "success_criteria": [{"kind": "file_exists", "path": "raw_data.json"}]
+        }
+      },
+      {
+        "id": "transform",
+        "kind": "worker",
+        "spec": {
+          "objective": "Clean and normalize the extracted data, apply business rules",
+          "inputs": {"input_file": "raw_data.json"},
+          "outputs": {"files": ["clean_data.json"]},
+          "success_criteria": [{"kind": "schema_valid", "schema": "output-schema.json"}]
+        }
+      },
+      {
+        "id": "load",
+        "kind": "worker",
+        "spec": {
+          "objective": "Load the transformed data into the target database",
+          "inputs": {"input_file": "clean_data.json"},
+          "outputs": {"files": ["load_report.json"]},
+          "success_criteria": [{"kind": "row_count", "min": 1}]
+        }
+      }
+    ],
+    "edges": [
+      {"from": "extract", "to": "transform", "condition": {"kind": "on_success"}},
+      {"from": "transform", "to": "load", "condition": {"kind": "on_success"}}
+    ],
+    "entry_nodes": ["extract"],
+    "exit_nodes": ["load"],
+    "expansion_policy": {
+      "allow_dynamic_expansion": false
+    }
+  }
+}

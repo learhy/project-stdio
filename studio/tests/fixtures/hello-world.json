@@ -1,0 +1,77 @@
+{
+  "schema_version": "1.0-phase-1",
+  "bundle_input": {
+    "idea": "Add a hello-world endpoint to the API",
+    "filed_by": "developer",
+    "filed_at": "2026-05-08T10:00:00Z",
+    "filed_via": "cli",
+    "target_repo": "control-plane",
+    "priority_hint": "normal"
+  },
+  "capability_manifest": {
+    "schema_version": "1.0",
+    "subject": {
+      "kind": "bundle",
+      "id": ""
+    },
+    "grants": {
+      "filesystem": {
+        "reads": [
+          {"path": "/usr/lib", "recursive": true}
+        ],
+        "writes": [
+          {"path": "/work/src", "recursive": true, "create": true}
+        ]
+      },
+      "network": {
+        "egress": [
+          {"destination": "ollama.com", "ports": [443], "protocol": "https", "rationale": "LLM API access"}
+        ],
+        "ingress": {"enabled": false},
+        "dns": {"enabled": true}
+      },
+      "process": {
+        "exec": [
+          {"binary": "/usr/bin/python3", "rationale": "Run tests"}
+        ],
+        "spawn_subtasks": {"enabled": false}
+      },
+      "rpc": {
+        "methods": ["worker.*", "cap.*"]
+      },
+      "resources": {
+        "wall_time_limit": 3600,
+        "llm_token_budget": {
+          "input_tokens": 100000,
+          "output_tokens": 50000
+        }
+      }
+    },
+    "metadata": {
+      "rationale": "Simple hello-world endpoint needs minimal capabilities",
+      "requested_by": "developer"
+    }
+  },
+  "task_dag": {
+    "schema_version": "1.0",
+    "bundle_id": "",
+    "nodes": [
+      {
+        "id": "implement-hello",
+        "kind": "worker",
+        "spec": {
+          "objective": "Add a GET /hello endpoint that returns {\"message\": \"hello world\"}",
+          "inputs": {},
+          "outputs": {"files": ["src/api/hello.py"]},
+          "success_criteria": [{"kind": "tests_pass"}]
+        }
+      }
+    ],
+    "edges": [],
+    "entry_nodes": ["implement-hello"],
+    "exit_nodes": ["implement-hello"],
+    "expansion_policy": {
+      "allow_dynamic_expansion": false
+    }
+  }
+}
