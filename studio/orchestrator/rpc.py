@@ -49,7 +49,6 @@ _STUB_METHODS: frozenset[str] = frozenset({
     "worker.resume",
     "worker.cancel",
     "worker.inject_context",
-    "worker.request_human_input",
 })
 
 
@@ -316,6 +315,69 @@ class RpcHandlers:
         )
         await self.db.conn.commit()
         return {"accepted": True}
+
+    # ── worker.request_human_input (full) ─────────────────────────────────
+
+    async def handle_request_human_input(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        """Create an approval_requests row and return the request_id for polling."""
+        import ulid
+        request_id = str(ulid.ULID())
+        now = self.now()
+
+        await self.db.execute(
+            "INSERT INTO approval_requests (id, bundle_id, kind, subject_id, context_json, state, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                request_id,
+                binding.bundle_id,
+                "human_input",
+                binding.worker_id,
+                json.dumps({
+                    "question": params.get("question", ""),
+                    "context": params.get("context", ""),
+                    "options": params.get("options"),
+                }),
+                "pending",
+                now,
+            ),
+        )
+        await self.db.conn.commit()
+
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "worker.human_input_requested",
+                "bundle",
+                binding.bundle_id,
+                json.dumps({"request_id": request_id, "worker_id": binding.worker_id}),
+                now,
+            ),
+        )
+        await self.db.conn.commit()
+
+        return {"request_id": request_id, "state": "pending"}
+
+    # ── worker.poll_human_input (full) ────────────────────────────────────
+
+    async def handle_poll_human_input(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        request_id = params.get("request_id", "")
+        row = await self.db.fetch_one(
+            "SELECT id, state, decision, decided_at, decided_by FROM approval_requests WHERE id = ?",
+            (request_id,),
+        )
+        if row is None:
+            return {"pending": True, "error": "request not found"}
+
+        if row["state"] == "pending":
+            return {"pending": True}
+
+        return {
+            "pending": False,
+            "response": row["decision"] or "",
+            "responded_at": row["decided_at"],
+            "responded_by": row["decided_by"] or "",
+        }
 
     # ── worker.final_report (full) ───────────────────────────────────────
 
@@ -915,12 +977,14 @@ def create_rpc_system(
     dispatcher.register("artifact.fetch", handlers.handle_artifact_fetch)
     dispatcher.register("artifact.list", handlers.handle_artifact_list)
     dispatcher.register("secrets.fetch", handlers.handle_secrets_fetch)
+    # human input (implemented in Bundle 2.6)
+    dispatcher.register("worker.request_human_input", handlers.handle_request_human_input)
+    dispatcher.register("worker.poll_human_input", handlers.handle_poll_human_input)
     # Stub methods also registered so dispatcher finds them (but they return -32000)
     dispatcher.register("worker.pause", _make_stub_handler("worker.pause"))
     dispatcher.register("worker.resume", _make_stub_handler("worker.resume"))
     dispatcher.register("worker.cancel", _make_stub_handler("worker.cancel"))
     dispatcher.register("worker.inject_context", _make_stub_handler("worker.inject_context"))
-    dispatcher.register("worker.request_human_input", _make_stub_handler("worker.request_human_input"))
 
     connection_manager = ConnectionManager(socket_path, dispatcher, handlers, db)
     return dispatcher, handlers, connection_manager

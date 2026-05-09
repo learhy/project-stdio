@@ -28,12 +28,14 @@ class WorkerSpawnResult:
         worker_id: str,
         token: str,
         node_id: str,
-        process: asyncio.subprocess.Process,
+        process: asyncio.subprocess.Process | None = None,
+        error: str = "",
     ) -> None:
         self.worker_id = worker_id
         self.token = token
         self.node_id = node_id
         self.process = process
+        self.error = error
 
 
 class LocalBwrapWorkerRunner:
@@ -63,10 +65,13 @@ class LocalBwrapWorkerRunner:
         manifest: CapabilityManifest,
         worktree_path: str,
         task_spec: dict[str, Any] | None = None,
+        base_branch: str = "main",
     ) -> WorkerSpawnResult:
         """Spawn a worker subprocess in a bubblewrap container.
 
-        Returns WorkerSpawnResult with the worker ID, token, and process handle.
+        Creates a git worktree at worktree_path on a sub-branch
+        bundle/<bundle_id>/<node_id> off base_branch. Returns
+        WorkerSpawnResult with the worker ID, token, and process handle.
         """
         token = _generate_token()
 
@@ -86,6 +91,20 @@ class LocalBwrapWorkerRunner:
         )
         await self.db.conn.commit()
 
+        # Create git worktree
+        worker_branch = f"bundle/{bundle_id}/{node_id}"
+        if not os.environ.get("STUDIO_TEST_MODE") == "1":
+            try:
+                await self._create_worktree(worktree_path, worker_branch, base_branch)
+            except Exception as exc:
+                return WorkerSpawnResult(
+                    worker_id=worker_id,
+                    token=token,
+                    node_id=node_id,
+                    process=None,
+                    error=f"Worktree creation failed: {exc}",
+                )
+
         # Build bwrap args
         bwrap_args = self._build_bwrap_args(manifest, worktree_path, token)
 
@@ -97,6 +116,8 @@ class LocalBwrapWorkerRunner:
             "STUDIO_WORKER_ID": worker_id,
             "STUDIO_BUNDLE_ID": bundle_id,
             "STUDIO_NODE_ID": node_id,
+            "STUDIO_WORKTREE_PATH": worktree_path,
+            "STUDIO_BASE_BRANCH": base_branch,
         }
 
         if task_spec:
@@ -116,6 +137,31 @@ class LocalBwrapWorkerRunner:
             node_id=node_id,
             process=process,
         )
+
+    async def _create_worktree(self, path: str, branch: str, base_branch: str) -> None:
+        """Create a git worktree at path on branch, based off base_branch."""
+        import os as _os
+        _os.makedirs(_os.path.dirname(path) if _os.path.dirname(path) else path, exist_ok=True)
+
+        proc = await asyncio.create_subprocess_exec(
+            "git", "worktree", "add", path, "-b", branch,
+            f"origin/{base_branch}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"git worktree add failed: {err}")
+
+        # Set bot author identity so commits are attributed correctly
+        for key, value in [("user.name", "studio-agents[bot]"), ("user.email", "studio-agents@learhy.net")]:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", path, "config", key, value,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
 
     def _build_bwrap_args(
         self,
