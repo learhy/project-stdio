@@ -294,15 +294,15 @@ class TestBundlerStateMachine:
                        if "UPDATE bundles" in str(c[0][0])]
         assert len(update_calls) >= 2  # proposal_json update + state update
 
-        # Should insert DAG nodes
+        # Should insert DAG nodes (1 work + 3 review tracks + 1 aggregator = 5)
         insert_calls = [c for c in db.execute.call_args_list
                        if "INSERT INTO dag_nodes" in str(c[0][0])]
-        assert len(insert_calls) == 1
+        assert len(insert_calls) == 5
 
-        # Should insert DAG edges
+        # Should insert DAG edges (1 original + 3 review->aggregator + 1 aggregator->entry = 5)
         edge_calls = [c for c in db.execute.call_args_list
                      if "INSERT INTO dag_edges" in str(c[0][0])]
-        assert len(edge_calls) == 1
+        assert len(edge_calls) == 5
 
     @pytest.mark.asyncio
     async def test_transition_bundler_failed(self):

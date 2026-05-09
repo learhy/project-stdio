@@ -23,6 +23,7 @@ _LEGAL_TRANSITIONS: frozenset[tuple[str, str]] = frozenset({
     (BundleState.PROPOSED, BundleState.FAILED),      # 1c: bundler planning failure
     (BundleState.IN_REVIEW, BundleState.APPROVED),    # 4: review passed
     (BundleState.IN_REVIEW, BundleState.REJECTED),    # rejection during review
+    (BundleState.IN_REVIEW, BundleState.PROPOSED),    # 3: review track found blocking issue
     (BundleState.APPROVED, BundleState.IN_PROGRESS), # 6: execution start
     (BundleState.IN_PROGRESS, BundleState.PAUSED),    # pause execution
     (BundleState.PAUSED, BundleState.IN_PROGRESS),    # resume execution
@@ -310,7 +311,7 @@ class BundleStateMachine:
     async def transition_complete_bundler_planning(
         self, bundle_id: str, proposal: dict
     ) -> None:
-        """Bundler completed planning: insert DAG, merge proposal, PROPOSED -> IN_REVIEW."""
+        """Bundler completed planning: inject review tracks, insert DAG, merge proposal, PROPOSED -> IN_REVIEW."""
         row = await self.db.fetch_one("SELECT state, proposal_json FROM bundles WHERE id = ?", (bundle_id,))
         if row is None:
             raise IllegalTransitionError("(missing)", BundleState.IN_REVIEW, f"Bundle {bundle_id} not found")
@@ -320,6 +321,7 @@ class BundleStateMachine:
         task_dag = proposal.get("task_dag", {})
         dag_nodes_raw = task_dag.get("nodes", [])
         dag_edges_raw = task_dag.get("edges", [])
+        entry_nodes = task_dag.get("entry_nodes", [])
 
         async with self.db.transaction():
             # Merge bundle_input with bundler-produced proposal
@@ -329,6 +331,58 @@ class BundleStateMachine:
                 "UPDATE bundles SET proposal_json = ? WHERE id = ?",
                 (json.dumps(merged), bundle_id),
             )
+
+            # Build the review task spec: full proposal context for review workers
+            review_spec = json.dumps({
+                "role": "__ROLE__",  # placeholder, replaced per node
+                "idea": proposal.get("requirements_summary", proposal.get("rfc_summary", "")),
+                "complexity_score": proposal.get("complexity_score", 0),
+                "risk_score": proposal.get("risk_score", 0),
+                "complexity_factors": proposal.get("complexity_factors", {}),
+                "risk_factors": proposal.get("risk_factors", {}),
+                "requirements_summary": proposal.get("requirements_summary", ""),
+                "rfc_summary": proposal.get("rfc_summary", ""),
+                "implementation_plan": proposal.get("implementation_plan", ""),
+                "concerns": proposal.get("concerns", []),
+                "target": proposal.get("target", "control-plane"),
+                "target_rationale": proposal.get("target_rationale", ""),
+                "task_dag": task_dag,
+            })
+
+            # Inject review track nodes
+            review_roles = [
+                ("adversarial", review_spec.replace("__ROLE__", "adversarial")),
+                ("security", review_spec.replace("__ROLE__", "security")),
+                ("qa", review_spec.replace("__ROLE__", "qa")),
+            ]
+            for role, spec in review_roles:
+                node_db_id = f"{bundle_id}:{role}"
+                await self.db.execute(
+                    "INSERT INTO dag_nodes (id, bundle_id, node_id, kind, spec_json, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (node_db_id, bundle_id, role, "worker", spec, "pending"),
+                )
+
+            # Inject review aggregator node
+            aggregator_id = f"{bundle_id}:review-aggregator"
+            aggregator_config = json.dumps({
+                "join": "all",
+                "output_strategy": "collect",
+                "cancel_remaining_on_quorum": False,
+            })
+            await self.db.execute(
+                "INSERT INTO dag_nodes (id, bundle_id, node_id, kind, aggregator_config_json, state) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (aggregator_id, bundle_id, "review-aggregator", "aggregator", aggregator_config, "pending"),
+            )
+
+            # Edges: review tracks -> aggregator
+            for role, _ in review_roles:
+                await self.db.execute(
+                    "INSERT INTO dag_edges (bundle_id, from_node_id, to_node_id, condition_kind) "
+                    "VALUES (?, ?, ?, ?)",
+                    (bundle_id, role, "review-aggregator", "on_success"),
+                )
 
             # Insert DAG nodes from bundler output
             for node in dag_nodes_raw:
@@ -346,7 +400,7 @@ class BundleStateMachine:
                     ),
                 )
 
-            # Insert DAG edges
+            # Insert DAG edges from bundler output
             for edge in dag_edges_raw:
                 await self.db.execute(
                     "INSERT INTO dag_edges (bundle_id, from_node_id, to_node_id, condition_kind) "
@@ -359,6 +413,26 @@ class BundleStateMachine:
                     ),
                 )
 
+            # Edges: aggregator -> bundler's entry nodes
+            if entry_nodes:
+                for en in entry_nodes:
+                    await self.db.execute(
+                        "INSERT INTO dag_edges (bundle_id, from_node_id, to_node_id, condition_kind) "
+                        "VALUES (?, ?, ?, ?)",
+                        (bundle_id, "review-aggregator", en, "on_success"),
+                    )
+            else:
+                # Fallback: wire aggregator to nodes with no incoming edges
+                work_node_ids = {n["id"] for n in dag_nodes_raw}
+                nodes_with_incoming = {e.get("to", e.get("to_node_id", "")) for e in dag_edges_raw}
+                for nid in work_node_ids:
+                    if nid not in nodes_with_incoming:
+                        await self.db.execute(
+                            "INSERT INTO dag_edges (bundle_id, from_node_id, to_node_id, condition_kind) "
+                            "VALUES (?, ?, ?, ?)",
+                            (bundle_id, "review-aggregator", nid, "on_success"),
+                        )
+
             # Fire transition to IN_REVIEW
             await self.db.execute(
                 "UPDATE bundles SET state = ? WHERE id = ?",
@@ -366,6 +440,27 @@ class BundleStateMachine:
             )
             await self._audit("bundle_planning_complete", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.IN_REVIEW})
+
+    # ── Transition 3: review track found blocking issue ─────────────────
+
+    async def transition_3_return_to_proposed(
+        self, bundle_id: str, blocking_reason: str
+    ) -> None:
+        """Transition 3: IN_REVIEW -> PROPOSED. Trigger: review track found a blocking issue."""
+        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.PROPOSED, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.PROPOSED)
+
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE bundles SET state = ? WHERE id = ?",
+                (BundleState.PROPOSED, bundle_id),
+            )
+            await self._audit("review_blocking_issue", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.PROPOSED,
+                             "blocking_reason": blocking_reason})
 
     async def transition_bundler_failed(self, bundle_id: str, reason: str) -> None:
         """Transition 1c: PROPOSED -> FAILED. Trigger: bundler worker failure."""

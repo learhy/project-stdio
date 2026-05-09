@@ -71,6 +71,49 @@ class Orchestrator:
         await self.sm.transition_bundler_failed(bundle_id, reason)
         logger.warning("Bundler failed for bundle %s: %s", bundle_id, reason)
 
+    async def _on_review_complete(self, bundle_id: str, role: str, findings: list) -> None:
+        """Callback from RpcHandlers when a review track worker completes successfully."""
+        logger.info("Review track %s complete for bundle %s: %s findings",
+                     role, bundle_id, len(findings))
+
+    async def _on_review_blocking(self, bundle_id: str, blocking_reason: str) -> None:
+        """Callback from RpcHandlers when a review track reports a blocking issue."""
+        await self.sm.transition_3_return_to_proposed(bundle_id, blocking_reason)
+        logger.warning("Review track blocking issue for bundle %s: %s", bundle_id, blocking_reason)
+
+    async def _on_review_aggregator_complete(self, bundle_id: str, merged: dict) -> None:
+        """Callback from DagExecutor when the review aggregator completes.
+
+        Bundle 2.4: calls the approval matrix evaluator stub (always returns approved).
+        Bundle 2.5: replaces with the real matrix evaluator.
+        """
+        logger.info("Review tracks complete for bundle %s; evaluating approval matrix stub", bundle_id)
+        await self._evaluate_approval_matrix(bundle_id, merged)
+
+    async def _evaluate_approval_matrix(self, bundle_id: str, merged_findings: dict) -> None:
+        """Approval matrix evaluator — stub for Bundle 2.4, always approves.
+
+        Bundle 2.5 replaces this with the full evaluator from the spec pseudocode.
+        """
+        # Publish merged review-summary artifact
+        try:
+            if self.executor and self.executor._artifact_store:
+                import json
+                await self.executor._artifact_store.publish(
+                    namespace="bundle",
+                    name="review-summary",
+                    version=bundle_id,
+                    content_type="application/json",
+                    data=json.dumps(merged_findings).encode("utf-8"),
+                    bundle_id=bundle_id,
+                )
+        except Exception as exc:
+            logger.warning("Failed to publish review-summary artifact: %s", exc)
+
+        # Stub: always approve
+        await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix-stub")
+        logger.info("Approval matrix stub approved bundle %s", bundle_id)
+
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -92,6 +135,10 @@ class Orchestrator:
         # proposal + DAG into the bundle and transition PROPOSED -> IN_REVIEW.
         self.handlers.set_on_bundler_report(self._on_bundler_report)
         self.handlers.set_on_bundler_failure(self._on_bundler_failure)
+
+        # Wire review track callbacks
+        self.handlers.set_on_review_complete(self._on_review_complete)
+        self.handlers.set_on_review_blocking(self._on_review_blocking)
 
         # 4. Worker runner (use noop for testing if bwrap unavailable)
         if os.environ.get("STUDIO_TEST_MODE") == "1":
@@ -115,6 +162,7 @@ class Orchestrator:
             global_concurrency=self.settings.worker.global_concurrency,
             heartbeat_timeout_multiplier=self.settings.worker.heartbeat_timeout_multiplier,
         )
+        self.executor._on_review_aggregator_complete = self._on_review_aggregator_complete
 
         # 6. Scheduler
         self.scheduler = Scheduler(

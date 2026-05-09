@@ -202,6 +202,8 @@ class RpcHandlers:
         self._on_cap_request: Callable[[str, str, dict], Awaitable[dict[str, Any]]] | None = None
         self._on_bundler_report: Callable[[str, dict], Awaitable[None]] | None = None
         self._on_bundler_failure: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_review_complete: Callable[[str, str, dict], Awaitable[None]] | None = None
+        self._on_review_blocking: Callable[[str, str], Awaitable[None]] | None = None
         self._artifact_store: "ArtifactStore | None" = None
         self._secret_store: "SecretStore | None" = None
 
@@ -224,6 +226,14 @@ class RpcHandlers:
     def set_on_bundler_failure(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         """Callback: on_bundler_failure(bundle_id, reason)."""
         self._on_bundler_failure = cb
+
+    def set_on_review_complete(self, cb: Callable[[str, str, dict], Awaitable[None]]) -> None:
+        """Callback: on_review_complete(bundle_id, role, findings_dict)."""
+        self._on_review_complete = cb
+
+    def set_on_review_blocking(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
+        """Callback: on_review_blocking(bundle_id, blocking_reason)."""
+        self._on_review_blocking = cb
 
 
     def set_artifact_store(self, store: "ArtifactStore") -> None:
@@ -334,6 +344,63 @@ class RpcHandlers:
                 await self._on_bundler_failure(binding.bundle_id, summary)
 
             return {"accepted": True, "bundler": True}
+
+        # ── Review track workers (adversarial, security, qa) ──
+        if binding.node_id in ("adversarial", "security", "qa"):
+            findings = params.get("findings", [])
+            blocking = params.get("blocking_issue", False)
+            blocking_reason = params.get("blocking_reason", "")
+            threat_model = params.get("threat_model")
+            verification_plan = params.get("verification_plan")
+
+            await self.db.execute(
+                "UPDATE workers SET state = ?, ended_at = ? WHERE id = ?",
+                (WorkerState.COMPLETE if outcome == "success" else WorkerState.FAILED,
+                 now, binding.worker_id),
+            )
+
+            # Store findings in dag_nodes.output_json for aggregator
+            output = {"findings": findings, "role": binding.node_id, "outcome": outcome}
+            if threat_model:
+                output["threat_model"] = threat_model
+            if verification_plan:
+                output["verification_plan"] = verification_plan
+
+            node_db_id = f"{binding.bundle_id}:{binding.node_id}"
+            await self.db.execute(
+                "UPDATE dag_nodes SET state = ?, output_json = ? WHERE id = ?",
+                (NodeState.COMPLETED if outcome == "success" else NodeState.FAILED,
+                 json.dumps(output), node_db_id),
+            )
+            await self.db.conn.commit()
+
+            # Blocking issue: fire Transition 3 (IN_REVIEW -> PROPOSED)
+            if blocking and self._on_review_blocking:
+                await self._on_review_blocking(binding.bundle_id, blocking_reason)
+
+            # Publish findings as bundle-scoped artifact
+            if self._artifact_store and findings:
+                artifact_name = {
+                    "adversarial": "adversarial-findings",
+                    "security": "security-findings",
+                    "qa": "verification-plan",
+                }.get(binding.node_id, f"{binding.node_id}-findings")
+                try:
+                    await self._artifact_store.publish(
+                        namespace="bundle",
+                        name=artifact_name,
+                        version=binding.bundle_id,
+                        content_type="application/json",
+                        data=json.dumps(output).encode("utf-8"),
+                        bundle_id=binding.bundle_id,
+                    )
+                except Exception:
+                    pass  # artifact publish is best-effort; findings are also in output_json
+
+            if self._on_review_complete and outcome == "success":
+                await self._on_review_complete(binding.bundle_id, binding.node_id, findings)
+
+            return {"accepted": True, "review": True, "role": binding.node_id}
 
         # ── DAG worker ──
         files_changed = params.get("files_changed", [])
