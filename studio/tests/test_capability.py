@@ -501,3 +501,112 @@ def test_empty_grants_deny_all():
     ]:
         allowed, _ = check_op(op, manifest)
         assert not allowed, f"{op} should be denied with empty grants"
+
+
+# ── Working tree write_scope subset ───────────────────────────────────────────
+
+def test_working_tree_task_full_bundle_restricted():
+    """Task wants full write, bundle only grants restricted paths — rejected."""
+    task = make_manifest(grants={
+        "filesystem": {
+            "reads": [{"path": "/work", "recursive": True}],
+            "writes": [{"path": "/work", "recursive": True, "create": True}],
+            "working_tree": {"branch": "main", "base": "main", "write_scope": "full"},
+        },
+    })
+    bundle = make_manifest(grants={
+        "filesystem": {
+            "reads": [{"path": "/work", "recursive": True}],
+            "writes": [{"path": "/work", "recursive": True, "create": True}],
+            "working_tree": {
+                "branch": "main",
+                "base": "main",
+                "write_scope": "path_restricted",
+                "restricted_paths": ["/work/src"],
+            },
+        },
+    })
+    ok, reason = is_subset(task, bundle)
+    assert not ok
+    assert "filesystem" in reason
+
+
+def test_working_tree_task_restricted_bundle_full():
+    """Task has restricted paths, bundle allows full — ok."""
+    task = make_manifest(grants={
+        "filesystem": {
+            "reads": [{"path": "/work", "recursive": True}],
+            "writes": [{"path": "/work", "recursive": True, "create": True}],
+            "working_tree": {
+                "branch": "feature", "base": "main",
+                "write_scope": "path_restricted",
+                "restricted_paths": ["/work/src"],
+            },
+        },
+    })
+    bundle = make_manifest(grants={
+        "filesystem": {
+            "reads": [{"path": "/work", "recursive": True}],
+            "writes": [{"path": "/work", "recursive": True, "create": True}],
+            "working_tree": {"branch": "main", "base": "main", "write_scope": "full"},
+        },
+    })
+    ok, reason = is_subset(task, bundle)
+    assert ok, reason
+
+
+def test_working_tree_both_restricted_paths_subset():
+    """Task paths [/work/src] are subset of bundle paths [/work/src, /work/tests]."""
+    task = make_manifest(grants={
+        "filesystem": {
+            "reads": [{"path": "/work", "recursive": True}],
+            "writes": [{"path": "/work", "recursive": True, "create": True}],
+            "working_tree": {
+                "branch": "feature", "base": "main",
+                "write_scope": "path_restricted",
+                "restricted_paths": ["/work/src"],
+            },
+        },
+    })
+    bundle = make_manifest(grants={
+        "filesystem": {
+            "reads": [{"path": "/work", "recursive": True}],
+            "writes": [{"path": "/work", "recursive": True, "create": True}],
+            "working_tree": {
+                "branch": "main", "base": "main",
+                "write_scope": "path_restricted",
+                "restricted_paths": ["/work/src", "/work/tests"],
+            },
+        },
+    })
+    ok, reason = is_subset(task, bundle)
+    assert ok, reason
+
+
+def test_working_tree_both_restricted_paths_not_subset():
+    """Task paths [/work/src, /work/other] exceed bundle paths [/work/src]."""
+    task = make_manifest(grants={
+        "filesystem": {
+            "reads": [{"path": "/work", "recursive": True}],
+            "writes": [{"path": "/work", "recursive": True, "create": True}],
+            "working_tree": {
+                "branch": "feature", "base": "main",
+                "write_scope": "path_restricted",
+                "restricted_paths": ["/work/src", "/work/other"],
+            },
+        },
+    })
+    bundle = make_manifest(grants={
+        "filesystem": {
+            "reads": [{"path": "/work", "recursive": True}],
+            "writes": [{"path": "/work", "recursive": True, "create": True}],
+            "working_tree": {
+                "branch": "main", "base": "main",
+                "write_scope": "path_restricted",
+                "restricted_paths": ["/work/src"],
+            },
+        },
+    })
+    ok, reason = is_subset(task, bundle)
+    assert not ok
+    assert "filesystem" in reason

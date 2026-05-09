@@ -66,14 +66,20 @@ def _filesystem_is_subset(task, bundle) -> bool:
     # Working tree
     if task.working_tree and bundle.working_tree:
         if (
-            task.working_tree.write_scope == "path_restricted"
-            and bundle.working_tree.write_scope == "full"
+            task.working_tree.write_scope == "full"
+            and bundle.working_tree.write_scope == "path_restricted"
         ):
+            # Task wants full write access but bundle only grants restricted paths.
             return False
-        if task.working_tree.restricted_paths:
+        if (
+            task.working_tree.write_scope == "path_restricted"
+            and bundle.working_tree.write_scope == "path_restricted"
+        ):
+            # Both restricted: task's restricted paths must be a subset of bundle's.
             bundle_paths = set(bundle.working_tree.restricted_paths)
             if not all(p in bundle_paths for p in task.working_tree.restricted_paths):
                 return False
+        # task=path_restricted, bundle=full: task is within bundle scope, always passes.
 
     return True
 
