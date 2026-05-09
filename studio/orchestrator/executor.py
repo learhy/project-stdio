@@ -53,15 +53,48 @@ class DagExecutor:
         # Active tracking
         self._running_workers: dict[str, asyncio.subprocess.Process] = {}
         self._active_bundles: set[str] = set()
+        self._artifact_events: asyncio.Queue[Any] = asyncio.Queue()
+        self._artifact_store: Any = None
 
         # Wire callbacks
         self.rpc_handlers.set_on_final_report(self._on_final_report)
         self.rpc_handlers.set_on_heartbeat(self._on_heartbeat)
         self.rpc_handlers.set_on_cap_request(self._on_cap_request)
 
+    def set_artifact_store(self, store: Any) -> None:
+        self._artifact_store = store
+
     @staticmethod
     def now() -> int:
         return int(time.time())
+
+    async def process_artifact_events(self) -> None:
+        """Drain the artifact event queue and re-evaluate pending successors.
+
+        Called on each scheduler tick. When a new_artifact event arrives, queries
+        artifact_refs for matching descriptors and tries to unblock pending nodes.
+        """
+        while not self._artifact_events.empty():
+            try:
+                event = self._artifact_events.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if event.event_type == "new_artifact":
+                # Find all artifact_refs rows matching this artifact's descriptor
+                refs = await self.db.fetch_all(
+                    "SELECT bundle_id, producer_node_id FROM artifact_refs WHERE descriptor_json = ?",
+                    (event.descriptor_json,),
+                )
+                for ref in refs:
+                    # Find successor nodes of the producer
+                    edges = await self.db.fetch_all(
+                        "SELECT to_node_id FROM dag_edges "
+                        "WHERE bundle_id = ? AND from_node_id = ? AND fired = 0",
+                        (ref["bundle_id"], ref["producer_node_id"]),
+                    )
+                    for edge in edges:
+                        await self._try_make_ready(ref["bundle_id"], edge["to_node_id"])
 
     # ── Bundle lifecycle ──────────────────────────────────────────────────
 
@@ -146,12 +179,22 @@ class DagExecutor:
 
     # ── Node completion and edge evaluation ────────────────────────────────
 
-    async def _process_node_completion(self, bundle_id: str, node_id: str, final_state: str) -> None:
+    async def _process_node_completion(
+        self, bundle_id: str, node_id: str, final_state: str, spec_json: str | None = None
+    ) -> None:
         """Evaluate outgoing edges from a completed/failed/skipped node.
 
         For each outgoing edge, evaluate its condition against the source's final state.
         Fire matching edges. Then check if any targets have become ready.
         """
+        # Decrement ref_count on this node's input artifacts
+        if spec_json:
+            try:
+                self_spec = json.loads(spec_json)
+                await self._adjust_artifact_refs(self_spec, bundle_id, node_id, -1)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         edges = await self.db.fetch_all(
             "SELECT id, to_node_id, condition_kind, condition_expr "
             "FROM dag_edges WHERE bundle_id = ? AND from_node_id = ? AND fired = 0",
@@ -221,7 +264,7 @@ class DagExecutor:
         target_db_id = f"{bundle_id}:{target_node_id}"
 
         target = await self.db.fetch_one(
-            "SELECT kind, aggregator_config_json, state FROM dag_nodes WHERE id = ?",
+            "SELECT kind, aggregator_config_json, state, spec_json FROM dag_nodes WHERE id = ?",
             (target_db_id,),
         )
         if target is None:
@@ -287,9 +330,90 @@ class DagExecutor:
             should_ready = fired_count >= total_count
 
         if should_ready:
+            # Check artifact input dependencies before marking ready
+            try:
+                target_spec = target["spec_json"]
+            except (KeyError, TypeError):
+                target_spec = None
+            if not await self._artifact_inputs_available(bundle_id, target_node_id, target_spec):
+                return
+
             await self.db.execute(
                 "UPDATE dag_nodes SET state = ?, ready_at = ? WHERE id = ?",
                 (NodeState.READY, self.now(), target_db_id),
+            )
+
+    async def _artifact_inputs_available(self, bundle_id: str, node_id: str, spec_json: str | None) -> bool:
+        """Check whether all artifact inputs declared in the node spec exist.
+
+        Returns True if the node has no artifact inputs or all are satisfied.
+        Returns False if any required artifact has not been published yet.
+        """
+        if not spec_json:
+            return True
+
+        try:
+            spec = json.loads(spec_json)
+        except (json.JSONDecodeError, TypeError):
+            return True
+
+        inputs = spec.get("inputs", {})
+        artifacts = inputs.get("artifacts", [])
+        if not artifacts:
+            return True
+
+        for art in artifacts:
+            descriptor = art.get("ref", art)
+            if not isinstance(descriptor, dict):
+                return False
+
+            ns = descriptor.get("namespace", "bundle")
+            name = descriptor.get("name", "")
+            version = descriptor.get("version", "")
+
+            # Check artifact_refs first
+            descriptor_json = json.dumps(descriptor)
+            ref_row = await self.db.fetch_one(
+                "SELECT 1 FROM artifact_refs WHERE bundle_id = ? AND descriptor_json = ?",
+                (bundle_id, descriptor_json),
+            )
+            if ref_row is not None:
+                continue  # This input is satisfied
+
+            # Fallback: check artifact_metadata (for externally injected bundle inputs)
+            # Only for entry nodes or global artifacts
+            if ns == "global":
+                meta_row = await self.db.fetch_one(
+                    "SELECT 1 FROM artifact_metadata WHERE namespace=? AND name=? AND version=? AND gc_d_at IS NULL",
+                    (ns, name, version),
+                )
+                if meta_row is not None:
+                    continue
+
+            # Not found — node stays pending
+            return False
+
+        return True
+
+    async def _adjust_artifact_refs(self, spec: dict, bundle_id: str, node_id: str, delta: int) -> None:
+        """Adjust ref_count for declared input artifacts by delta (+1 or -1)."""
+        inputs = spec.get("inputs", {})
+        artifacts = inputs.get("artifacts", [])
+        if not artifacts:
+            return
+
+        for art in artifacts:
+            descriptor = art.get("ref", art)
+            if not isinstance(descriptor, dict):
+                continue
+            ns = descriptor.get("namespace", "bundle")
+            name = descriptor.get("name", "")
+            version = descriptor.get("version", "")
+
+            await self.db.execute(
+                "UPDATE artifact_metadata SET ref_count = MAX(0, ref_count + ?) "
+                "WHERE namespace = ? AND name = ? AND version = ?",
+                (delta, ns, name, version),
             )
 
     async def _check_bundle_completion(self, bundle_id: str) -> None:
@@ -438,6 +562,8 @@ class DagExecutor:
             "UPDATE dag_nodes SET state = ?, worker_id = ?, started_at = ? WHERE id = ?",
             (NodeState.RUNNING, worker_id, now, node["id"]),
         )
+        # Increment ref_count on declared input artifacts
+        await self._adjust_artifact_refs(spec, bundle_id, node["node_id"], +1)
         await self.db.conn.commit()
 
         if result.process is not None:

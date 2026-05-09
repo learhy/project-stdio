@@ -55,6 +55,18 @@ class Reconciler:
         for w in orphan_workers:
             node_db_id = f"{w['bundle_id']}:{w['node_id']}"
 
+            # Decrement ref_count on input artifacts before marking as failed
+            nrow = await self.db.fetch_one(
+                "SELECT spec_json FROM dag_nodes WHERE id = ?", (node_db_id,)
+            )
+            if nrow and nrow["spec_json"]:
+                try:
+                    from .executor import DagExecutor
+                    spec = json.loads(nrow["spec_json"])
+                    await self.executor._adjust_artifact_refs(spec, w["bundle_id"], w["node_id"], -1)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             # Mark worker as failed
             await self.db.execute(
                 "UPDATE workers SET state = ?, exit_reason = ?, ended_at = ? WHERE id = ?",

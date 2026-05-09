@@ -52,6 +52,8 @@ class Scheduler:
         """Periodically try to dispatch ready nodes from all active bundles."""
         while self._running:
             try:
+                # Process artifact events to unblock nodes waiting on inputs
+                await self.executor.process_artifact_events()
                 for bundle_id in list(self.executor._active_bundles):
                     await self.executor._dispatch_ready(bundle_id)
             except Exception:
