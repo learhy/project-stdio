@@ -457,6 +457,71 @@ class BundleProposal(BaseModel):
     task_dag: dict = Field(default_factory=dict)
 
 
+# ── Review track models ───────────────────────────────────────────────────────
+
+class Severity(StrEnum):
+    INFO = "info"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class FindingStatus(StrEnum):
+    RESOLVED = "resolved"
+    ACCEPTED_RISK = "accepted-risk"
+    UNRESOLVED = "unresolved"
+
+
+class ReviewRole(StrEnum):
+    ADVERSARIAL = "adversarial"
+    SECURITY = "security"
+    QA = "qa"
+
+
+class ReviewFinding(BaseModel):
+    severity: Severity = Severity.LOW
+    status: FindingStatus = FindingStatus.UNRESOLVED
+    category: str = ""
+    finding: str = ""
+    recommendation: str = ""
+    rationale: str = ""
+
+
+class ThreatModel(BaseModel):
+    summary: str = ""
+    assets: list[str] = Field(default_factory=list)
+    threats: list[str] = Field(default_factory=list)
+    mitigations: list[str] = Field(default_factory=list)
+    open_risks: list[str] = Field(default_factory=list)
+
+
+class RollbackPlan(BaseModel):
+    machine_executable: bool = False
+    auto_rollback_eligible: bool = False
+    steps: list[str] = Field(default_factory=list)
+    recovery_time_estimate_seconds: int = 0
+
+
+class VerificationPlan(BaseModel):
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    test_surface: dict = Field(default_factory=dict)
+    pre_merge_gates: list[str] = Field(default_factory=list)
+    post_ship_verification: dict = Field(default_factory=dict)
+    rollback_plan: RollbackPlan = Field(default_factory=RollbackPlan)
+
+
+class ReviewTrackOutput(BaseModel):
+    role: ReviewRole
+    bundle_id: str = ""
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    threat_model: ThreatModel | None = None
+    verification_plan: VerificationPlan | None = None
+    blocking_issue: bool = False
+    blocking_reason: str = ""
+    summary: str = ""
+
+
 # ── Settings models ──────────────────────────────────────────────────────────
 
 class KernelSettings(BaseModel):
@@ -488,6 +553,7 @@ class OrchestratorSettings(BaseModel):
     db_path: str = "/var/lib/studio/state.db"
     socket_permissions: str = "0660"
     socket_owner: str = "studio:studio"
+    memory_root: str = "memory/"
 
 
 class ArtifactsSettings(BaseModel):

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Awaitable
 
 from .models import (
     NodeState,
@@ -55,6 +55,7 @@ class DagExecutor:
         self._active_bundles: set[str] = set()
         self._artifact_events: asyncio.Queue[Any] = asyncio.Queue()
         self._artifact_store: Any = None
+        self._on_review_aggregator_complete: Callable[[str, dict], Awaitable[None]] | None = None
 
         # Wire callbacks
         self.rpc_handlers.set_on_final_report(self._on_final_report)
@@ -759,6 +760,10 @@ class DagExecutor:
 
         await self.db.conn.commit()
         await self._process_node_completion(bundle_id, node["node_id"], NodeState.COMPLETED)
+
+        # Fire review aggregator callback for approval matrix evaluation
+        if node["node_id"] == "review-aggregator" and self._on_review_aggregator_complete:
+            await self._on_review_aggregator_complete(bundle_id, output or {})
 
     def _apply_aggregator_output(
         self,

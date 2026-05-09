@@ -22,7 +22,8 @@
     "socket_path": "/run/studio/orchestrator.sock",
     "db_path": "/var/lib/studio/state.db",
     "socket_permissions": "0660",
-    "socket_owner": "studio:studio"
+    "socket_owner": "studio:studio",
+    "memory_root": "memory/"
   },
   "artifacts": {
     "inline_threshold_bytes": 4096,
