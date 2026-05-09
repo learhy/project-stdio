@@ -41,7 +41,7 @@ class TestOrchestratorLifecycle:
         with patch("studio.orchestrator.main.create_database") as mock_create_db, \
              patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
              patch("studio.orchestrator.main.LocalBwrapWorkerRunner") as mock_runner_cls, \
-             patch("studio.orchestrator.main.LinearDagExecutor") as mock_exec_cls, \
+             patch("studio.orchestrator.main.DagExecutor") as mock_exec_cls, \
              patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
              patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
              patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
@@ -106,7 +106,7 @@ class TestOrchestratorLifecycle:
         with patch("studio.orchestrator.main.create_database") as mock_create_db, \
              patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
              patch("studio.orchestrator.main.LocalBwrapWorkerRunner"), \
-             patch("studio.orchestrator.main.LinearDagExecutor"), \
+             patch("studio.orchestrator.main.DagExecutor"), \
              patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
              patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
              patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
@@ -146,7 +146,7 @@ class TestOrchestratorLifecycle:
         with patch("studio.orchestrator.main.create_database") as mock_create_db, \
              patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
              patch("studio.orchestrator.main.LocalBwrapWorkerRunner"), \
-             patch("studio.orchestrator.main.LinearDagExecutor"), \
+             patch("studio.orchestrator.main.DagExecutor"), \
              patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
              patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
              patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \

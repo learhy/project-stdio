@@ -25,7 +25,7 @@ class Reconciler:
         self,
         db: "Database",
         sm: Any,  # BundleStateMachine
-        executor: Any,  # LinearDagExecutor
+        executor: Any,  # DagExecutor
     ) -> None:
         self.db = db
         self.sm = sm

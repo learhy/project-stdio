@@ -17,9 +17,16 @@ if TYPE_CHECKING:
 # Legal (from_state, to_state) pairs for Phase 1
 _LEGAL_TRANSITIONS: frozenset[tuple[str, str]] = frozenset({
     ("(none)", BundleState.PROPOSED),      # 1: submit
-    (BundleState.PROPOSED, BundleState.APPROVED),    # 1a: kernel approve
-    (BundleState.PROPOSED, BundleState.REJECTED),    # 1b: kernel reject
+    (BundleState.PROPOSED, BundleState.IN_REVIEW),    # 2: start pre-execution review
+    (BundleState.PROPOSED, BundleState.APPROVED),    # 1a: kernel approve (bootstrapping)
+    (BundleState.PROPOSED, BundleState.REJECTED),    # 1b: kernel reject (bootstrapping)
+    (BundleState.IN_REVIEW, BundleState.APPROVED),    # 4: review passed
+    (BundleState.IN_REVIEW, BundleState.REJECTED),    # rejection during review
     (BundleState.APPROVED, BundleState.IN_PROGRESS), # 6: execution start
+    (BundleState.IN_PROGRESS, BundleState.PAUSED),    # pause execution
+    (BundleState.PAUSED, BundleState.IN_PROGRESS),    # resume execution
+    (BundleState.PAUSED, BundleState.REDIRECTING),    # redirect paused bundle
+    (BundleState.REDIRECTING, BundleState.IN_PROGRESS), # redirect complete
     (BundleState.IN_PROGRESS, BundleState.VERIFYING), # 9: all exit nodes terminal
     (BundleState.VERIFYING, BundleState.COMPLETE),    # 17: verification passed
     (BundleState.VERIFYING, BundleState.FAILED),      # 19: verification failed
@@ -251,6 +258,139 @@ class BundleStateMachine:
             )
             await self._audit("kernel_direct_rejection", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.REJECTED, "reason": reason})
+
+    # ── Transition 2: start pre-execution review (PROPOSED -> IN_REVIEW) ───
+
+    async def transition_2_start_review(self, bundle_id: str) -> None:
+        """Transition 2: PROPOSED -> IN_REVIEW. Trigger: pre_execution_review_started."""
+        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.IN_REVIEW, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.IN_REVIEW)
+
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE bundles SET state = ? WHERE id = ?",
+                (BundleState.IN_REVIEW, bundle_id),
+            )
+            await self._audit("pre_execution_review_started", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.IN_REVIEW})
+
+    # ── Transition 4: review passed (IN_REVIEW -> APPROVED) ────────────
+
+    async def transition_4_approve_from_review(self, bundle_id: str, approved_by: str) -> None:
+        """Transition 4: IN_REVIEW -> APPROVED. Trigger: review_approved."""
+        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.APPROVED, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.APPROVED)
+
+        now = self.now()
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE bundles SET state = ?, approved_at = ?, approved_by = ? WHERE id = ?",
+                (BundleState.APPROVED, now, approved_by, bundle_id),
+            )
+            await self.db.execute(
+                "INSERT INTO approval_decisions (bundle_id, decision, surface, actor, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (bundle_id, "approved", "cli", approved_by, now),
+            )
+            await self._audit("review_approved", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.APPROVED, "by": approved_by})
+
+    # ── Transition: reject from IN_REVIEW ─────────────────────────────
+
+    async def transition_reject_from_review(self, bundle_id: str, rejected_by: str, reason: str = "") -> None:
+        """IN_REVIEW -> REJECTED. Trigger: review_rejected."""
+        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.REJECTED, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.REJECTED)
+
+        now = self.now()
+        outcome = {"status": "rejected", "rationale": reason}
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE bundles SET state = ?, completed_at = ?, outcome_json = ? WHERE id = ?",
+                (BundleState.REJECTED, now, json.dumps(outcome), bundle_id),
+            )
+            await self.db.execute(
+                "INSERT INTO approval_decisions (bundle_id, decision, surface, actor, comment, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (bundle_id, "rejected", "cli", rejected_by, reason, now),
+            )
+            await self._audit("review_rejected", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.REJECTED, "reason": reason})
+
+    # ── Pause / Resume / Redirect ─────────────────────────────────────
+
+    async def transition_pause(self, bundle_id: str, reason: str = "") -> None:
+        """IN_PROGRESS -> PAUSED. Trigger: bundle_paused."""
+        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.PAUSED, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.PAUSED)
+
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE bundles SET state = ? WHERE id = ?",
+                (BundleState.PAUSED, bundle_id),
+            )
+            await self._audit("bundle_paused", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.PAUSED, "reason": reason})
+
+    async def transition_resume(self, bundle_id: str) -> None:
+        """PAUSED -> IN_PROGRESS. Trigger: bundle_resumed."""
+        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.IN_PROGRESS, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.IN_PROGRESS)
+
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE bundles SET state = ? WHERE id = ?",
+                (BundleState.IN_PROGRESS, bundle_id),
+            )
+            await self._audit("bundle_resumed", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.IN_PROGRESS})
+
+    async def transition_redirect(self, bundle_id: str, reason: str = "") -> None:
+        """PAUSED -> REDIRECTING. Trigger: bundle_redirecting."""
+        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.REDIRECTING, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.REDIRECTING)
+
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE bundles SET state = ? WHERE id = ?",
+                (BundleState.REDIRECTING, bundle_id),
+            )
+            await self._audit("bundle_redirecting", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.REDIRECTING, "reason": reason})
+
+    async def transition_redirect_complete(self, bundle_id: str) -> None:
+        """REDIRECTING -> IN_PROGRESS. Trigger: redirect_complete."""
+        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            raise IllegalTransitionError("(missing)", BundleState.IN_PROGRESS, f"Bundle {bundle_id} not found")
+        current = row["state"]
+        _check_legal(current, BundleState.IN_PROGRESS)
+
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE bundles SET state = ? WHERE id = ?",
+                (BundleState.IN_PROGRESS, bundle_id),
+            )
+            await self._audit("redirect_complete", "bundle", bundle_id,
+                            {"from_state": current, "to_state": BundleState.IN_PROGRESS})
 
     # ── Transition 6: execution start (APPROVED -> IN_PROGRESS) ────────
 

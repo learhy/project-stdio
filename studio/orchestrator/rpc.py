@@ -46,7 +46,6 @@ _STUB_METHODS: frozenset[str] = frozenset({
     "worker.cancel",
     "worker.inject_context",
     "worker.prepare_handoff",
-    "cap.request",
     "artifact.request",
     "worker.request_human_input",
 })
@@ -198,6 +197,7 @@ class RpcHandlers:
         self.db = db
         self._on_final_report: Callable[[str, str, str, dict], Awaitable[None]] | None = None
         self._on_heartbeat: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_cap_request: Callable[[str, str, dict], Awaitable[dict[str, Any]]] | None = None
 
     def set_on_final_report(self, cb: Callable[[str, str, str, dict], Awaitable[None]]) -> None:
         """Callback: on_final_report(bundle_id, node_id, worker_id, outcome)."""
@@ -206,6 +206,10 @@ class RpcHandlers:
     def set_on_heartbeat(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         """Callback: on_heartbeat(worker_id, phase). Called on every heartbeat."""
         self._on_heartbeat = cb
+
+    def set_on_cap_request(self, cb: Callable[[str, str, dict], Awaitable[dict[str, Any]]]) -> None:
+        """Callback: on_cap_request(bundle_id, node_id, request_params_dict)."""
+        self._on_cap_request = cb
 
     @staticmethod
     def now() -> int:
@@ -352,6 +356,22 @@ class RpcHandlers:
             "last_heartbeat": worker_row["last_heartbeat"] if worker_row else None,
             "current_phase": worker_row["current_phase"] if worker_row else None,
         }
+
+    # ── cap.request (full) ───────────────────────────────────────────────
+
+    async def handle_cap_request(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        """Handle cap.request for dynamic DAG expansion."""
+        if not self._on_cap_request:
+            return {"decision": "denied", "decision_id": None,
+                    "reason": "cap.request not wired to executor"}
+
+        try:
+            return await self._on_cap_request(
+                binding.bundle_id, binding.node_id, params
+            )
+        except Exception as exc:
+            return {"decision": "denied", "decision_id": None,
+                    "reason": str(exc)}
 
     # ── cap.check (full) ─────────────────────────────────────────────────
 
@@ -559,7 +579,7 @@ def create_rpc_system(
     dispatcher.register("worker.cancel", _make_stub_handler("worker.cancel"))
     dispatcher.register("worker.inject_context", _make_stub_handler("worker.inject_context"))
     dispatcher.register("worker.prepare_handoff", _make_stub_handler("worker.prepare_handoff"))
-    dispatcher.register("cap.request", _make_stub_handler("cap.request"))
+    dispatcher.register("cap.request", handlers.handle_cap_request)
     dispatcher.register("artifact.request", _make_stub_handler("artifact.request"))
     dispatcher.register("worker.request_human_input", _make_stub_handler("worker.request_human_input"))
 

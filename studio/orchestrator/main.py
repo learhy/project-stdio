@@ -32,7 +32,7 @@ from .rpc import (
     INTERNAL_ERROR,
 )
 from .runner import LocalBwrapWorkerRunner
-from .executor import LinearDagExecutor
+from .executor import DagExecutor
 from .scheduler import Scheduler
 from .reconciler import Reconciler
 from .models import Settings, OrchestratorSettings
@@ -51,7 +51,7 @@ class Orchestrator:
         self.handlers: RpcHandlers | None = None
         self.conn_mgr: ConnectionManager | None = None
         self.runner: LocalBwrapWorkerRunner | None = None
-        self.executor: LinearDagExecutor | None = None
+        self.executor: DagExecutor | None = None
         self.scheduler: Scheduler | None = None
         self.reconciler: Reconciler | None = None
         self._server: asyncio.AbstractServer | None = None
@@ -87,7 +87,7 @@ class Orchestrator:
             )
 
         # 5. Executor
-        self.executor = LinearDagExecutor(
+        self.executor = DagExecutor(
             self.db,
             self.sm,
             self.runner,
