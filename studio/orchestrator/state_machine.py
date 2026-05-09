@@ -72,6 +72,20 @@ class IllegalTransitionError(Exception):
         }
 
 
+class CooldownError(Exception):
+    """Raised when approval is attempted before cooldown has elapsed."""
+
+    def __init__(self, bundle_id: str, cooldown_until: int, now: int) -> None:
+        self.bundle_id = bundle_id
+        self.cooldown_until = cooldown_until
+        self.now = now
+        remaining = cooldown_until - now
+        super().__init__(
+            f"Bundle {bundle_id} is in cooldown until timestamp {cooldown_until} "
+            f"({remaining}s remaining)"
+        )
+
+
 def _validate_linear_dag(nodes: list[dict], edges: list[dict]) -> None:
     """Reject non-linear DAGs: Phase 1 only supports single-chain pipelines.
 
@@ -481,14 +495,27 @@ class BundleStateMachine:
     # ── Transition 4: review passed (IN_REVIEW -> APPROVED) ────────────
 
     async def transition_4_approve_from_review(self, bundle_id: str, approved_by: str) -> None:
-        """Transition 4: IN_REVIEW -> APPROVED. Trigger: review_approved."""
-        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        """Transition 4: IN_REVIEW -> APPROVED. Trigger: review_approved.
+
+        Enforces cooldown gate: if cooldown_until is set and hasn't elapsed,
+        raises CooldownError (not IllegalTransitionError — this is a timed gate, not a
+        state-machine-rule violation).
+        """
+        row = await self.db.fetch_one(
+            "SELECT state, cooldown_until FROM bundles WHERE id = ?", (bundle_id,)
+        )
         if row is None:
             raise IllegalTransitionError("(missing)", BundleState.APPROVED, f"Bundle {bundle_id} not found")
         current = row["state"]
         _check_legal(current, BundleState.APPROVED)
 
         now = self.now()
+
+        # Cooldown gate
+        cooldown_until = row["cooldown_until"]
+        if cooldown_until is not None and cooldown_until > now:
+            raise CooldownError(bundle_id, cooldown_until, now)
+
         async with self.db.transaction():
             await self.db.execute(
                 "UPDATE bundles SET state = ?, approved_at = ?, approved_by = ? WHERE id = ?",

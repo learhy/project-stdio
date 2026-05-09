@@ -591,24 +591,52 @@ class TestReviewWorkerRoleDispatch:
 
 
 class TestApprovalMatrixStub:
-    """Tests for the approval matrix evaluator stub in Bundle 2.4."""
+    """Tests for the approval matrix evaluator (Bundle 2.5 replaces stub)."""
 
     @pytest.mark.asyncio
-    async def test_evaluate_approval_matrix_stub_always_approves(self):
+    async def test_evaluate_approval_matrix_auto_approves_eligible(self):
+        import json
         from studio.orchestrator.main import Orchestrator
 
         app = Orchestrator()
         app.sm = MagicMock()
         app.sm.transition_4_approve_from_review = AsyncMock()
+        app.sm.now = MagicMock(return_value=1700000000)
+        app.settings = MagicMock()
+        app.settings.approval = MagicMock(
+            summary_timeout_hours=4,
+            cooldown_hours_reversible=1,
+            cooldown_hours_irreversible=24,
+            mandatory_review_triggers=[],
+        )
+
+        app.db = MagicMock()
+        app.db.fetch_one = AsyncMock(return_value={
+            "proposal_json": json.dumps({
+                "bundle_input": {"idea": "Test"},
+                "proposal": {"complexity_score": 1, "risk_score": 1},
+            }),
+            "tags": "[]",
+            "irreversible": 0,
+        })
+        app.db.execute = AsyncMock()
+        app.db.conn = MagicMock()
+        app.db.conn.commit = AsyncMock()
 
         # Mock executor with artifact store
         app.executor = MagicMock()
         app.executor._artifact_store = None
 
-        await app._evaluate_approval_matrix("01TEST", {})
+        # merged findings with viable rollback to allow auto-ship
+        merged = {
+            "security": {"findings": []},
+            "adversarial": {"findings": []},
+            "qa": {"verification_plan": {"rollback_plan": {"machine_executable": True}}},
+        }
+        await app._evaluate_approval_matrix("01TEST", merged)
 
         app.sm.transition_4_approve_from_review.assert_called_once_with(
-            "01TEST", "approval-matrix-stub"
+            "01TEST", "approval-matrix"
         )
 
 

@@ -61,6 +61,97 @@ class ApprovalTier(StrEnum):
     FULL_REVIEW_COOLDOWN = "full_review_cooldown"
 
 
+# Tier ordering for self-escalation comparison
+_TIER_ORDER: dict[str, int] = {
+    "auto": 0,
+    "auto_notify": 1,
+    "summary": 2,
+    "full_review": 3,
+    "full_review_cooldown": 4,
+}
+
+
+def max_tier(a: str, b: str) -> str:
+    """Return the higher of two tier strings."""
+    a_rank = _TIER_ORDER.get(a, -1)
+    b_rank = _TIER_ORDER.get(b, -1)
+    return a if a_rank >= b_rank else b
+
+
+# ── Mandatory-review trigger models ────────────────────────────────────────────
+
+
+class TriggerType(StrEnum):
+    TARGET = "target"
+    FILE_PATTERN = "file_pattern"
+    TAG = "tag"
+
+
+class MandatoryReviewTrigger(BaseModel):
+    """Base for mandatory-review triggers. type discriminates subclasses."""
+    type: str
+
+
+class TargetTrigger(MandatoryReviewTrigger):
+    type: Literal["target"] = "target"
+    value: str  # "new-repo", "control-plane"
+
+    def matches(self, bundle: dict) -> bool:
+        return bundle.get("target") == self.value
+
+
+class FilePatternTrigger(MandatoryReviewTrigger):
+    type: Literal["file_pattern"] = "file_pattern"
+    glob: str  # e.g. ".github/workflows/*", "AGENTS.md", "settings.json"
+
+    def matches(self, bundle: dict) -> bool:
+        import fnmatch
+        dag = bundle.get("task_dag", {})
+        for node in dag.get("nodes", []):
+            spec = node.get("spec", {})
+            for read_path in spec.get("filesystem", {}).get("reads", []):
+                if fnmatch.fnmatch(read_path, self.glob):
+                    return True
+            for write_path in spec.get("filesystem", {}).get("writes", []):
+                if fnmatch.fnmatch(write_path, self.glob):
+                    return True
+        return False
+
+
+class TagTrigger(MandatoryReviewTrigger):
+    type: Literal["tag"] = "tag"
+    tag: str  # e.g. "auth", "billing", "secrets", "pii"
+
+    def matches(self, bundle: dict) -> bool:
+        return self.tag in bundle.get("tags", [])
+
+
+_TRIGGER_REGISTRY: dict[str, type[MandatoryReviewTrigger]] = {
+    TriggerType.TARGET: TargetTrigger,
+    TriggerType.FILE_PATTERN: FilePatternTrigger,
+    TriggerType.TAG: TagTrigger,
+}
+
+
+def parse_trigger(config: dict) -> MandatoryReviewTrigger:
+    """Parse a trigger config dict into the correct MandatoryReviewTrigger subclass."""
+    t = config.get("type", "")
+    cls = _TRIGGER_REGISTRY.get(t)
+    if cls is None:
+        raise ValueError(f"Unknown mandatory-review trigger type: {t}")
+    return cls(**config)
+
+
+# ── Approval settings model ────────────────────────────────────────────────────
+
+
+class ApprovalSettings(BaseModel):
+    summary_timeout_hours: int = 4
+    cooldown_hours_reversible: int = 1
+    cooldown_hours_irreversible: int = 24
+    mandatory_review_triggers: list[dict] = Field(default_factory=list)
+
+
 # ── Capability manifest models ───────────────────────────────────────────────
 
 class FilesystemPathGrant(BaseModel):
@@ -455,6 +546,9 @@ class BundleProposal(BaseModel):
     rfc_summary: str = ""
     implementation_plan: str = ""
     task_dag: dict = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
+    self_escalation_tier: str | None = None
+    irreversible: bool = False
 
 
 # ── Review track models ───────────────────────────────────────────────────────
@@ -579,6 +673,7 @@ class Settings(BaseModel):
     orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     secrets_config: list[SecretsConfigEntry] = Field(default_factory=list)
+    approval: ApprovalSettings = Field(default_factory=ApprovalSettings)
 
 
 # ── RPC message models ───────────────────────────────────────────────────────

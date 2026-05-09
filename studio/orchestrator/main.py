@@ -91,14 +91,81 @@ class Orchestrator:
         await self._evaluate_approval_matrix(bundle_id, merged)
 
     async def _evaluate_approval_matrix(self, bundle_id: str, merged_findings: dict) -> None:
-        """Approval matrix evaluator — stub for Bundle 2.4, always approves.
+        """Full approval matrix evaluator — replaces Bundle 2.4 stub.
 
-        Bundle 2.5 replaces this with the full evaluator from the spec pseudocode.
+        Reads bundle proposal, review track findings, and settings to compute tier,
+        auto_ship eligibility, and cooldown. Stores the result and either auto-approves
+        or leaves the bundle waiting for human action.
         """
+        from .approval import evaluate_approval_matrix
+
+        # Load bundle proposal
+        row = await self.db.fetch_one(
+            "SELECT proposal_json, tags, irreversible FROM bundles WHERE id = ?", (bundle_id,)
+        )
+        if row is None:
+            logger.error("Cannot evaluate matrix for missing bundle %s", bundle_id)
+            return
+
+        try:
+            proposal = json.loads(row["proposal_json"] or "{}")
+        except json.JSONDecodeError:
+            proposal = {}
+
+        bundle_input = proposal.get("bundle_input", {})
+        bundler_proposal = proposal.get("proposal", {})
+        tags_raw = row["tags"] or "[]"
+        try:
+            tags = json.loads(tags_raw)
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+
+        # Merge tags: bundler may have set some, security review may have added
+        security_output = merged_findings.get("security", {})
+        if isinstance(security_output, dict):
+            sec_findings = security_output.get("findings", [])
+        else:
+            sec_findings = []
+        # If security review had findings with categories matching sensitive tags,
+        # add those tags (simplified: if security review produced any threat_model, mark sensitive)
+        if security_output.get("threat_model"):
+            # Security review determined this touches sensitive surfaces
+            pass  # tags are already set from bundler + security review additions
+
+        irreversible = bool(row["irreversible"])
+
+        approval_cfg = self.settings.approval
+
+        result = evaluate_approval_matrix(
+            bundle=bundler_proposal,
+            merged_findings=merged_findings,
+            trigger_configs=approval_cfg.mandatory_review_triggers,
+            tags=tags,
+            self_escalation_tier=bundler_proposal.get("self_escalation_tier"),
+            irreversible=irreversible,
+            cooldown_hours_reversible=approval_cfg.cooldown_hours_reversible,
+            cooldown_hours_irreversible=approval_cfg.cooldown_hours_irreversible,
+        )
+
+        tier = result["tier"]
+        auto_ship = result["auto_ship"]
+        reason = result["reason"]
+        cooldown_until = result["cooldown_until"]
+
+        # Store tier and cooldown on the bundle
+        await self.db.execute(
+            "UPDATE bundles SET tier = ?, cooldown_until = ? WHERE id = ?",
+            (tier, cooldown_until, bundle_id),
+        )
+        await self.db.conn.commit()
+        logger.info(
+            "Approval matrix for bundle %s: tier=%s auto_ship=%s reason=%s cooldown=%s",
+            bundle_id, tier, auto_ship, reason, cooldown_until,
+        )
+
         # Publish merged review-summary artifact
         try:
             if self.executor and self.executor._artifact_store:
-                import json
                 await self.executor._artifact_store.publish(
                     namespace="bundle",
                     name="review-summary",
@@ -110,9 +177,12 @@ class Orchestrator:
         except Exception as exc:
             logger.warning("Failed to publish review-summary artifact: %s", exc)
 
-        # Stub: always approve
-        await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix-stub")
-        logger.info("Approval matrix stub approved bundle %s", bundle_id)
+        # Auto-approve if eligible, otherwise leave for human action
+        if auto_ship:
+            await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix")
+            logger.info("Auto-approved bundle %s (tier=%s)", bundle_id, tier)
+        else:
+            logger.info("Bundle %s requires human approval (tier=%s)", bundle_id, tier)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -613,6 +683,133 @@ async def _cli_kill(app: Orchestrator, params: dict) -> dict:
     return {"workers_killed": len(workers)}
 
 
+async def _cli_deck(app: Orchestrator, params: dict) -> dict:
+    bundle_id = params.get("bundle_id", "")
+    row = await app.db.fetch_one(
+        "SELECT id, state, proposal_json, tags, cooldown_until, tier FROM bundles WHERE id = ?",
+        (bundle_id,),
+    )
+    if row is None:
+        raise ValueError(f"Bundle {bundle_id} not found")
+
+    proposal_raw = json.loads(row["proposal_json"] or "{}")
+    bundler_proposal = proposal_raw.get("proposal", {})
+    bundle_input = proposal_raw.get("bundle_input", {})
+
+    # Load review track findings from dag_nodes
+    review_nodes = await app.db.fetch_all(
+        "SELECT node_id, output_json FROM dag_nodes WHERE bundle_id = ? AND node_id IN (?, ?, ?)",
+        (bundle_id, "adversarial", "security", "qa"),
+    )
+
+    findings: dict[str, Any] = {}
+    for rn in review_nodes:
+        try:
+            findings[rn["node_id"]] = json.loads(rn["output_json"] or "{}")
+        except json.JSONDecodeError:
+            findings[rn["node_id"]] = {}
+
+    # Parse cooldown
+    cooldown_until = row["cooldown_until"]
+    cooldown_str = "none"
+    if cooldown_until:
+        remaining = cooldown_until - app.sm.now()
+        if remaining > 0:
+            cooldown_str = f"{remaining}s remaining"
+        else:
+            cooldown_str = "expired"
+
+    # Build recommendation block
+    confidence_pct = 0
+    if bundler_proposal:
+        c_score = bundler_proposal.get("complexity_score", 0)
+        r_score = bundler_proposal.get("risk_score", 0)
+        if c_score <= 3 and r_score <= 2:
+            confidence_pct = 90
+        elif c_score <= 6 and r_score <= 5:
+            confidence_pct = 70
+        else:
+            confidence_pct = 50
+
+    recommendation = {
+        "complexity_score": bundler_proposal.get("complexity_score", "?"),
+        "risk_score": bundler_proposal.get("risk_score", "?"),
+        "confidence_pct": confidence_pct,
+        "estimated_loc": bundler_proposal.get("estimated_loc", "?"),
+        "estimated_duration": bundler_proposal.get("estimated_duration_seconds", "?"),
+    }
+
+    # Build cost block
+    cost = {
+        "estimated_tokens": bundler_proposal.get("estimated_tokens", "?"),
+        "estimated_worker_count": bundler_proposal.get("estimated_worker_count", "?"),
+    }
+
+    # Build findings block from review tracks
+    adv_output = findings.get("adversarial", {})
+    sec_output = findings.get("security", {})
+    qa_output = findings.get("qa", {})
+
+    review_findings = {
+        "adversarial": adv_output.get("findings", []),
+        "security": sec_output.get("findings", []),
+        "qa": qa_output,
+    }
+
+    deck = {
+        "bundle_id": row["id"],
+        "tier": row["tier"] or "unknown",
+        "auto_ship": False,  # If we're showing the deck, it wasn't auto-shipped
+        "state": row["state"],
+        "cooldown": cooldown_str,
+        "proposal": {"idea": bundle_input.get("idea", "(no idea)")},
+        "recommendation": recommendation,
+        "counter_case": bundler_proposal.get("counter_case", ""),
+        "biggest_risk": bundler_proposal.get("biggest_risk", ""),
+        "stakes_line": bundler_proposal.get("stakes_line", ""),
+        "cost": cost,
+        "findings": review_findings,
+    }
+
+    return deck
+
+
+async def _cli_pending(app: Orchestrator, params: dict) -> dict:
+    rows = await app.db.fetch_all(
+        "SELECT id, state, proposal_json, tier, created_at FROM bundles WHERE state = ?",
+        ("in_review",),
+    )
+
+    now = app.sm.now()
+    summary_timeout = app.settings.approval.summary_timeout_hours * 3600
+
+    bundles = []
+    for r in rows:
+        age_secs = now - (r["created_at"] or 0)
+        age = _format_age(age_secs)
+
+        if age_secs > summary_timeout:
+            status = "stale"
+        elif age_secs > summary_timeout * 0.5:
+            status = "acting-soon"
+        else:
+            status = "fresh"
+
+        proposal_raw = json.loads(r["proposal_json"] or "{}")
+        bundle_input = proposal_raw.get("bundle_input", {})
+
+        bundles.append({
+            "id": r["id"],
+            "tier": r["tier"] or "?",
+            "state": r["state"],
+            "age": age,
+            "status": status,
+            "idea": bundle_input.get("idea", ""),
+        })
+
+    return {"bundles": bundles}
+
+
 async def _cli_status(app: Orchestrator, params: dict) -> dict:
     bundles = await app.db.fetch_all(
         "SELECT id, state, proposal_json FROM bundles WHERE state NOT IN (?, ?, ?, ?, ?)",
@@ -639,6 +836,8 @@ _CLI_HANDLERS = {
     "studio.show": _cli_show,
     "studio.show_worker": _cli_show_worker,
     "studio.kill": _cli_kill,
+    "studio.deck": _cli_deck,
+    "studio.pending": _cli_pending,
     "studio.status": _cli_status,
 }
 

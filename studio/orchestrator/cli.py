@@ -169,6 +169,110 @@ async def cmd_kill(bundle_id: str) -> int:
     return 0
 
 
+async def cmd_deck(bundle_id: str) -> int:
+    """Print the full review deck for a bundle."""
+    resp = await _send_rpc(_get_socket_path(), "studio.deck",
+                           {"bundle_id": bundle_id})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    deck = resp.get("result", {})
+    _print_deck(deck)
+    return 0
+
+
+def _print_deck(deck: dict) -> None:
+    """Render a review deck to the terminal."""
+    print(f"══════════════════════════════════════════════════════════════")
+    print(f"  REVIEW DECK: {deck.get('bundle_id', 'unknown')}")
+    print(f"══════════════════════════════════════════════════════════════")
+    print(f"  Tier:       {deck.get('tier', 'unknown')}")
+    print(f"  Auto-ship:  {deck.get('auto_ship', False)}")
+    print(f"  State:      {deck.get('state', 'unknown')}")
+    print(f"  Cooldown:   {deck.get('cooldown', 'none')}")
+    print()
+
+    proposal = deck.get("proposal", {})
+    print(f"── Proposal ──────────────────────────────────────────────")
+    print(f"  Idea: {proposal.get('idea', '(no idea)')}")
+    print()
+
+    rec = deck.get("recommendation", {})
+    print(f"── Recommendation + Confidence ───────────────────────────")
+    print(f"  Complexity: {rec.get('complexity_score', '?')}/10  Risk: {rec.get('risk_score', '?')}/10")
+    print(f"  Confidence: {rec.get('confidence_pct', '?')}%")
+    print(f"  Estimated LOC: {rec.get('estimated_loc', '?')}")
+    print(f"  Estimated duration: {rec.get('estimated_duration', '?')}")
+    print()
+
+    if deck.get("counter_case"):
+        print(f"── Counter-case ──────────────────────────────────────────")
+        print(f"  {deck['counter_case']}")
+        print()
+
+    if deck.get("biggest_risk"):
+        print(f"── Biggest Risk ─────────────────────────────────────────")
+        print(f"  {deck['biggest_risk']}")
+        print()
+
+    if deck.get("stakes_line"):
+        print(f"── Stakes Line ───────────────────────────────────────────")
+        print(f"  {deck['stakes_line']}")
+        print()
+
+    if deck.get("cost"):
+        cost = deck["cost"]
+        print(f"── Cost Estimate ────────────────────────────────────────")
+        print(f"  Tokens: {cost.get('estimated_tokens', '?')}")
+        print(f"  Workers: {cost.get('estimated_worker_count', '?')}")
+        print()
+
+    findings = deck.get("findings", {})
+    if findings:
+        adv = findings.get("adversarial", [])
+        sec = findings.get("security", [])
+        qa = findings.get("qa", {})
+        if adv:
+            print(f"── Adversarial Critique Findings ({len(adv)}) ───")
+            for f in adv[:5]:
+                print(f"  [{f.get('severity', '?')}] {f.get('finding', '?')}")
+        if sec:
+            print(f"── Security Review Findings ({len(sec)}) ───")
+            for f in sec[:5]:
+                print(f"  [{f.get('severity', '?')}] {f.get('finding', '?')}")
+        if qa:
+            vp = qa.get("verification_plan", {})
+            if vp:
+                criteria = vp.get("acceptance_criteria", [])
+                print(f"── Verification Plan ({len(criteria)} criteria) ───")
+                for c in criteria[:5]:
+                    print(f"  - {c}")
+        print()
+
+    print(f"══════════════════════════════════════════════════════════════")
+
+
+async def cmd_pending() -> int:
+    """List all bundles waiting for PM action."""
+    resp = await _send_rpc(_get_socket_path(), "studio.pending", {})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    bundles = resp.get("result", {}).get("bundles", [])
+    if not bundles:
+        print("No bundles pending review.")
+        return 0
+
+    print(f"{'ID':<28} {'TIER':<22} {'STATE':<12} {'AGE':<8} {'STATUS':<14} IDEA")
+    for b in bundles:
+        status = b.get("status", "")
+        print(f"{b['id']:<28} {b.get('tier', '?'):<22} {b.get('state', '?'):<12} "
+              f"{b.get('age', '?'):<8} {status:<14} {b.get('idea', '')}")
+    return 0
+
+
 async def cmd_status() -> int:
     """Show orchestrator status."""
     resp = await _send_rpc(_get_socket_path(), "studio.status", {})
@@ -221,6 +325,13 @@ def main() -> None:
     p_kill = sub.add_parser("kill", help="Kill a running bundle")
     p_kill.add_argument("bundle_id", help="Bundle ID (ULID)")
 
+    # deck
+    p_deck = sub.add_parser("deck", help="Print the review deck for a bundle")
+    p_deck.add_argument("bundle_id", help="Bundle ID (ULID)")
+
+    # pending
+    sub.add_parser("pending", help="List bundles waiting for PM action")
+
     # status
     sub.add_parser("status", help="Show orchestrator status")
 
@@ -246,6 +357,10 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_show_worker(args.worker_id))
         elif args.command == "kill":
             exit_code = loop.run_until_complete(cmd_kill(args.bundle_id))
+        elif args.command == "deck":
+            exit_code = loop.run_until_complete(cmd_deck(args.bundle_id))
+        elif args.command == "pending":
+            exit_code = loop.run_until_complete(cmd_pending())
         elif args.command == "status":
             exit_code = loop.run_until_complete(cmd_status())
         else:

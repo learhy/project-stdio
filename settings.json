@@ -34,5 +34,21 @@
     "bundle_retention_complete_seconds": 604800,
     "bundle_retention_failed_seconds": 2592000
   },
-  "secrets_config": []
+  "secrets_config": [],
+  "approval": {
+    "summary_timeout_hours": 4,
+    "cooldown_hours_reversible": 1,
+    "cooldown_hours_irreversible": 24,
+    "mandatory_review_triggers": [
+      {"type": "file_pattern", "glob": "AGENTS.md"},
+      {"type": "file_pattern", "glob": "settings.json"},
+      {"type": "file_pattern", "glob": ".github/workflows/*"},
+      {"type": "file_pattern", "glob": "pyproject.toml"},
+      {"type": "target", "value": "new-repo"},
+      {"type": "tag", "tag": "auth"},
+      {"type": "tag", "tag": "billing"},
+      {"type": "tag", "tag": "secrets"},
+      {"type": "tag", "tag": "pii"}
+    ]
+  }
 }
