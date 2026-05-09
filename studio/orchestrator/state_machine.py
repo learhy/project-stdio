@@ -63,6 +63,44 @@ class IllegalTransitionError(Exception):
         }
 
 
+def _validate_linear_dag(nodes: list[dict], edges: list[dict]) -> None:
+    """Reject non-linear DAGs: Phase 1 only supports single-chain pipelines.
+
+    A linear DAG has at most one outgoing edge and at most one incoming edge
+    per node. Fan-out and fan-in are rejected.
+    """
+    if not nodes:
+        return
+
+    out_degree: dict[str, int] = {}
+    in_degree: dict[str, int] = {}
+
+    for n in nodes:
+        node_id = n.get("node_id", n.get("id", ""))
+        out_degree[node_id] = 0
+        in_degree[node_id] = 0
+
+    for e in edges:
+        src = e.get("from_node_id", e.get("from", ""))
+        dst = e.get("to_node_id", e.get("to", ""))
+        out_degree[src] = out_degree.get(src, 0) + 1
+        in_degree[dst] = in_degree.get(dst, 0) + 1
+
+    for node_id, count in out_degree.items():
+        if count > 1:
+            raise IllegalTransitionError(
+                "(none)", "proposed",
+                f"Non-linear DAG not supported in Phase 1: node '{node_id}' has {count} outgoing edges (fan-out)."
+            )
+
+    for node_id, count in in_degree.items():
+        if count > 1:
+            raise IllegalTransitionError(
+                "(none)", "proposed",
+                f"Non-linear DAG not supported in Phase 1: node '{node_id}' has {count} incoming edges (fan-in)."
+            )
+
+
 def _check_legal(from_state: str, to_state: str) -> None:
     if (from_state, to_state) not in _LEGAL_TRANSITIONS:
         if from_state in TERMINAL_STATES:
@@ -108,6 +146,7 @@ class BundleStateMachine:
     ) -> None:
         """Transition 1: (none) -> PROPOSED. Trigger: bundle_input_received."""
         _check_legal("(none)", BundleState.PROPOSED)
+        _validate_linear_dag(dag_nodes, dag_edges)
 
         async with self.db.transaction():
             await self.db.execute(
