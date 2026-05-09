@@ -35,15 +35,17 @@ CREATE TABLE IF NOT EXISTS bundles (
 CREATE TABLE IF NOT EXISTS workers (
   id TEXT PRIMARY KEY,
   bundle_id TEXT NOT NULL REFERENCES bundles(id),
-  task_index INTEGER NOT NULL,
+  node_id TEXT NOT NULL,
+  token TEXT NOT NULL,
+  manifest_json TEXT NOT NULL DEFAULT '{}',
   state TEXT NOT NULL,
   pid INTEGER,
+  current_phase TEXT,
+  created_at INTEGER NOT NULL,
   started_at INTEGER,
   last_heartbeat INTEGER,
   ended_at INTEGER,
-  exit_reason TEXT,
-  task_spec_json TEXT NOT NULL DEFAULT '{}',
-  report_json TEXT
+  exit_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS capabilities (

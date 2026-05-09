@@ -95,7 +95,6 @@ class BundleStateMachine:
             "VALUES (?, ?, ?, ?, ?)",
             (event_type, subject_type, subject_id, json.dumps(payload or {}), self.now()),
         )
-        await self.db.conn.commit()
 
     # ── Transition 1: submit (bundle_input_received) ────────────────────
 

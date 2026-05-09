@@ -74,12 +74,17 @@ class Orchestrator:
             self.db, cfg.socket_path, self.sm
         )
 
-        # 4. Worker runner
-        self.runner = LocalBwrapWorkerRunner(
-            self.db,
-            cfg.socket_path,
-            network_isolation=self.settings.kernel.network_isolation,
-        )
+        # 4. Worker runner (use noop for testing if bwrap unavailable)
+        if os.environ.get("STUDIO_TEST_MODE") == "1":
+            from .runner import NoopWorkerRunner
+            self.runner = NoopWorkerRunner(self.db)
+            logger.info("Test mode: using NoopWorkerRunner")
+        else:
+            self.runner = LocalBwrapWorkerRunner(
+                self.db,
+                cfg.socket_path,
+                network_isolation=self.settings.kernel.network_isolation,
+            )
 
         # 5. Executor
         self.executor = LinearDagExecutor(
@@ -408,7 +413,7 @@ async def _cli_show(app: Orchestrator, params: dict) -> dict:
         "SELECT id, state, proposal_json FROM bundles WHERE id = ?", (bundle_id,)
     )
     if row is None:
-        return {"error": f"Bundle {bundle_id} not found"}
+        raise ValueError(f"Bundle {bundle_id} not found")
 
     proposal = json.loads(row["proposal_json"] or "{}")
     nodes = await app.db.fetch_all(
@@ -430,7 +435,7 @@ async def _cli_show_worker(app: Orchestrator, params: dict) -> dict:
         (worker_id,),
     )
     if row is None:
-        return {"error": f"Worker {worker_id} not found"}
+        raise ValueError(f"Worker {worker_id} not found")
 
     heartbeat_ago = ""
     if row["last_heartbeat"]:
@@ -526,6 +531,12 @@ def main() -> None:
     )
 
     settings = Settings()
+    # Allow environment variable overrides for testing
+    if os.environ.get("STUDIO_ORCH_DB_PATH"):
+        settings.orchestrator.db_path = os.environ["STUDIO_ORCH_DB_PATH"]
+    if os.environ.get("STUDIO_ORCH_SOCKET_PATH"):
+        settings.orchestrator.socket_path = os.environ["STUDIO_ORCH_SOCKET_PATH"]
+
     app = Orchestrator(settings)
 
     loop = asyncio.new_event_loop()

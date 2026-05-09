@@ -272,8 +272,8 @@ class TestCliHandlers:
     @pytest.mark.asyncio
     async def test_cli_show_missing(self, app_mock):
         app_mock.db.fetch_one = AsyncMock(return_value=None)
-        result = await _cli_show(app_mock, {"bundle_id": "MISSING"})
-        assert "error" in result
+        with pytest.raises(ValueError, match="Bundle MISSING not found"):
+            await _cli_show(app_mock, {"bundle_id": "MISSING"})
 
     @pytest.mark.asyncio
     async def test_cli_show_worker(self, app_mock):

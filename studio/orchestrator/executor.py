@@ -275,15 +275,7 @@ class LinearDagExecutor:
             except (json.JSONDecodeError, TypeError):
                 spec = {}
 
-            # Mark node as running
-            now = self.now()
-            await self.db.execute(
-                "UPDATE dag_nodes SET state = ?, worker_id = ?, started_at = ? WHERE id = ?",
-                (NodeState.RUNNING, worker_id, now, node["id"]),
-            )
-            await self.db.conn.commit()
-
-            # Spawn the worker
+            # Spawn the worker first (inserts worker row needed by FK)
             result = await self.runner.spawn_worker(
                 worker_id=worker_id,
                 bundle_id=bundle_id,
@@ -292,6 +284,14 @@ class LinearDagExecutor:
                 worktree_path="/tmp/worktree-placeholder",
                 task_spec=spec.get("spec", spec),
             )
+
+            # Now safe to reference worker_id in dag_nodes (FK satisfied)
+            now = self.now()
+            await self.db.execute(
+                "UPDATE dag_nodes SET state = ?, worker_id = ?, started_at = ? WHERE id = ?",
+                (NodeState.RUNNING, worker_id, now, node["id"]),
+            )
+            await self.db.conn.commit()
 
             if result.process is not None:
                 self._running_workers[worker_id] = result.process
