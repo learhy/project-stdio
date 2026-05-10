@@ -9,6 +9,7 @@ dependencies = [
     "python-ulid>=2.0.0",
     "blake3>=0.4.0",
     "pyyaml>=6.0",
+    "mcp>=1.27.1",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +25,7 @@ studio-orchestrator = "studio.orchestrator.main:main"
 studio-worker = "studio.workers.developer:main"
 studio-bundler = "studio.workers.bundler:main"
 studio-review = "studio.workers.review:main"
+studio-mcp = "studio.mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]

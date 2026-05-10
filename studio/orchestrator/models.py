@@ -566,6 +566,11 @@ class ArtifactsSettings(BaseModel):
     bundle_retention_failed_seconds: int = 2592000  # [PROVISIONAL] 30 days
 
 
+class McpSettings(BaseModel):
+    port: int = 8080
+    bearer_token: str = ""
+
+
 class SecretsConfigEntry(BaseModel):
     name: str
     env_var: str
@@ -578,6 +583,7 @@ class Settings(BaseModel):
     ollama_cloud: OllamaCloudSettings = Field(default_factory=OllamaCloudSettings)
     orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
+    mcp: McpSettings = Field(default_factory=McpSettings)
     secrets_config: list[SecretsConfigEntry] = Field(default_factory=list)
 
 

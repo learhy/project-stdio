@@ -34,5 +34,9 @@
     "bundle_retention_complete_seconds": 604800,
     "bundle_retention_failed_seconds": 2592000
   },
+  "mcp": {
+    "port": 8080,
+    "bearer_token": ""
+  },
   "secrets_config": []
 }

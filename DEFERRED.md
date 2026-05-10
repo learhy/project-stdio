@@ -28,3 +28,9 @@ Workers refreshing short-lived tokens every hour produce one audit line per hour
 
 ### Global artifact default TTL
 Global artifacts currently live forever until cap-evicted or explicitly deleted. A configurable default TTL (e.g., 90 days) would prevent unbounded accumulation. Deferred per spec (line 1816).
+
+### MCP capability grant/revoke tools (Bundle 2.7)
+`grant_capability` and `revoke_capability` MCP tools return a `not_implemented` stub. The full capability request flow requires capability_requests table mechanics and state machine transitions not yet built. Deferred to Phase 3.
+
+### MCP stdio-over-SSH transport (Bundle 2.7)
+Only streamable HTTP transport is implemented in v1 (port 8080, reverse-proxied by Caddy). stdio-over-SSH is deferred to Phase 3.
