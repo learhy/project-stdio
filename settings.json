@@ -23,7 +23,8 @@
     "db_path": "/var/lib/studio/state.db",
     "socket_permissions": "0660",
     "socket_owner": "studio:studio",
-    "memory_root": "memory/"
+    "memory_root": "memory/",
+    "http_port": 7810
   },
   "artifacts": {
     "inline_threshold_bytes": 4096,
@@ -37,6 +38,15 @@
   "mcp": {
     "port": 8080,
     "bearer_token": ""
+  },
+  "github": {
+    "enabled": false,
+    "app_id": "",
+    "installation_id": "",
+    "private_key_path": "",
+    "poll_interval_seconds": 60,
+    "owner": "",
+    "repo": ""
   },
   "secrets_config": []
 }

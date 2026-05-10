@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS bundles (
   approved_at INTEGER,
   approved_by TEXT,
   completed_at INTEGER,
-  outcome_json TEXT
+  outcome_json TEXT,
+  github_issue_number INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS workers (
@@ -289,6 +290,16 @@ class Database:
             )
             await self._conn.commit()
             logger.info("Applied migration v2: artifact_metadata schema updated")
+
+        if current_version < 3:
+            await self._conn.execute(
+                "ALTER TABLE bundles ADD COLUMN github_issue_number INTEGER"
+            )
+            await self._conn.execute(
+                "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (3,)
+            )
+            await self._conn.commit()
+            logger.info("Applied migration v3: github_issue_number column added")
 
     async def close(self) -> None:
         if self._conn:

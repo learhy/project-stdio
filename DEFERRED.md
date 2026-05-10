@@ -34,3 +34,12 @@ Global artifacts currently live forever until cap-evicted or explicitly deleted.
 
 ### MCP stdio-over-SSH transport (Bundle 2.7)
 Only streamable HTTP transport is implemented in v1 (port 8080, reverse-proxied by Caddy). stdio-over-SSH is deferred to Phase 3.
+
+### GitHub webhook signature validation (Bundle 2.8)
+Webhook endpoint at `/github/webhook` accepts POST requests without HMAC-SHA256 signature verification. A webhook secret should be configured and signatures validated before exposing the endpoint beyond localhost. Deferred as bonus feature.
+
+### Per-bundle polling time tracking (Bundle 2.8)
+GitHub issue polling uses a single global `_last_poll_time` for all bundles. Per-bundle `last_polled_at` would avoid redundant API calls for bundles with no recent activity. Deferred until polling overhead becomes measurable.
+
+### GitHub API rate-limit handling (Bundle 2.8)
+No rate-limit awareness — the client does not inspect `X-RateLimit-Remaining` headers or back off when near limits. At current polling cadence (60s) and bundle volume this is safe, but rate-limit awareness should be added before production use with a busy repo.
