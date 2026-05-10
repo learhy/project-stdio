@@ -48,3 +48,20 @@ Transitions 20 (verification_failed_auto_rollback) and 21 (verification_failed_m
 
 ### QA worker automated check runners (Bundle 2.9)
 The QA worker's `_run_automated_checks()` shells out to `pytest`, `ruff`, and `acceptance.sh` as subprocesses. Coverage threshold checking and pre-merge gate enforcement are limited to what the shell commands return. A more structured test-runner interface (with per-test-case granularity, flaky detection, and structured coverage reports) would improve the Verification Report's fidelity but is deferred.
+
+## Phase 3
+
+### Egress proxy TLS-in-CONNECT SNI enforcement (Bundle 3.1)
+The proxy peeks at the first TLS ClientHello after CONNECT and extracts the SNI. If the SNI doesn't match the CONNECT target hostname, the tunnel is blocked. However, TLS 1.3 Encrypted ClientHello (ECH) will defeat SNI sniffing entirely. When ECH gains real-world adoption, the proxy will need an alternative enforcement path (likely: enforce at CONNECT time with DNS pinning, accept the residual risk of post-CONNECT hostname mismatches, and rely on audit logging for incident response). Deferred until ECH appears in worker traffic.
+
+### Egress proxy HTTP method/path constraints (Bundle 3.1)
+The capability manifest schema has separate `http` and `https` protocols with a note that "the schema can be extended later with method or path constraints without breaking compatibility." The current proxy enforces only hostname:port. Per-method restrictions (allow GET but not POST) and per-path restrictions (allow /api/* but not /admin/*) are deferred.
+
+### Egress proxy caching layer (Bundle 3.1)
+No response caching in the proxy. Repeated requests to the same endpoint result in repeated upstream connections. A caching layer with manifest-aware cache keys would reduce latency for common package manager and API calls, but adds cache invalidation complexity and potential staleness bugs. Deferred until worker network latency is a measured bottleneck.
+
+### Egress proxy connection pooling (Bundle 3.1)
+Each HTTP request opens a new upstream connection. Connection pooling (keep-alive across multiple requests from the same worker to the same host) would reduce TCP handshake overhead. Deferred until worker traffic patterns justify the complexity.
+
+### K8sJobWorkerRunner network policy integration (Bundle 3.1)
+The `K8sJobWorkerRunner` is future work; when implemented, the egress proxy model maps to `NetworkPolicy` egress rules with the proxy as a sidecar. The translation logic (capability manifest → NetworkPolicy + sidecar config) is not specified, and the proxy's Unix socket model may need a TCP listener variant for sidecar communication. Deferred until the k8s runner is implemented.

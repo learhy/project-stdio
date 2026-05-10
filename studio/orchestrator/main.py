@@ -301,7 +301,7 @@ class Orchestrator:
             self.runner = LocalBwrapWorkerRunner(
                 self.db,
                 cfg.socket_path,
-                network_isolation=self.settings.kernel.network_isolation,
+                egress_proxy=self.settings.egress_proxy,
             )
 
         # 5. Executor
@@ -997,7 +997,7 @@ async def _cli_kill(app: Orchestrator, params: dict) -> dict:
     for w in workers:
         proc = app.executor._running_workers.pop(w["id"], None)
         if proc and proc.returncode is None:
-            await app.runner.kill_worker(proc)
+            await app.runner.kill_worker(proc, w["id"])
 
     await app.sm.transition_25_fail_execution(bundle_id, "killed via CLI")
     return {"workers_killed": len(workers)}

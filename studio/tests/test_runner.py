@@ -22,6 +22,7 @@ from studio.orchestrator.models import (
     Grants,
     ManifestSubject,
     ManifestMetadata,
+    EgressProxySettings,
 )
 
 
@@ -122,13 +123,7 @@ class TestLocalBwrapWorkerRunner:
         assert "--bind" in args
         assert "/tmp/build" in args
 
-    def test_bwrap_no_unshare_net_in_permissive(self, runner):
-        manifest = make_manifest()
-        args = runner._build_bwrap_args(manifest, "/tmp/wt", "tok")
-        assert "--unshare-net" not in args
-
-    def test_bwrap_unshare_net_in_enforcing(self, db_mock):
-        runner = LocalBwrapWorkerRunner(db_mock, "/tmp/s", network_isolation="enforcing")
+    def test_bwrap_always_unshare_net(self, runner):
         manifest = make_manifest()
         args = runner._build_bwrap_args(manifest, "/tmp/wt", "tok")
         assert "--unshare-net" in args
@@ -180,6 +175,9 @@ class TestLocalBwrapWorkerRunner:
                 assert env["STUDIO_WORKER_ID"] == "w1"
                 assert "STUDIO_WORKTREE_PATH" in env
                 assert "STUDIO_BASE_BRANCH" in env
+                assert "STUDIO_PROXY_SOCKET" in env
+                assert "http_proxy" in env
+                assert "https_proxy" in env
 
     @pytest.mark.asyncio
     async def test_spawn_worker_includes_task_spec_in_env(self, runner, db_mock):
@@ -206,6 +204,26 @@ class TestLocalBwrapWorkerRunner:
 
         await runner.kill_worker(proc)
         proc.terminate.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_kill_worker_with_proxy_cleanup(self, runner):
+        proc = MagicMock()
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock(return_value=0)
+
+        # Add a mock proxy process
+        proxy_proc = MagicMock()
+        proxy_proc.terminate = MagicMock()
+        proxy_proc.wait = AsyncMock(return_value=0)
+        runner._proxy_processes["w1"] = proxy_proc
+
+        with patch("os.unlink"):
+            await runner.kill_worker(proc, "w1")
+
+        proc.terminate.assert_called_once()
+        proxy_proc.terminate.assert_called_once()
+        assert "w1" not in runner._proxy_processes
 
     @pytest.mark.asyncio
     async def test_kill_worker_timeout_then_kill(self, runner):
