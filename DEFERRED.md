@@ -43,10 +43,8 @@ GitHub issue polling uses a single global `_last_poll_time` for all bundles. Per
 
 ### GitHub API rate-limit handling (Bundle 2.8)
 No rate-limit awareness — the client does not inspect `X-RateLimit-Remaining` headers or back off when near limits. At current polling cadence (60s) and bundle volume this is safe, but rate-limit awareness should be added before production use with a busy repo.
-
 ### Auto-rollback on verification failure (Bundle 2.9)
 Transitions 20 (verification_failed_auto_rollback) and 21 (verification_failed_manual_rollback) are stubbed with TODO comments in state_machine.py. When QA verification fails, the bundle always goes to Transition 19 (VERIFYING → FAILED). Auto-rollback requires: machine-executable rollback plan detection, stakes assessment, rollback DAG spawning, and the full Rollback mid-flight steering mechanics. Deferred to Phase 3.
 
 ### QA worker automated check runners (Bundle 2.9)
 The QA worker's `_run_automated_checks()` shells out to `pytest`, `ruff`, and `acceptance.sh` as subprocesses. Coverage threshold checking and pre-merge gate enforcement are limited to what the shell commands return. A more structured test-runner interface (with per-test-case granularity, flaky detection, and structured coverage reports) would improve the Verification Report's fidelity but is deferred.
-
