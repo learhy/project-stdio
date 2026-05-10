@@ -10,14 +10,20 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .github import GitHubClient
 
 from .db import Database, create_database
+from .models import BundleState
 from .state_machine import BundleStateMachine
 from .rpc import (
     RpcDispatcher,
@@ -57,6 +63,12 @@ class Orchestrator:
         self.scheduler: Scheduler | None = None
         self.reconciler: Reconciler | None = None
         self._server: asyncio.AbstractServer | None = None
+        self._http_server: "uvicorn.Server | None" = None
+        self._poll_task: asyncio.Task | None = None
+        self._http_task: asyncio.Task | None = None
+        self.github_client: "GitHubClient | None" = None
+        self._processed_comment_ids: set[int] = set()
+        self._last_poll_time: datetime | None = None
         self._running = False
 
     async def _on_bundler_report(self, bundle_id: str, proposal: dict) -> None:
@@ -126,6 +138,17 @@ class Orchestrator:
         # 2. State machine (kernel mode — Phase 1 approves/rejects directly)
         self.sm = BundleStateMachine(self.db, kernel_mode=True)
 
+        # 2.5. GitHub client (non-blocking — failures logged, transitions proceed)
+        if self.settings.github.enabled:
+            from .github import GitHubClient
+            self.github_client = GitHubClient(self.settings.github)
+            await self.github_client.initialize()
+            self.sm.set_github_client(self.github_client)
+            logger.info("GitHub client initialized for %s/%s",
+                        self.settings.github.owner, self.settings.github.repo)
+        else:
+            self.github_client = None
+
         # 3. RPC system
         self.dispatcher, self.handlers, self.conn_mgr = create_rpc_system(
             self.db, cfg.socket_path, self.sm
@@ -185,6 +208,12 @@ class Orchestrator:
         await self.scheduler.start()
         logger.info("Scheduler started")
 
+        # 9.5. Start HTTP server + GitHub polling (if enabled)
+        if self.settings.github.enabled:
+            self._http_task = asyncio.create_task(self._run_http_server())
+            self._poll_task = asyncio.create_task(self._poll_github_issues())
+            logger.info("HTTP server + GitHub polling started")
+
         # 10. Bind socket (single socket for workers + CLI)
         socket_path = cfg.socket_path
         if os.path.exists(socket_path):
@@ -201,6 +230,24 @@ class Orchestrator:
         """Graceful shutdown: stop accepting, drain loops, close DB."""
         self._running = False
         logger.info("Shutting down...")
+
+        if self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._http_server:
+            self._http_server.should_exit = True
+            if self._http_task:
+                try:
+                    await self._http_task
+                except asyncio.CancelledError:
+                    pass
+
+        if self.github_client:
+            await self.github_client.close()
 
         if self.scheduler:
             await self.scheduler.stop()
@@ -221,6 +268,123 @@ class Orchestrator:
             await self.db.close()
 
         logger.info("Orchestrator stopped")
+
+    # ── GitHub HTTP server + polling ──────────────────────────────────────
+
+    async def _run_http_server(self) -> None:
+        """Run a Starlette HTTP listener for /health and /github/webhook."""
+        try:
+            import uvicorn
+            from starlette.applications import Starlette
+            from starlette.responses import JSONResponse
+            from starlette.routing import Route
+
+            async def health(request) -> JSONResponse:
+                return JSONResponse({"status": "ok"})
+
+            async def webhook(request) -> JSONResponse:
+                try:
+                    body = await request.json()
+                    event = request.headers.get("X-GitHub-Event", "")
+                    if event == "issue_comment":
+                        action = body.get("action", "")
+                        comment = body.get("comment", {})
+                        issue = body.get("issue", {})
+                        sender = body.get("sender", {}).get("login", "")
+                        if action == "created" and sender != "studio-agents[bot]":
+                            comment_id = comment.get("id", 0)
+                            if comment_id not in self._processed_comment_ids:
+                                issue_number = issue.get("number", 0)
+                                bundle_id = await self._resolve_bundle_by_issue(issue_number)
+                                if bundle_id:
+                                    await self._process_comment(bundle_id, comment)
+                                    self._processed_comment_ids.add(comment_id)
+                except Exception:
+                    pass
+                return JSONResponse({"received": True})
+
+            routes = [
+                Route("/health", health, methods=["GET"]),
+                Route("/github/webhook", webhook, methods=["POST"]),
+            ]
+            app = Starlette(routes=routes)
+
+            cfg = uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=self.settings.orchestrator.http_port,
+                log_level="warning",
+            )
+            self._http_server = uvicorn.Server(cfg)
+            await self._http_server.serve()
+        except Exception as exc:
+            logger.warning("HTTP server failed: %s", exc)
+
+    async def _poll_github_issues(self) -> None:
+        """Poll open GitHub issues for new slash-command comments every poll_interval_seconds."""
+        interval = self.settings.github.poll_interval_seconds
+        while self._running:
+            try:
+                await self._poll_once()
+            except Exception as exc:
+                logger.warning("GitHub poll error: %s", exc)
+            await asyncio.sleep(interval)
+
+    async def _poll_once(self) -> None:
+        if self.github_client is None:
+            return
+        rows = await self.db.fetch_all(
+            "SELECT id, github_issue_number FROM bundles WHERE github_issue_number IS NOT NULL AND state IN (?, ?)",
+            (BundleState.IN_REVIEW, BundleState.PROPOSED),
+        )
+        for row in rows:
+            bundle_id = row["id"]
+            issue_number = row["github_issue_number"]
+            comments = await self.github_client.get_comments_since(issue_number, self._last_poll_time)
+            for comment in comments:
+                comment_id = comment.get("id", 0)
+                if comment_id not in self._processed_comment_ids:
+                    await self._process_comment(bundle_id, comment)
+                    self._processed_comment_ids.add(comment_id)
+        self._last_poll_time = datetime.now(timezone.utc)
+
+    async def _resolve_bundle_by_issue(self, issue_number: int) -> str | None:
+        row = await self.db.fetch_one(
+            "SELECT id FROM bundles WHERE github_issue_number = ?", (issue_number,)
+        )
+        return row["id"] if row else None
+
+    async def _process_comment(self, bundle_id: str, comment: dict) -> None:
+        body = comment.get("body", "").strip()
+        user = comment.get("user", {}).get("login", "github-user")
+        actor = f"github:{user}"
+
+        if not body:
+            return
+
+        # Parse slash commands
+        if re.match(r"^/approve\s*$", body, re.IGNORECASE):
+            await self.sm.transition_4_approve_from_review(bundle_id, actor)
+            await self._acknowledge_comment(bundle_id, user, "approve")
+        elif (m := re.match(r"^/reject\s+(.+)$", body, re.IGNORECASE | re.DOTALL)):
+            reason = m.group(1).strip()
+            await self.sm.transition_reject_from_review(bundle_id, actor, reason)
+            await self._acknowledge_comment(bundle_id, user, "reject")
+        elif (m := re.match(r"^/modify\s+(.+)$", body, re.IGNORECASE | re.DOTALL)):
+            instructions = m.group(1).strip()
+            await self.sm.transition_3_return_to_proposed(bundle_id, instructions)
+            await self._acknowledge_comment(bundle_id, user, "modify")
+
+    async def _acknowledge_comment(self, bundle_id: str, user: str, command: str) -> None:
+        if self.github_client is None:
+            return
+        row = await self.db.fetch_one(
+            "SELECT github_issue_number FROM bundles WHERE id = ?", (bundle_id,)
+        )
+        if row is None or row["github_issue_number"] is None:
+            return
+        ack = f"@{user} `/ {command}` acknowledged."
+        await self.github_client.post_comment(row["github_issue_number"], ack)
 
     # ── Connection dispatch ────────────────────────────────────────────────
 

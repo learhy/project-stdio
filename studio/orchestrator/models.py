@@ -554,6 +554,7 @@ class OrchestratorSettings(BaseModel):
     socket_permissions: str = "0660"
     socket_owner: str = "studio:studio"
     memory_root: str = "memory/"
+    http_port: int = 7810
 
 
 class ArtifactsSettings(BaseModel):
@@ -571,6 +572,16 @@ class McpSettings(BaseModel):
     bearer_token: str = ""
 
 
+class GitHubSettings(BaseModel):
+    enabled: bool = False
+    app_id: str = ""
+    installation_id: str = ""
+    private_key_path: str = ""
+    poll_interval_seconds: int = 60
+    owner: str = ""
+    repo: str = ""
+
+
 class SecretsConfigEntry(BaseModel):
     name: str
     env_var: str
@@ -584,6 +595,7 @@ class Settings(BaseModel):
     orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
+    github: GitHubSettings = Field(default_factory=GitHubSettings)
     secrets_config: list[SecretsConfigEntry] = Field(default_factory=list)
 
 

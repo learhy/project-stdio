@@ -6,6 +6,7 @@ Transitions 1a and 1b are PHASE-1-ONLY (gated on kernel_mode).
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,7 @@ from .models import BundleState
 
 if TYPE_CHECKING:
     from .db import Database
+    from .github import GitHubClient
 
 # Legal (from_state, to_state) pairs for Phase 1
 _LEGAL_TRANSITIONS: frozenset[tuple[str, str]] = frozenset({
@@ -129,6 +131,10 @@ class BundleStateMachine:
     def __init__(self, db: "Database", kernel_mode: bool = False) -> None:
         self.db = db
         self.kernel_mode = kernel_mode
+        self._github: "GitHubClient | None" = None
+
+    def set_github_client(self, github_client: "GitHubClient") -> None:
+        self._github = github_client
 
     @staticmethod
     def now() -> int:
@@ -440,6 +446,8 @@ class BundleStateMachine:
             )
             await self._audit("bundle_planning_complete", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.IN_REVIEW})
+        # Create GitHub issue after transition
+        await self._github_create_issue(bundle_id, proposal)
 
     # ── Transition 3: review track found blocking issue ─────────────────
 
@@ -461,6 +469,7 @@ class BundleStateMachine:
             await self._audit("review_blocking_issue", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.PROPOSED,
                              "blocking_reason": blocking_reason})
+        await self._github_post_mirror(bundle_id, f"Modification requested via MCP: {blocking_reason}")
 
     async def transition_bundler_failed(self, bundle_id: str, reason: str) -> None:
         """Transition 1c: PROPOSED -> FAILED. Trigger: bundler worker failure."""
@@ -501,6 +510,7 @@ class BundleStateMachine:
             )
             await self._audit("review_approved", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.APPROVED, "by": approved_by})
+        await self._github_post_mirror(bundle_id, f"Bundle approved via MCP by {approved_by}.")
 
     # ── Transition: reject from IN_REVIEW ─────────────────────────────
 
@@ -526,6 +536,7 @@ class BundleStateMachine:
             )
             await self._audit("review_rejected", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.REJECTED, "reason": reason})
+        await self._github_post_mirror(bundle_id, f"Bundle rejected via MCP: {reason}")
 
     # ── Pause / Resume / Redirect ─────────────────────────────────────
 
@@ -544,6 +555,7 @@ class BundleStateMachine:
             )
             await self._audit("bundle_paused", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.PAUSED, "reason": reason})
+        await self._github_post_mirror(bundle_id, f"Bundle paused. {reason}")
 
     async def transition_resume(self, bundle_id: str) -> None:
         """PAUSED -> IN_PROGRESS. Trigger: bundle_resumed."""
@@ -560,6 +572,7 @@ class BundleStateMachine:
             )
             await self._audit("bundle_resumed", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.IN_PROGRESS})
+        await self._github_post_mirror(bundle_id, "Bundle resumed.")
 
     async def transition_redirect(self, bundle_id: str, reason: str = "") -> None:
         """PAUSED -> REDIRECTING. Trigger: bundle_redirecting."""
@@ -688,3 +701,69 @@ class BundleStateMachine:
             )
             await self._audit("bundle_failed_during_execution", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.FAILED, "reason": reason})
+        await self._github_post_mirror(bundle_id, f"Execution failed: {reason}")
+
+    # ── GitHub side-effect helpers ─────────────────────────────────────────
+
+    async def _github_create_issue(self, bundle_id: str, proposal: dict) -> None:
+        if self._github is None:
+            return
+        title = self._format_issue_title(bundle_id, proposal)
+        body = self._format_issue_body(bundle_id, proposal)
+        labels = self._derive_issue_labels(proposal)
+        issue_number = await self._github.create_issue(title, body, labels)
+        if issue_number is not None:
+            await self.db.execute(
+                "UPDATE bundles SET github_issue_number = ? WHERE id = ?",
+                (issue_number, bundle_id),
+            )
+            await self.db.conn.commit()
+            logger = logging.getLogger(__name__)
+            logger.info("GitHub issue #%s created for bundle %s", issue_number, bundle_id)
+        else:
+            logger = logging.getLogger(__name__)
+            logger.warning("Failed to create GitHub issue for bundle %s", bundle_id)
+
+    async def _github_post_mirror(self, bundle_id: str, message: str) -> None:
+        if self._github is None:
+            return
+        row = await self.db.fetch_one(
+            "SELECT github_issue_number FROM bundles WHERE id = ?", (bundle_id,)
+        )
+        if row is None or row["github_issue_number"] is None:
+            return
+        await self._github.post_comment(row["github_issue_number"], message)
+
+    def _format_issue_title(self, bundle_id: str, proposal: dict) -> str:
+        summary = proposal.get("requirements_summary", proposal.get("rfc_summary", ""))
+        if len(summary) > 80:
+            summary = summary[:77] + "..."
+        return f"[{bundle_id[:8]}] {summary}"
+
+    def _format_issue_body(self, bundle_id: str, proposal: dict) -> str:
+        complexity = proposal.get("complexity_score", 0)
+        risk = proposal.get("risk_score", 0)
+        target = proposal.get("target", "control-plane")
+        target_rationale = proposal.get("target_rationale", "")
+        summary = proposal.get("requirements_summary", proposal.get("rfc_summary", ""))
+        concerns = proposal.get("concerns", [])
+        concerns_text = "\n".join(f"- {c}" for c in concerns) if concerns else "None"
+
+        return (
+            f"## Proposal Summary\n{summary}\n\n"
+            f"## Complexity & Risk\n"
+            f"- Complexity Score: {complexity}/10\n"
+            f"- Risk Score: {risk}/10\n\n"
+            f"## Target\n{target}\n\n"
+            f"## Concerns\n{concerns_text}\n\n"
+            f"## Available Commands\n"
+            f"- `/approve` — Approve this bundle\n"
+            f"- `/reject <reason>` — Reject this bundle with a reason\n"
+            f"- `/modify <instructions>` — Request modifications before approval"
+        )
+
+    def _derive_issue_labels(self, proposal: dict) -> list[str]:
+        tier = proposal.get("tier", "full_review")
+        tier_label = f"approval/{tier.replace('_', '-')}"
+        state_label = "state/in-review"
+        return [tier_label, state_label]
