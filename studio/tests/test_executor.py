@@ -376,12 +376,15 @@ class TestGetNodeState:
 
 class TestCheckBundleCompletion:
     @pytest.mark.asyncio
-    async def test_all_complete_transitions_to_complete(self, executor, db_mock, sm_mock):
+    async def test_all_complete_transitions_to_verifying_and_callback(self, executor, db_mock, sm_mock):
         db_mock.fetch_all.return_value = []  # no failed nodes
+        callback = AsyncMock()
+        executor._on_bundle_verifying = callback
         with patch.object(executor, '_compute_bundle_status', new=AsyncMock(return_value="all_terminal")):
             await executor._check_bundle_completion("b1")
             sm_mock.transition_9_to_verifying.assert_called_once()
-            sm_mock.transition_17_complete.assert_called_once()
+            sm_mock.transition_17_complete.assert_not_called()
+            callback.assert_called_once_with("b1")
 
     @pytest.mark.asyncio
     async def test_failed_nodes_fail_bundle(self, executor, db_mock, sm_mock):
