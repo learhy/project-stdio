@@ -566,7 +566,13 @@ class CalibrationEntry(BaseModel):
 
 class KernelSettings(BaseModel):
     mode: bool = True
-    network_isolation: Literal["permissive", "enforcing"] = "permissive"
+
+
+class EgressProxySettings(BaseModel):
+    enabled: bool = True
+    socket_dir: str = "/run/studio"
+    connect_timeout_seconds: int = 10
+    read_timeout_seconds: int = 30
 
 
 class DefaultTimeoutHours(BaseModel):
@@ -630,6 +636,7 @@ class SecretsConfigEntry(BaseModel):
 
 class Settings(BaseModel):
     kernel: KernelSettings = Field(default_factory=KernelSettings)
+    egress_proxy: EgressProxySettings = Field(default_factory=EgressProxySettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     ollama_cloud: OllamaCloudSettings = Field(default_factory=OllamaCloudSettings)
     orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)

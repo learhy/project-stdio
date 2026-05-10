@@ -140,9 +140,9 @@ class DagExecutor:
         for w in workers:
             proc = self._running_workers.pop(w["id"], None)
             if proc and proc.returncode is None:
-                await self.runner.kill_worker(proc)
+                await self.runner.kill_worker(proc, w["id"])
 
-    # ── Node lifecycle callbacks ──────────────────────────────────────────
+    # ── Node lifecycle callbacks ──────────────────────────────────────────────────────────────────────────────────
 
     async def _on_final_report(self, bundle_id: str, node_id: str, worker_id: str, outcome: dict) -> None:
         """Callback from RpcHandlers when a worker sends final_report."""
@@ -815,7 +815,7 @@ class DagExecutor:
                 if pred["worker_id"]:
                     proc = self._running_workers.pop(pred["worker_id"], None)
                     if proc and proc.returncode is None:
-                        await self.runner.kill_worker(proc)
+                        await self.runner.kill_worker(proc, pred["worker_id"])
 
     async def _count_running_workers(self) -> int:
         row = await self.db.fetch_one(
@@ -885,7 +885,7 @@ class DagExecutor:
                 # Kill the worker process
                 proc = self._running_workers.pop(w["id"], None)
                 if proc and proc.returncode is None:
-                    await self.runner.kill_worker(proc)
+                    await self.runner.kill_worker(proc, w["id"])
 
                 # Mark node and worker as failed
                 await self.db.execute(

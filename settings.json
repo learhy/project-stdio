@@ -1,7 +1,12 @@
 {
   "kernel": {
-    "mode": true,
-    "network_isolation": "permissive"
+    "mode": true
+  },
+  "egress_proxy": {
+    "enabled": true,
+    "socket_dir": "/run/studio",
+    "connect_timeout_seconds": 10,
+    "read_timeout_seconds": 30
   },
   "worker": {
     "global_concurrency": 4,

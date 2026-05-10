@@ -32,6 +32,7 @@ studio-bundler = "studio.workers.bundler:main"
 studio-review = "studio.workers.review:main"
 studio-mcp = "studio.mcp.server:main"
 studio-qa = "studio.workers.qa:main"
+studio-proxy = "studio.orchestrator.proxy:main"
 
 [build-system]
 requires = ["hatchling"]

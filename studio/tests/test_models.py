@@ -151,7 +151,7 @@ def test_capability_manifest_deserialization():
 
 def test_settings_deserialization():
     data = {
-        "kernel": {"mode": True, "network_isolation": "permissive"},
+        "kernel": {"mode": True},
         "worker": {
             "global_concurrency": 4,
             "default_timeout_hours": {"small": 2, "medium": 4, "large": 8},
