@@ -312,3 +312,81 @@ class TestServerSettings:
             assert s["bearer_token"] == "secret"
         finally:
             os.chdir(old_cwd)
+
+
+# ── Bearer auth middleware ──────────────────────────────────────────────────
+
+class TestBearerAuth:
+    @pytest.mark.asyncio
+    async def test_bearer_token_missing_returns_401(self):
+        from studio.mcp.server import BearerAuthMiddleware, _make_token_verifier
+
+        async def dummy_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        verify = _make_token_verifier("sec-ret")
+        middleware = BearerAuthMiddleware(dummy_app, verify)
+
+        events = []
+        async def collect_send(msg):
+            events.append(msg)
+
+        scope = {"type": "http", "headers": []}
+        await middleware(scope, MagicMock(), collect_send)
+        assert events[0]["status"] == 401
+        assert b"Missing bearer token" in events[1]["body"]
+
+    @pytest.mark.asyncio
+    async def test_bearer_token_invalid_returns_401(self):
+        from studio.mcp.server import BearerAuthMiddleware, _make_token_verifier
+
+        async def dummy_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        verify = _make_token_verifier("sec-ret")
+        middleware = BearerAuthMiddleware(dummy_app, verify)
+
+        events = []
+        async def collect_send(msg):
+            events.append(msg)
+
+        scope = {"type": "http", "headers": [(b"authorization", b"Bearer wrong-token")]}
+        await middleware(scope, MagicMock(), collect_send)
+        assert events[0]["status"] == 401
+        assert b"Invalid bearer token" in events[1]["body"]
+
+    @pytest.mark.asyncio
+    async def test_bearer_token_valid_passes_through(self):
+        from studio.mcp.server import BearerAuthMiddleware, _make_token_verifier
+
+        async def dummy_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        verify = _make_token_verifier("sec-ret")
+        middleware = BearerAuthMiddleware(dummy_app, verify)
+
+        events = []
+        async def collect_send(msg):
+            events.append(msg)
+
+        scope = {"type": "http", "headers": [(b"authorization", b"Bearer sec-ret")]}
+        await middleware(scope, MagicMock(), collect_send)
+        assert events[0]["status"] == 200
+        assert events[1]["body"] == b"ok"
+
+    @pytest.mark.asyncio
+    async def test_non_http_scope_passes_through(self):
+        from studio.mcp.server import BearerAuthMiddleware, _make_token_verifier
+
+        async def dummy_app(scope, receive, send):
+            pass  # websocket scope, nothing to send
+
+        verify = _make_token_verifier("sec-ret")
+        middleware = BearerAuthMiddleware(dummy_app, verify)
+
+        scope = {"type": "websocket", "headers": []}
+        # Should not raise — passes through to dummy app
+        await middleware(scope, MagicMock(), MagicMock())

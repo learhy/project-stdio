@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,59 @@ def _load_settings() -> dict:
         return {"port": 8080, "bearer_token": ""}
     data = json.loads(settings_path.read_text())
     return data.get("mcp", {"port": 8080, "bearer_token": ""})
+
+
+def _make_token_verifier(expected_token: str):
+    """Return a callable that verifies a bearer token using constant-time comparison."""
+    def verify(token: str) -> bool:
+        return secrets.compare_digest(token, expected_token)
+    return verify
+
+
+class BearerAuthMiddleware:
+    """ASGI middleware that checks Authorization: Bearer <token> before passing through."""
+
+    def __init__(self, app, verify_token):
+        self.app = app
+        self.verify_token = verify_token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        auth_header = ""
+        for name, value in scope.get("headers", []):
+            if name == b"authorization":
+                auth_header = value.decode()
+                break
+
+        if not auth_header.startswith("Bearer "):
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [(b"content-type", b"application/json")],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b'{"error":"UNAUTHORIZED","detail":"Missing bearer token"}',
+            })
+            return
+
+        token = auth_header[7:]
+        if not self.verify_token(token):
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [(b"content-type", b"application/json")],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b'{"error":"UNAUTHORIZED","detail":"Invalid bearer token"}',
+            })
+            return
+
+        await self.app(scope, receive, send)
 
 
 class StudioMcpServer(FastMCP):
@@ -382,7 +436,21 @@ async def _run_server() -> None:
     except Exception as exc:
         print(f"[studio-mcp] WARNING: Could not connect to orchestrator: {exc}", file=sys.stderr, flush=True)
         print(f"[studio-mcp] Read-only mode — mutation tools will fail", file=sys.stderr, flush=True)
-    server.run(transport="streamable-http")
+
+    # Build the FastMCP ASGI app and wrap with bearer auth middleware
+    bearer_token = settings.get("bearer_token", "")
+    app = server.streamable_http_app()
+    if bearer_token:
+        verify = _make_token_verifier(bearer_token)
+        app = BearerAuthMiddleware(app, verify)
+        print(f"[studio-mcp] Bearer token auth enabled", file=sys.stderr, flush=True)
+    else:
+        print(f"[studio-mcp] WARNING: No bearer token set — auth disabled", file=sys.stderr, flush=True)
+
+    import uvicorn
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
+    srv = uvicorn.Server(config)
+    await srv.serve()
 
 
 def main() -> None:
