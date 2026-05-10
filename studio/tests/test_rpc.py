@@ -488,7 +488,7 @@ class TestConnectionManager:
 
         reader = AsyncMock()
         reader.readline.side_effect = [
-            (json.dumps({"jsonrpc": "2.0", "method": "auth", "token": "sec-ret", "id": 1}) + "\n").encode(),
+            (json.dumps({"jsonrpc": "2.0", "method": "auth", "params": {"token": "sec-ret"}, "id": 1}) + "\n").encode(),
             b"",  # EOF after auth ack, ends read loop
         ]
         writer = MagicMock()
@@ -511,7 +511,7 @@ class TestConnectionManager:
 
         reader = AsyncMock()
         reader.readline.side_effect = [
-            (json.dumps({"jsonrpc": "2.0", "method": "auth", "token": "bad-token", "id": 1}) + "\n").encode(),
+            (json.dumps({"jsonrpc": "2.0", "method": "auth", "params": {"token": "bad-token"}, "id": 1}) + "\n").encode(),
             b"",
         ]
         writer = MagicMock()
@@ -573,7 +573,7 @@ class TestCreateRpcSystem:
         assert dispatcher is not None
         assert handlers is not None
         assert conn_mgr is not None
-        assert len(dispatcher._handlers) == 17
+        assert len(dispatcher._handlers) == 24
 
     def test_register_all_methods(self, db_mock, tmp_path):
         sp = str(tmp_path / "test.sock")
@@ -586,6 +586,10 @@ class TestCreateRpcSystem:
             "artifact.publish", "artifact.fetch", "artifact.list",
             "secrets.fetch", "worker.request_human_input",
             "worker.poll_human_input",
+            "mcp.approve_bundle", "mcp.reject_bundle",
+            "mcp.request_modification", "mcp.escalate_bundle",
+            "mcp.pause_bundle", "mcp.resume_bundle",
+            "mcp.kill_worker",
         }
         assert set(dispatcher._handlers.keys()) == expected
 

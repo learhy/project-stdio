@@ -90,9 +90,19 @@ class WorkerBinding:
         self.manifest_cache: dict[str, Any] | None = None
 
 
+class SystemBinding:
+    """Tracks a trusted system connection (MCP server) — no worker token, no capability checks."""
+
+    def __init__(self, role: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.role = role
+        self.reader = reader
+        self.writer = writer
+
+
 # ── RPC Dispatcher ────────────────────────────────────────────────────────────
 
-Handler = Callable[[WorkerBinding, dict[str, Any], Any], Awaitable[dict]]
+# Handler accepts either WorkerBinding or SystemBinding
+Handler = Callable[[WorkerBinding | SystemBinding, dict[str, Any], Any], Awaitable[dict]]
 
 
 class RpcDispatcher:
@@ -107,7 +117,7 @@ class RpcDispatcher:
         self._handlers[method] = handler
 
     async def dispatch(
-        self, binding: WorkerBinding, raw: bytes
+        self, binding: WorkerBinding | SystemBinding, raw: bytes
     ) -> bytes | None:
         """Parse and dispatch a JSON-RPC message. Returns the response to send, or None for notifications."""
         try:
@@ -128,33 +138,34 @@ class RpcDispatcher:
 
         is_notification = req_id is None
 
-        # ── Capability check ──
-        cap_ok, cap_reason = self._check_rpc_method(binding, method)
-        if not cap_ok:
-            if is_notification:
-                return None
-            resp = _make_error(
-                CAPABILITY_DENIED,
-                f"capability_denied: {cap_reason}",
-                data={
-                    "method": method,
-                    "worker_rpc_methods": binding.rpc_methods,
-                },
-                req_id=req_id,
-            )
-            return (json.dumps(resp) + "\n").encode()
+        # ── Capability check (skipped for SystemBinding) ──
+        if not isinstance(binding, SystemBinding):
+            cap_ok, cap_reason = self._check_rpc_method(binding, method)
+            if not cap_ok:
+                if is_notification:
+                    return None
+                resp = _make_error(
+                    CAPABILITY_DENIED,
+                    f"capability_denied: {cap_reason}",
+                    data={
+                        "method": method,
+                        "worker_rpc_methods": binding.rpc_methods,
+                    },
+                    req_id=req_id,
+                )
+                return (json.dumps(resp) + "\n").encode()
 
-        # ── Stub check ──
-        if method in _STUB_METHODS:
-            if is_notification:
-                return None
-            resp = _make_error(
-                METHOD_NOT_IMPLEMENTED,
-                f"method_not_implemented: {method}",
-                data={"method": method, "phase": "Phase 1 stub"},
-                req_id=req_id,
-            )
-            return (json.dumps(resp) + "\n").encode()
+            # ── Stub check (only for WorkerBinding) ──
+            if method in _STUB_METHODS:
+                if is_notification:
+                    return None
+                resp = _make_error(
+                    METHOD_NOT_IMPLEMENTED,
+                    f"method_not_implemented: {method}",
+                    data={"method": method, "phase": "Phase 1 stub"},
+                    req_id=req_id,
+                )
+                return (json.dumps(resp) + "\n").encode()
 
         # ── Dispatch ──
         handler = self._handlers.get(method)
@@ -240,6 +251,10 @@ class RpcHandlers:
 
     def set_secret_store(self, store: "SecretStore") -> None:
         self._secret_store = store
+
+    def set_sm(self, sm: Any) -> None:
+        """Set state machine reference for MCP handlers."""
+        self.sm = sm
 
     @staticmethod
     def now() -> int:
@@ -572,6 +587,135 @@ class RpcHandlers:
         allowed, _ = check_op(op_descriptor, manifest)
         return {"allowed": allowed, "capability_id": None}
 
+    # ── mcp.* handlers (system surface, no capability check) ────────────────
+    # Called by the MCP server process over the trusted Unix socket.
+
+    async def handle_mcp_approve_bundle(self, binding: SystemBinding, params: dict, req_id: Any) -> dict:
+        bundle_id = params.get("id", "")
+        comment = params.get("comment", "")
+        if not bundle_id:
+            return {"error": "INVALID_PARAMS", "detail": "id is required"}
+        try:
+            await self.sm.transition_4_approve_from_review(bundle_id, "mcp")
+        except Exception as exc:
+            return {"error": "ILLEGAL_TRANSITION", "detail": str(exc)}
+        if comment:
+            await self._audit_mcp("mcp_approve_comment", "bundle", bundle_id,
+                                 {"comment": comment, "actor": "mcp"})
+        return {"transition": "APPROVED", "bundle_id": bundle_id, "new_state": "approved"}
+
+    async def handle_mcp_reject_bundle(self, binding: SystemBinding, params: dict, req_id: Any) -> dict:
+        bundle_id = params.get("id", "")
+        reason = params.get("reason", "")
+        if not bundle_id:
+            return {"error": "INVALID_PARAMS", "detail": "id is required"}
+        if not reason:
+            return {"error": "INVALID_PARAMS", "detail": "reason is required"}
+        try:
+            await self.sm.transition_reject_from_review(bundle_id, "mcp", reason)
+        except Exception as exc:
+            return {"error": "ILLEGAL_TRANSITION", "detail": str(exc)}
+        return {"transition": "REJECTED", "bundle_id": bundle_id, "new_state": "rejected"}
+
+    async def handle_mcp_request_modification(self, binding: SystemBinding, params: dict, req_id: Any) -> dict:
+        bundle_id = params.get("id", "")
+        instructions = params.get("instructions", "")
+        if not bundle_id:
+            return {"error": "INVALID_PARAMS", "detail": "id is required"}
+        if not instructions:
+            return {"error": "INVALID_PARAMS", "detail": "instructions is required"}
+        try:
+            await self.sm.transition_3_return_to_proposed(bundle_id, instructions)
+        except Exception as exc:
+            return {"error": "ILLEGAL_TRANSITION", "detail": str(exc)}
+        return {"transition": "PROPOSED", "bundle_id": bundle_id, "new_state": "proposed",
+                "message": "Bundler will revise based on instructions."}
+
+    async def handle_mcp_escalate_bundle(self, binding: SystemBinding, params: dict, req_id: Any) -> dict:
+        bundle_id = params.get("id", "")
+        reason = params.get("reason", "")
+        if not bundle_id:
+            return {"error": "INVALID_PARAMS", "detail": "id is required"}
+        row = await self.db.fetch_one("SELECT tier FROM bundles WHERE id = ?", (bundle_id,))
+        if row is None:
+            return {"error": "NOT_FOUND", "detail": f"Bundle {bundle_id} does not exist"}
+        current_tier = row["tier"]
+        tier_order = ["auto", "auto_notify", "summary", "full_review", "full_review_cooldown"]
+        try:
+            idx = tier_order.index(current_tier)
+        except ValueError:
+            idx = -1
+        if idx < 0 or idx >= len(tier_order) - 1:
+            return {"error": "ILLEGAL_TRANSITION",
+                    "detail": f"Bundle is already at highest tier: {current_tier}"}
+        new_tier = tier_order[idx + 1]
+        now = self.now()
+        await self.db.execute("UPDATE bundles SET tier = ? WHERE id = ?", (new_tier, bundle_id))
+        await self.db.execute(
+            "INSERT INTO approval_decisions (bundle_id, decision, surface, actor, comment, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (bundle_id, "escalated", "mcp", "mcp", reason, now),
+        )
+        await self.db.conn.commit()
+        await self._audit_mcp("bundle_escalated", "bundle", bundle_id,
+                              {"previous_tier": current_tier, "new_tier": new_tier, "reason": reason})
+        return {"bundle_id": bundle_id, "new_tier": new_tier, "previous_tier": current_tier,
+                "message": f"Bundle escalated to {new_tier}."}
+
+    async def handle_mcp_pause_bundle(self, binding: SystemBinding, params: dict, req_id: Any) -> dict:
+        bundle_id = params.get("id", "")
+        if not bundle_id:
+            return {"error": "INVALID_PARAMS", "detail": "id is required"}
+        try:
+            await self.sm.transition_pause(bundle_id)
+        except Exception as exc:
+            return {"error": "ILLEGAL_TRANSITION", "detail": str(exc)}
+        workers_row = await self.db.fetch_all(
+            "SELECT COUNT(*) as cnt FROM workers WHERE bundle_id = ? AND state IN ('running','pending')",
+            (bundle_id,),
+        )
+        workers_waiting = workers_row[0]["cnt"] if workers_row else 0
+        return {"transition": "PAUSED", "bundle_id": bundle_id, "new_state": "paused",
+                "workers_waiting": workers_waiting}
+
+    async def handle_mcp_resume_bundle(self, binding: SystemBinding, params: dict, req_id: Any) -> dict:
+        bundle_id = params.get("id", "")
+        note = params.get("note", "")
+        if not bundle_id:
+            return {"error": "INVALID_PARAMS", "detail": "id is required"}
+        try:
+            await self.sm.transition_resume(bundle_id)
+        except Exception as exc:
+            return {"error": "ILLEGAL_TRANSITION", "detail": str(exc)}
+        if note:
+            await self._audit_mcp("bundle_resumed_note", "bundle", bundle_id, {"note": note})
+        return {"transition": "RESUMED", "bundle_id": bundle_id, "new_state": "in_progress"}
+
+    async def handle_mcp_kill_worker(self, binding: SystemBinding, params: dict, req_id: Any) -> dict:
+        worker_id = params.get("worker_id", "")
+        reason = params.get("reason", "")
+        if not worker_id:
+            return {"error": "INVALID_PARAMS", "detail": "worker_id is required"}
+        now = self.now()
+        await self.db.execute(
+            "UPDATE workers SET state = ?, ended_at = ?, exit_reason = ? WHERE id = ?",
+            (WorkerState.KILLED, now, f"killed via mcp: {reason}" if reason else "killed via mcp", worker_id),
+        )
+        await self.db.conn.commit()
+        await self._audit_mcp("worker_killed", "worker", worker_id,
+                              {"reason": reason, "surface": "mcp"})
+        return {"worker_id": worker_id, "action": "cancel_dispatched",
+                "message": "Cancel sent to worker."}
+
+    async def _audit_mcp(self, event_type: str, subject_type: str, subject_id: str,
+                          payload: dict) -> None:
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (event_type, subject_type, subject_id, json.dumps(payload), self.now()),
+        )
+        await self.db.conn.commit()
+
     # ── artifact.publish (full) ────────────────────────────────────────────
 
     async def _load_manifest(self, binding: WorkerBinding) -> dict[str, Any] | None:
@@ -859,8 +1003,8 @@ class ConnectionManager:
         await binding.writer.drain()
 
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        """Handle a new Unix socket connection — authenticate via token, then read/write RPC."""
-        binding: WorkerBinding | None = None
+        """Handle a new Unix socket connection — authenticate via token (worker) or role (system)."""
+        binding: WorkerBinding | SystemBinding | None = None
 
         try:
             # First message must be the auth token
@@ -875,8 +1019,29 @@ class ConnectionManager:
                 await writer.drain()
                 return
 
-            token = auth_msg.get("token", "")
             method = auth_msg.get("method", "")
+            auth_params = auth_msg.get("params", {})
+            role = auth_params.get("role", "")
+            token = auth_params.get("token", "")
+
+            # ── MCP system auth: trusted by socket file permissions ──
+            if method == "auth" and role == "mcp":
+                binding = SystemBinding(role="mcp", reader=reader, writer=writer)
+                writer.write((json.dumps(_make_result(
+                    {"bound": True, "role": "mcp"}, auth_msg.get("id")
+                )) + "\n").encode())
+                await writer.drain()
+
+                # Read loop — dispatch without capability checks
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    response = await self.dispatcher.dispatch(binding, line)
+                    if response is not None:
+                        writer.write(response)
+                        await writer.drain()
+                return
 
             if method != "auth" or not token:
                 writer.write((json.dumps(_make_error(
@@ -942,7 +1107,7 @@ class ConnectionManager:
         except Exception:
             pass
         finally:
-            if binding:
+            if binding and isinstance(binding, WorkerBinding):
                 self._bindings.pop(f"{binding.bundle_id}:{binding.node_id}", None)
                 self._by_worker_id.pop(binding.worker_id, None)
             try:
@@ -963,6 +1128,8 @@ def create_rpc_system(
     Returns (dispatcher, handlers, connection_manager).
     """
     handlers = RpcHandlers(db)
+    if sm is not None:
+        handlers.set_sm(sm)
     dispatcher = RpcDispatcher(db, sm)
 
     # Register all handlers
@@ -985,6 +1152,14 @@ def create_rpc_system(
     dispatcher.register("worker.resume", _make_stub_handler("worker.resume"))
     dispatcher.register("worker.cancel", _make_stub_handler("worker.cancel"))
     dispatcher.register("worker.inject_context", _make_stub_handler("worker.inject_context"))
+    # mcp.* handlers (system surface, called by MCP server process)
+    dispatcher.register("mcp.approve_bundle", handlers.handle_mcp_approve_bundle)
+    dispatcher.register("mcp.reject_bundle", handlers.handle_mcp_reject_bundle)
+    dispatcher.register("mcp.request_modification", handlers.handle_mcp_request_modification)
+    dispatcher.register("mcp.escalate_bundle", handlers.handle_mcp_escalate_bundle)
+    dispatcher.register("mcp.pause_bundle", handlers.handle_mcp_pause_bundle)
+    dispatcher.register("mcp.resume_bundle", handlers.handle_mcp_resume_bundle)
+    dispatcher.register("mcp.kill_worker", handlers.handle_mcp_kill_worker)
 
     connection_manager = ConnectionManager(socket_path, dispatcher, handlers, db)
     return dispatcher, handlers, connection_manager
