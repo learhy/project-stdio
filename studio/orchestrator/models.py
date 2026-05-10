@@ -522,6 +522,46 @@ class ReviewTrackOutput(BaseModel):
     summary: str = ""
 
 
+# ── Post-execution QA / Verification Report models ────────────────────────────
+
+class CriterionResult(BaseModel):
+    criterion: str = ""
+    passed: bool = False
+    evidence: str = ""
+    automated: bool = True
+
+
+class VerificationReport(BaseModel):
+    """Structured Verification Report produced by the post-execution QA agent."""
+    bundle_id: str = ""
+    outcome: Literal["passed", "failed", "partial"] = "passed"
+    criteria_results: list[CriterionResult] = Field(default_factory=list)
+    automated_checks: dict = Field(default_factory=dict)
+    llm_assessment: str = ""
+    failed_criteria: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    summary: str = ""
+    produced_at: int = 0
+
+
+class CalibrationEntry(BaseModel):
+    """Estimated vs actual record for a single axis, written to scoring-outcomes.jsonl."""
+    bundle_id: str = ""
+    recorded_at: int = 0
+    estimated_loc: int = 0
+    actual_loc: int = 0
+    estimated_duration_seconds: int = 0
+    actual_duration_seconds: int = 0
+    estimated_worker_count: int = 0
+    actual_worker_count: int = 0
+    estimated_tokens: int = 0
+    actual_tokens: int = 0
+    divergence_threshold_exceeded: list[str] = Field(default_factory=list)
+    blocking_issue: bool = False
+    blocking_reason: str = ""
+    summary: str = ""
+
+
 # ── Settings models ──────────────────────────────────────────────────────────
 
 class KernelSettings(BaseModel):

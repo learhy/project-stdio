@@ -214,6 +214,8 @@ class RpcHandlers:
         self._on_bundler_failure: Callable[[str, str], Awaitable[None]] | None = None
         self._on_review_complete: Callable[[str, str, dict], Awaitable[None]] | None = None
         self._on_review_blocking: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_qa_pass: Callable[[str, dict], Awaitable[None]] | None = None
+        self._on_qa_fail: Callable[[str, str, dict], Awaitable[None]] | None = None
         self._artifact_store: "ArtifactStore | None" = None
         self._secret_store: "SecretStore | None" = None
 
@@ -245,6 +247,13 @@ class RpcHandlers:
         """Callback: on_review_blocking(bundle_id, blocking_reason)."""
         self._on_review_blocking = cb
 
+    def set_on_qa_pass(self, cb: Callable[[str, dict], Awaitable[None]]) -> None:
+        """Callback: on_qa_pass(bundle_id, verification_report)."""
+        self._on_qa_pass = cb
+
+    def set_on_qa_fail(self, cb: Callable[[str, str, dict], Awaitable[None]]) -> None:
+        """Callback: on_qa_fail(bundle_id, reason, verification_report)."""
+        self._on_qa_fail = cb
 
     def set_artifact_store(self, store: "ArtifactStore") -> None:
         self._artifact_store = store
@@ -478,6 +487,27 @@ class RpcHandlers:
                 await self._on_review_complete(binding.bundle_id, binding.node_id, findings)
 
             return {"accepted": True, "review": True, "role": binding.node_id}
+
+        # ── Post-execution QA verification worker ──
+        if binding.node_id == "qa-verification":
+            verification_report = params.get("verification_report", {})
+
+            await self.db.execute(
+                "UPDATE workers SET state = ?, ended_at = ? WHERE id = ?",
+                (
+                    WorkerState.COMPLETE if outcome == "success" else WorkerState.FAILED,
+                    now,
+                    binding.worker_id,
+                ),
+            )
+            await self.db.conn.commit()
+
+            if outcome == "success" and self._on_qa_pass:
+                await self._on_qa_pass(binding.bundle_id, verification_report)
+            elif self._on_qa_fail:
+                await self._on_qa_fail(binding.bundle_id, summary, verification_report)
+
+            return {"accepted": True, "qa": True}
 
         # ── DAG worker ──
         files_changed = params.get("files_changed", [])

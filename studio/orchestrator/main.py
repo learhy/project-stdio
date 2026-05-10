@@ -126,6 +126,131 @@ class Orchestrator:
         await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix-stub")
         logger.info("Approval matrix stub approved bundle %s", bundle_id)
 
+    # ── Post-execution QA callbacks ────────────────────────────────────────
+
+    async def _on_bundle_verifying(self, bundle_id: str) -> None:
+        """Callback from DagExecutor when bundle enters VERIFYING state. Spawns QA worker."""
+        await self._spawn_qa_worker(bundle_id)
+
+    async def _on_qa_pass(self, bundle_id: str, verification_report: dict) -> None:
+        """QA verification passed: fire Transition 17 (VERIFYING -> COMPLETE)."""
+        outcome = {"status": "shipped", "verification": verification_report}
+        await self.sm.transition_17_complete(bundle_id, outcome)
+        await self._record_calibration(bundle_id)
+        logger.info("QA verification passed for bundle %s", bundle_id)
+
+    async def _on_qa_fail(self, bundle_id: str, reason: str, verification_report: dict) -> None:
+        """QA verification failed: fire Transition 19 (VERIFYING -> FAILED)."""
+        await self.sm.transition_19_fail_verification(
+            bundle_id,
+            reason or "Verification failed; see report for details",
+        )
+        # Store the verification report in the bundle outcome
+        await self.db.execute(
+            "UPDATE bundles SET outcome_json = ? WHERE id = ?",
+            (json.dumps({
+                "status": "failed_verification",
+                "rationale": reason,
+                "verification": verification_report,
+            }), bundle_id),
+        )
+        await self.db.conn.commit()
+        await self._record_calibration(bundle_id)
+        logger.warning("QA verification failed for bundle %s: %s", bundle_id, reason)
+
+    # ── Calibration loop ───────────────────────────────────────────────────
+
+    async def _record_calibration(self, bundle_id: str) -> None:
+        """Record estimated vs actual on all axes after bundle reaches terminal state."""
+        row = await self.db.fetch_one(
+            "SELECT proposal_json, outcome_json FROM bundles WHERE id = ?", (bundle_id,)
+        )
+        if row is None:
+            return
+
+        try:
+            proposal = json.loads(row["proposal_json"] or "{}")
+        except json.JSONDecodeError:
+            proposal = {}
+        try:
+            outcome = json.loads(row["outcome_json"] or "{}")
+        except json.JSONDecodeError:
+            outcome = {}
+
+        # Estimates come from the bundler proposal block
+        bundler_proposal = proposal.get("proposal", {})
+        estimated_loc = bundler_proposal.get("estimated_loc", 0)
+        estimated_duration = bundler_proposal.get("estimated_duration_seconds", 0)
+        estimated_workers = bundler_proposal.get("estimated_worker_count", 0)
+        estimated_tokens = bundler_proposal.get("estimated_tokens", 0)
+
+        # Actuals from execution
+        actual_loc = outcome.get("calibration", {}).get("actual_loc", 0)
+        actual_duration = outcome.get("calibration", {}).get("actual_duration_seconds", 0)
+        actual_workers = outcome.get("calibration", {}).get("actual_worker_count", 0)
+        actual_tokens = outcome.get("calibration", {}).get("actual_tokens", 0)
+
+        # Compute divergence: >50% on any axis triggers post-mortem flag
+        def _pct_divergence(estimated: int, actual: int) -> float | None:
+            if estimated == 0:
+                return None
+            return abs(actual - estimated) / estimated
+
+        diverged: list[str] = []
+        for axis_name, est, act in [
+            ("loc", estimated_loc, actual_loc),
+            ("duration_seconds", estimated_duration, actual_duration),
+            ("worker_count", estimated_workers, actual_workers),
+            ("tokens", estimated_tokens, actual_tokens),
+        ]:
+            pct = _pct_divergence(est, act)
+            if pct is not None and pct > 0.5:
+                diverged.append(axis_name)
+
+        entry = {
+            "bundle_id": bundle_id,
+            "recorded_at": self.sm.now(),
+            "estimated_loc": estimated_loc,
+            "actual_loc": actual_loc,
+            "estimated_duration_seconds": estimated_duration,
+            "actual_duration_seconds": actual_duration,
+            "estimated_worker_count": estimated_workers,
+            "actual_worker_count": actual_workers,
+            "estimated_tokens": estimated_tokens,
+            "actual_tokens": actual_tokens,
+            "divergence_threshold_exceeded": diverged,
+        }
+
+        # Write to memory/calibration/scoring-outcomes.jsonl
+        memory_root = self.settings.orchestrator.memory_root
+        cal_path = Path(memory_root) / "calibration" / "scoring-outcomes.jsonl"
+        try:
+            cal_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cal_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+            logger.info("Calibration recorded for bundle %s, diverged: %s", bundle_id, diverged)
+        except Exception as exc:
+            logger.warning("Failed to write calibration for %s: %s", bundle_id, exc)
+
+        # Post-mortem prompt when any axis diverged >50%
+        if diverged:
+            postmortem_path = Path(memory_root) / "post-mortems" / f"{bundle_id}.json"
+            try:
+                postmortem_path.parent.mkdir(parents=True, exist_ok=True)
+                postmortem_data = {
+                    "bundle_id": bundle_id,
+                    "trigger": "divergence_threshold_exceeded",
+                    "diverged_axes": diverged,
+                    "calibration": entry,
+                    "proposal_summary": bundler_proposal.get("requirements_summary", ""),
+                    "outcome_status": outcome.get("status", "unknown"),
+                }
+                with open(postmortem_path, "w") as f:
+                    json.dump(postmortem_data, f, indent=2)
+                logger.info("Post-mortem written for bundle %s: %s", bundle_id, diverged)
+            except Exception as exc:
+                logger.warning("Failed to write post-mortem for %s: %s", bundle_id, exc)
+
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -163,6 +288,10 @@ class Orchestrator:
         self.handlers.set_on_review_complete(self._on_review_complete)
         self.handlers.set_on_review_blocking(self._on_review_blocking)
 
+        # Wire post-execution QA callbacks
+        self.handlers.set_on_qa_pass(self._on_qa_pass)
+        self.handlers.set_on_qa_fail(self._on_qa_fail)
+
         # 4. Worker runner (use noop for testing if bwrap unavailable)
         if os.environ.get("STUDIO_TEST_MODE") == "1":
             from .runner import NoopWorkerRunner
@@ -186,6 +315,7 @@ class Orchestrator:
             heartbeat_timeout_multiplier=self.settings.worker.heartbeat_timeout_multiplier,
         )
         self.executor._on_review_aggregator_complete = self._on_review_aggregator_complete
+        self.executor._on_bundle_verifying = self._on_bundle_verifying
 
         # 6. Scheduler
         self.scheduler = Scheduler(
@@ -659,6 +789,102 @@ async def _spawn_bundler(app: Orchestrator, bundle_id: str, bundle_input: dict) 
     logger.info("Bundler worker spawned: %s for bundle %s", worker_id, bundle_id)
 
 
+async def _spawn_qa_worker(app: Orchestrator, bundle_id: str) -> None:
+    """Spawn a post-execution QA verification worker as a standalone process."""
+    worker_id = f"qa_{bundle_id}"
+    token = secrets.token_hex(32)
+    now = int(time.time())
+
+    # Fetch the verification plan artifact from bundle proposal
+    row = await app.db.fetch_one(
+        "SELECT proposal_json FROM bundles WHERE id = ?", (bundle_id,)
+    )
+    verification_plan = {}
+    bundle_input = {}
+    if row:
+        proposal = json.loads(row["proposal_json"] or "{}")
+        bundle_input = proposal.get("bundle_input", {})
+        # The verification plan from pre-execution review is inlined in proposal
+        bundler_proposal = proposal.get("proposal", {})
+        verification_plan = bundler_proposal.get("verification_plan", {})
+
+    manifest_json = json.dumps({
+        "schema_version": "1.0",
+        "subject": {"kind": "bundle", "id": bundle_id},
+        "grants": {
+            "filesystem": {"reads": [], "writes": []},
+            "network": {"egress": ["*:443"]},
+            "process": {"exec": []},
+            "rpc": {"methods": ["worker.*"]},
+            "resources": {},
+        },
+        "metadata": {"rationale": "QA verification worker needs outbound HTTPS for Ollama Cloud API"},
+    })
+
+    await app.db.execute(
+        "INSERT INTO workers (id, bundle_id, node_id, token, manifest_json, state, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (worker_id, bundle_id, "qa-verification", token, manifest_json, "pending", now),
+    )
+    await app.db.conn.commit()
+
+    worker_env = {
+        **os.environ,
+        "STUDIO_WORKER_TOKEN": token,
+        "STUDIO_SOCKET_PATH": app.settings.orchestrator.socket_path,
+        "STUDIO_WORKER_ID": worker_id,
+        "STUDIO_BUNDLE_ID": bundle_id,
+        "STUDIO_NODE_ID": "qa-verification",
+        "STUDIO_TASK_SPEC": json.dumps({
+            "bundle_id": bundle_id,
+            "ollama_base_url": app.settings.ollama_cloud.base_url,
+            "verification_plan": verification_plan,
+            "bundle_branch": f"bundle/{bundle_id}",
+            "repo_path": os.getcwd(),
+        }),
+        "OLLAMA_CLOUD_BASE_URL": app.settings.ollama_cloud.base_url,
+    }
+
+    process = await asyncio.create_subprocess_exec(
+        "studio-qa",
+        env=worker_env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    if not hasattr(app, '_qa_processes'):
+        app._qa_processes = {}
+    app._qa_processes[worker_id] = process
+    logger.info("QA worker spawned: %s for bundle %s", worker_id, bundle_id)
+
+
+async def _cli_calibration_report(app: Orchestrator, params: dict) -> dict:
+    """Print calibration report from memory/calibration/."""
+    memory_root = app.settings.orchestrator.memory_root
+    cal_path = Path(memory_root) / "calibration" / "scoring-outcomes.jsonl"
+
+    entries: list[dict] = []
+    if cal_path.exists():
+        for line in cal_path.read_text().strip().split("\n"):
+            if line.strip():
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    if not entries:
+        return {"entries": [], "message": "No calibration data recorded yet."}
+
+    # Summarize: per-axis avg divergence
+    total = len(entries)
+    diverged_count = sum(1 for e in entries if e.get("divergence_threshold_exceeded"))
+    return {
+        "total_entries": total,
+        "entries_with_divergence": diverged_count,
+        "recent": entries[-10:],
+    }
+
+
 async def _cli_approve(app: Orchestrator, params: dict) -> dict:
     bundle_id = params.get("bundle_id", "")
     await app.sm.transition_1a_approve(bundle_id, "cli")
@@ -804,6 +1030,7 @@ _CLI_HANDLERS = {
     "studio.show_worker": _cli_show_worker,
     "studio.kill": _cli_kill,
     "studio.status": _cli_status,
+    "studio.calibration_report": _cli_calibration_report,
 }
 
 

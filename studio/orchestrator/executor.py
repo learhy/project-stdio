@@ -56,6 +56,7 @@ class DagExecutor:
         self._artifact_events: asyncio.Queue[Any] = asyncio.Queue()
         self._artifact_store: Any = None
         self._on_review_aggregator_complete: Callable[[str, dict], Awaitable[None]] | None = None
+        self._on_bundle_verifying: Callable[[str], Awaitable[None]] | None = None
 
         # Wire callbacks
         self.rpc_handlers.set_on_final_report(self._on_final_report)
@@ -435,8 +436,9 @@ class DagExecutor:
             else:
                 try:
                     await self.sm.transition_9_to_verifying(bundle_id)
-                    await self.sm.transition_17_complete(bundle_id)
                     self._active_bundles.discard(bundle_id)
+                    if self._on_bundle_verifying:
+                        await self._on_bundle_verifying(bundle_id)
                 except Exception:
                     pass
 

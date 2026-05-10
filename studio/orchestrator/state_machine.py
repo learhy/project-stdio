@@ -703,6 +703,18 @@ class BundleStateMachine:
                             {"from_state": current, "to_state": BundleState.FAILED, "reason": reason})
         await self._github_post_mirror(bundle_id, f"Execution failed: {reason}")
 
+    # ── Transition 20 / 21: auto-rollback (TODO Phase 3) ──────────────────
+    #
+    # Transition 20 (VERIFYING → IN_PROGRESS): verification_failed_auto_rollback.
+    # Triggered when QA verification fails AND the rollback plan is machine-executable
+    # AND stakes are Low. The bundle re-enters IN_PROGRESS to execute the rollback DAG.
+    #
+    # Transition 21 (VERIFYING → IN_PROGRESS): verification_failed_manual_rollback.
+    # Same as Transition 20 but requires reviewer approval before rollback begins.
+    #
+    # Both are stubbed for v1.1. In Bundle 2.9, failed verification always goes to
+    # Transition 19 (VERIFYING → FAILED). Rollback is deferred to Phase 3.
+
     # ── GitHub side-effect helpers ─────────────────────────────────────────
 
     async def _github_create_issue(self, bundle_id: str, proposal: dict) -> None:
