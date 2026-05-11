@@ -1172,7 +1172,47 @@ async def _cli_recall(app: Orchestrator, params: dict) -> dict:
     if not bundle_id:
         return {"error": "bundle_id is required"}
 
-    return await app.ops.recall_bundle(bundle_id, actor="cli")
+    # 1. Check recall eligibility (48h window)
+    result = await app.ops.recall_bundle(bundle_id, actor="cli")
+    if not result.get("eligible"):
+        return result
+
+    # 2. Fetch original bundle to build reversal bundle_input
+    row = await app.db.fetch_one(
+        "SELECT proposal_json FROM bundles WHERE id = ?", (bundle_id,)
+    )
+    proposal = json.loads(row["proposal_json"] or "{}") if row else {}
+    bundle_input = proposal.get("bundle_input", {})
+    original_idea = bundle_input.get("idea", "")
+
+    reversal_idea = f"Revert bundle {bundle_id}"
+    if original_idea:
+        reversal_idea += f": {original_idea}"
+
+    reversal_input = {
+        "idea": reversal_idea,
+        "supersedes_bundle_id": bundle_id,
+        "target_repo": bundle_input.get("target_repo", "control-plane"),
+    }
+
+    # 3. Submit reversal bundle through the normal bundler flow
+    from ulid import ULID
+    rollback_id = str(ULID())
+    now = int(time.time())
+
+    await app.sm.transition_1_submit_idea(rollback_id, reversal_input)
+    await _spawn_bundler(app, rollback_id, reversal_input)
+
+    # 4. Notify
+    await app.ops.notify_recall(bundle_id, rollback_id)
+
+    return {
+        "eligible": True,
+        "bundle_id": bundle_id,
+        "rollback_bundle_id": rollback_id,
+        "reversal_idea": reversal_idea,
+        "message": "Recall rollback bundle created",
+    }
 
 
 async def _cli_health(app: Orchestrator, params: dict) -> dict:

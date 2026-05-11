@@ -209,9 +209,9 @@ class OpsTooling:
     async def recall_bundle(
         self, bundle_id: str, actor: str = "cli"
     ) -> dict[str, Any]:
-        """Check if a COMPLETE bundle is eligible for recall and create a rollback bundle.
+        """Check if a COMPLETE bundle is eligible for recall.
 
-        Returns {"eligible": True, "rollback_bundle_id": "..."} or {"eligible": False, "reason": "..."}
+        Returns {"eligible": True, "bundle_id": "..."} or {"eligible": False, "reason": "..."}
         """
         cursor = await self._db.execute(
             "SELECT id, state, completed_at, proposal_json FROM bundles WHERE id = ?",
@@ -240,6 +240,15 @@ class OpsTooling:
             }
 
         return {"eligible": True, "bundle_id": bundle_id, "completed_at": completed_at}
+
+    async def notify_recall(
+        self, bundle_id: str, rollback_bundle_id: str
+    ) -> None:
+        """Notify that a recall was requested for a bundle."""
+        issue_number = await self._get_issue_number(bundle_id)
+        await self._notifier.notify_recall(
+            bundle_id, rollback_bundle_id, issue_number=issue_number
+        )
 
     # ── health ────────────────────────────────────────────────────────────
 
