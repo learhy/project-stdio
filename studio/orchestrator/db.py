@@ -4,13 +4,25 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable, Awaitable
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+
+class DatabaseVersionError(RuntimeError):
+    """Raised when the on-disk database schema version is ahead of the code version."""
+
+    def __init__(self, stored: int, code: int) -> None:
+        super().__init__(
+            f"Database schema version {stored} is ahead of code version {code}. "
+            "Upgrade the orchestrator."
+        )
+        self.stored = stored
+        self.code = code
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -214,11 +226,83 @@ CREATE TABLE IF NOT EXISTS artifact_refs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifact_refs_descriptor ON artifact_refs(bundle_id, descriptor_json);
-
-CREATE TABLE IF NOT EXISTS schema_version (
-  version INTEGER PRIMARY KEY
-);
 """
+
+
+# ── Migration registry (sequential, single global version) ──────────────────
+
+MigrationFn = Callable[[aiosqlite.Connection], Awaitable[None]]
+MIGRATIONS: dict[int, MigrationFn] = {}
+
+
+def migration(target: int):
+    """Decorator: register a migration function for the given target version."""
+    def decorator(fn: MigrationFn) -> MigrationFn:
+        MIGRATIONS[target] = fn
+        return fn
+    return decorator
+
+
+@migration(2)
+async def _migrate_v2(conn: aiosqlite.Connection) -> None:
+    """Replace artifact_metadata with spec-compliant schema."""
+    await conn.execute("DROP TABLE IF EXISTS artifact_metadata")
+    await conn.executescript("""
+        CREATE TABLE artifact_metadata (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          namespace TEXT NOT NULL CHECK(namespace IN ('bundle', 'global', 'task')),
+          name TEXT NOT NULL,
+          version TEXT NOT NULL DEFAULT '',
+          content_type TEXT NOT NULL,
+          hash TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          inline_data BLOB,
+          producer_node_id TEXT,
+          producer_worker_id TEXT,
+          bundle_id TEXT,
+          task_id TEXT,
+          ref_count INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          published_at INTEGER NOT NULL,
+          expires_at INTEGER,
+          gc_eligible_at INTEGER,
+          gc_d_at INTEGER,
+          UNIQUE(namespace, name, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifact_metadata_hash ON artifact_metadata(hash);
+        CREATE INDEX IF NOT EXISTS idx_artifact_metadata_bundle ON artifact_metadata(bundle_id);
+        CREATE INDEX IF NOT EXISTS idx_artifact_metadata_ns_name ON artifact_metadata(namespace, name);
+        CREATE INDEX IF NOT EXISTS idx_artifact_metadata_gc ON artifact_metadata(gc_eligible_at)
+            WHERE gc_eligible_at IS NOT NULL AND gc_d_at IS NULL;
+    """)
+
+
+@migration(3)
+async def _migrate_v3(conn: aiosqlite.Connection) -> None:
+    """Add github_issue_number column to bundles."""
+    await conn.execute(
+        "ALTER TABLE bundles ADD COLUMN github_issue_number INTEGER"
+    )
+
+
+@migration(4)
+async def _migrate_v4(conn: aiosqlite.Connection) -> None:
+    """Add approval matrix columns to bundles (irreversible, cooldown_until, tags)."""
+    await conn.execute(
+        "ALTER TABLE bundles ADD COLUMN irreversible INTEGER NOT NULL DEFAULT 0"
+    )
+    await conn.execute(
+        "ALTER TABLE bundles ADD COLUMN cooldown_until INTEGER"
+    )
+    await conn.execute(
+        "ALTER TABLE bundles ADD COLUMN tags TEXT"
+    )
+
+
+@migration(5)
+async def _migrate_v5(conn: aiosqlite.Connection) -> None:
+    """Drop the legacy schema_version table (replaced by PRAGMA user_version)."""
+    await conn.execute("DROP TABLE IF EXISTS schema_version")
 
 
 class Database:
@@ -229,97 +313,81 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
 
     async def connect(self) -> aiosqlite.Connection:
-        """Open the database connection, enable WAL, create schema."""
+        """Open the database connection, enable WAL, create schema, run migrations."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(str(self.db_path))
         self._conn.row_factory = aiosqlite.Row
-        # Enable WAL and foreign keys via pragmas, then run schema
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(SCHEMA_SQL)
         await self._conn.commit()
         await self._run_migrations()
-        logger.info("Database connected: %s (WAL mode)", self.db_path)
+        logger.info("Database connected: %s (WAL mode, schema v%s)", self.db_path, SCHEMA_VERSION)
         return self._conn
 
-    async def _run_migrations(self) -> None:
-        """Apply schema migrations based on stored version vs current SCHEMA_VERSION."""
-        row = await self._conn.execute("SELECT version FROM schema_version")
-        stored = await row.fetchone()
+    async def _get_current_version(self) -> int:
+        """Determine the current schema version of the on-disk database.
 
-        if stored is None:
-            # Brand new database — SCHEMA_SQL just created everything at current version.
-            await self._conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+        Uses PRAGMA user_version as the authoritative source. Falls back to
+        reading the legacy schema_version table for databases created before
+        the PRAGMA-based versioning was introduced (Bundle 3.2).
+        """
+        row = await self._conn.execute("PRAGMA user_version")
+        result = await row.fetchone()
+        user_ver = result[0] if result else 0
+
+        if user_ver > 0:
+            return user_ver
+
+        # user_version is 0 — could be an old DB that still uses the
+        # schema_version table, or a brand-new empty database.
+        try:
+            row = await self._conn.execute(
+                "SELECT version FROM schema_version LIMIT 1"
             )
+            stored = await row.fetchone()
+            if stored is not None:
+                return stored["version"]
+        except aiosqlite.OperationalError:
+            pass
+
+        return 0
+
+    async def _set_version(self, version: int) -> None:
+        await self._conn.execute(f"PRAGMA user_version = {version}")
+
+    async def _run_migrations(self) -> None:
+        """Apply pending schema migrations in sequence.
+
+        Raises DatabaseVersionError if the on-disk database is ahead of the
+        code's SCHEMA_VERSION.
+        """
+        current = await self._get_current_version()
+
+        if current == 0:
+            # Brand-new database — SCHEMA_SQL just created everything.
+            await self._set_version(SCHEMA_VERSION)
             await self._conn.commit()
             return
 
-        current_version = stored["version"]
+        if current > SCHEMA_VERSION:
+            raise DatabaseVersionError(current, SCHEMA_VERSION)
 
-        if current_version < 2:
-            # Migration v2: Replace old artifact_metadata with spec-compliant schema.
-            await self._conn.execute("DROP TABLE IF EXISTS artifact_metadata")
-            await self._conn.executescript("""
-                CREATE TABLE artifact_metadata (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  namespace TEXT NOT NULL CHECK(namespace IN ('bundle', 'global', 'task')),
-                  name TEXT NOT NULL,
-                  version TEXT NOT NULL DEFAULT '',
-                  content_type TEXT NOT NULL,
-                  hash TEXT NOT NULL,
-                  size_bytes INTEGER NOT NULL,
-                  inline_data BLOB,
-                  producer_node_id TEXT,
-                  producer_worker_id TEXT,
-                  bundle_id TEXT,
-                  task_id TEXT,
-                  ref_count INTEGER NOT NULL DEFAULT 0,
-                  created_at INTEGER NOT NULL,
-                  published_at INTEGER NOT NULL,
-                  expires_at INTEGER,
-                  gc_eligible_at INTEGER,
-                  gc_d_at INTEGER,
-                  UNIQUE(namespace, name, version)
-                );
-                CREATE INDEX IF NOT EXISTS idx_artifact_metadata_hash ON artifact_metadata(hash);
-                CREATE INDEX IF NOT EXISTS idx_artifact_metadata_bundle ON artifact_metadata(bundle_id);
-                CREATE INDEX IF NOT EXISTS idx_artifact_metadata_ns_name ON artifact_metadata(namespace, name);
-                CREATE INDEX IF NOT EXISTS idx_artifact_metadata_gc ON artifact_metadata(gc_eligible_at)
-                    WHERE gc_eligible_at IS NOT NULL AND gc_d_at IS NULL;
-            """)
-            await self._conn.execute(
-                "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (2,)
-            )
-            await self._conn.commit()
-            logger.info("Applied migration v2: artifact_metadata schema updated")
-
-        if current_version < 3:
-            await self._conn.execute(
-                "ALTER TABLE bundles ADD COLUMN github_issue_number INTEGER"
-            )
-            await self._conn.execute(
-                "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (3,)
-            )
-            await self._conn.commit()
-            logger.info("Applied migration v3: github_issue_number column added")
-
-        if current_version < 4:
-            # Migration v4: approval matrix columns + drop legacy schema_version table.
-            await self._conn.execute(
-                "ALTER TABLE bundles ADD COLUMN irreversible INTEGER NOT NULL DEFAULT 0"
-            )
-            await self._conn.execute(
-                "ALTER TABLE bundles ADD COLUMN cooldown_until INTEGER"
-            )
-            await self._conn.execute(
-                "ALTER TABLE bundles ADD COLUMN tags TEXT"
-            )
-            await self._conn.execute(
-                "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (4,)
-            )
-            await self._conn.commit()
-            logger.info("Applied migration v4: approval matrix columns added")
+        if current < SCHEMA_VERSION:
+            for target in range(current + 1, SCHEMA_VERSION + 1):
+                fn = MIGRATIONS.get(target)
+                if fn is None:
+                    logger.error(
+                        "Missing migration for version %d (current=%d, code=%d)",
+                        target, current, SCHEMA_VERSION,
+                    )
+                    raise RuntimeError(
+                        f"No migration registered for version {target}"
+                    )
+                await fn(self._conn)
+                await self._set_version(target)
+                await self._conn.commit()
+                logger.info("Applied migration v%d: %s", target, fn.__doc__ or fn.__name__)
 
     async def close(self) -> None:
         if self._conn:

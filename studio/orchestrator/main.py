@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .github import GitHubClient
 
-from .db import Database, create_database
+from .db import Database, create_database, DatabaseVersionError
 from .models import BundleState
 from .state_machine import BundleStateMachine
 from .rpc import (
@@ -1190,6 +1190,13 @@ def main() -> None:
 
     try:
         loop.run_until_complete(_run())
+    except DatabaseVersionError as exc:
+        logging.critical(
+            "Database schema version %d is ahead of code version %d. "
+            "Upgrade the orchestrator.",
+            exc.stored, exc.code,
+        )
+        sys.exit(1)
     except KeyboardInterrupt:
         pass
     finally:

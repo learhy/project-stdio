@@ -38,7 +38,6 @@ async def test_all_tables_exist(db):
         "approval_decisions", "capability_checks", "audit_log",
         "dag_nodes", "dag_edges", "node_state_history",
         "dag_expansions", "approval_requests", "artifact_refs",
-        "schema_version",
     }
     assert expected.issubset(table_names)
 
