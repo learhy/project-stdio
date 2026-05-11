@@ -6,6 +6,7 @@ All public methods return safe defaults on failure — never raise.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -24,6 +25,59 @@ GITHUB_API_BASE = "https://api.github.com"
 # Bot user name for self-triggering prevention
 BOT_LOGIN = "studio-agents[bot]"
 
+# Rate-limit threshold: pause when remaining calls drop below this
+RATE_LIMIT_REMAINING_THRESHOLD = 100
+
+
+class GitHubRateLimiter:
+    """Tracks GitHub API rate-limit state and paces calls to avoid exhausting quotas.
+
+    Inspects X-RateLimit-Remaining and X-RateLimit-Reset headers from responses.
+    When remaining calls drop below the threshold, subsequent calls are delayed
+    until the reset window or until the minimum backoff has elapsed.
+    """
+
+    def __init__(self, remaining_threshold: int = RATE_LIMIT_REMAINING_THRESHOLD) -> None:
+        self._threshold = remaining_threshold
+        self._remaining: int | None = None
+        self._reset_at: int = 0
+        self._backoff_until: float = 0.0
+
+    def update(self, headers: dict[str, str]) -> None:
+        """Update tracked state from response headers."""
+        remaining = headers.get("X-RateLimit-Remaining")
+        if remaining is not None:
+            self._remaining = int(remaining)
+        reset = headers.get("X-RateLimit-Reset")
+        if reset is not None:
+            self._reset_at = int(reset)
+
+    @property
+    def should_pause(self) -> bool:
+        """True when rate-limit remaining is below threshold and no backoff is active."""
+        if self._remaining is None:
+            return False
+        return self._remaining < self._threshold
+
+    async def wait_if_needed(self) -> None:
+        """Pause if rate-limited or in active backoff."""
+        now = time.time()
+        if now < self._backoff_until:
+            delay = self._backoff_until - now
+            logger.info("Rate-limit backoff: sleeping %.1fs", delay)
+            await asyncio.sleep(delay)
+
+        if self._remaining is not None and self._remaining < self._threshold:
+            wait = max(self._reset_at - int(now) + 1, 30)
+            logger.info("Rate-limit low (%d remaining): sleeping %ds until reset",
+                        self._remaining, wait)
+            await asyncio.sleep(wait)
+
+    def backoff(self, seconds: int = 60) -> None:
+        """Force a backoff period (called on 403/429 responses)."""
+        self._backoff_until = time.time() + seconds
+        logger.warning("Rate-limit backoff triggered: %ds", seconds)
+
 
 class GitHubClient:
     """GitHub App-authenticated REST API client for issue management."""
@@ -34,6 +88,7 @@ class GitHubClient:
         self._client: httpx.AsyncClient | None = None
         self._installation_token: str | None = None
         self._token_expiry: int = 0
+        self._rate_limiter = GitHubRateLimiter()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -167,12 +222,14 @@ class GitHubClient:
         """Make an authenticated API request. Returns parsed JSON or None on failure."""
         if self._client is None:
             return None
+        await self._rate_limiter.wait_if_needed()
         token = await self._get_installation_token()
         if token is None:
             return None
         headers = {"Authorization": f"Bearer {token}"}
         try:
             resp = await self._client.request(method, path, json=json_body, headers=headers)
+            self._rate_limiter.update(dict(resp.headers))
             if resp.status_code == 401:
                 # Token may have expired — force refresh and retry once
                 self._installation_token = None
@@ -181,6 +238,11 @@ class GitHubClient:
                     return None
                 headers["Authorization"] = f"Bearer {token}"
                 resp = await self._client.request(method, path, json=json_body, headers=headers)
+                self._rate_limiter.update(dict(resp.headers))
+            if resp.status_code in (403, 429):
+                self._rate_limiter.backoff(120)
+                logger.warning("GitHub API %s %s returned %d", method, path, resp.status_code)
+                return None
             resp.raise_for_status()
             return resp.json() if resp.status_code != 204 else {}
         except Exception as exc:

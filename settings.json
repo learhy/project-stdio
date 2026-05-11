@@ -49,6 +49,7 @@
     "app_id": "",
     "installation_id": "",
     "private_key_path": "",
+    "webhook_secret": "",
     "poll_interval_seconds": 60,
     "owner": "",
     "repo": ""
