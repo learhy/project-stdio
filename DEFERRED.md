@@ -8,9 +8,6 @@ The v1.1 spec describes a retry policy with backoff. The `RetryPolicy` model exi
 ### RPC query gate (rpc_query predicate)
 Gate nodes with `rpc_query` predicate auto-pass in `_dispatch_gate`. Real implementation requires: a target worker lookup, an RPC call to that worker, and timeout handling. Deferred — no bundle scheduled yet.
 
-### Expansion capability subset check (required before Phase 2.6)
-`handle_expansion_request` auto-approves all structurally valid expansions without checking capability manifests. Fragment nodes can request capabilities beyond the bundle grant. Fix before any real worker issues expansion requests: call `capability.is_subset()` for each fragment node manifest against the bundle grant. Deny if any node exceeds it.
-
 ### Artifact streaming (stream_put/stream_get)
 Streaming for artifact data transfer is deferred until artifact sizes routinely exceed 100 MB or base64 overhead becomes a bottleneck. The design sketch is in the v1.1 spec (lines 1788-1794). Binary side channel alongside the JSON-RPC control channel is the intended path.
 
@@ -50,6 +47,9 @@ Transitions 20 (verification_failed_auto_rollback) and 21 (verification_failed_m
 The QA worker's `_run_automated_checks()` shells out to `pytest`, `ruff`, and `acceptance.sh` as subprocesses. Coverage threshold checking and pre-merge gate enforcement are limited to what the shell commands return. A more structured test-runner interface (with per-test-case granularity, flaky detection, and structured coverage reports) would improve the Verification Report's fidelity but is deferred.
 
 ## Phase 3
+
+### Worker inject_context push on secret rotation (Bundle 3.4)
+Secret rotation records affected workers in audit_log but does not actively push new secret values to running workers. Workers that fetched the old secret continue using it until they re-fetch. Implement `worker.inject_context` push notification so rotated secrets are delivered to affected workers without restart. Deferred — `worker.inject_context` is a stub method.
 
 ### Egress proxy TLS-in-CONNECT SNI enforcement (Bundle 3.1)
 The proxy peeks at the first TLS ClientHello after CONNECT and extracts the SNI. If the SNI doesn't match the CONNECT target hostname, the tunnel is blocked. However, TLS 1.3 Encrypted ClientHello (ECH) will defeat SNI sniffing entirely. When ECH gains real-world adoption, the proxy will need an alternative enforcement path (likely: enforce at CONNECT time with DNS pinning, accept the residual risk of post-CONNECT hostname mismatches, and rely on audit logging for incident response). Deferred until ECH appears in worker traffic.

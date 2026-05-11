@@ -150,7 +150,7 @@ class TestLocalBwrapWorkerRunner:
                 assert insert_call[0][1][0] == "w1"
                 assert insert_call[0][1][1] == "b1"
                 assert insert_call[0][1][2] == "n1"
-                assert insert_call[0][1][5] == "pending"
+                assert insert_call[0][1][6] == "pending"
 
                 assert result.worker_id == "w1"
                 assert result.process is mock_proc
@@ -277,5 +277,5 @@ class TestNoopWorkerRunner:
         manifest = make_manifest()
         await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
         insert_call = db_mock.execute.call_args_list[0]
-        # Index 5 = state
-        assert insert_call[0][1][5] == "pending"
+        # Index 6 = state (shifted by token_expires_at at index 4)
+        assert insert_call[0][1][6] == "pending"

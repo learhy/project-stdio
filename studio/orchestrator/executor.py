@@ -952,9 +952,48 @@ class DagExecutor:
             return {"decision": "denied", "decision_id": None,
                     "reason": "Expansion would exceed max total nodes"}
 
-        # TODO (required before Phase 2.6): Check expansion fragment nodes have capability
-        # manifests that are subsets of the bundle-level approved grant. Without this, workers
-        # can self-grant elevated capabilities via expansion. See: capability.is_subset()
+        # Check expansion fragment node capability manifests are subsets of the
+        # bundle-level approved grant (Bundle 3.4, was deferred from Phase 2.6).
+        from .capability import is_subset
+        from .models import CapabilityManifest
+
+        # Load bundle-level capability manifest from proposal_json
+        bundle_row = await self.db.fetch_one(
+            "SELECT proposal_json FROM bundles WHERE id = ?", (bundle_id,)
+        )
+        if bundle_row:
+            bundle_proposal = json.loads(bundle_row["proposal_json"] or "{}")
+            bundle_cap_raw = bundle_proposal.get("capability_manifest", {})
+        else:
+            bundle_cap_raw = {}
+
+        if bundle_cap_raw:
+            try:
+                bundle_cap = CapabilityManifest.model_validate(bundle_cap_raw)
+            except Exception:
+                bundle_cap = CapabilityManifest()
+        else:
+            bundle_cap = CapabilityManifest()
+
+        for n in fragment.nodes:
+            node_spec = n.spec if hasattr(n.spec, 'model_dump') else n.spec
+            spec_dict = node_spec.model_dump() if hasattr(node_spec, 'model_dump') else (node_spec or {})
+            cap_raw = spec_dict.get("capability_manifest")
+            if cap_raw:
+                try:
+                    node_cap = CapabilityManifest.model_validate(cap_raw)
+                except Exception as exc:
+                    return {"decision": "denied", "decision_id": None,
+                            "reason": f"Invalid capability manifest in node '{n.id}': {exc}"}
+                ok, reason = is_subset(node_cap, bundle_cap)
+                if not ok:
+                    await self._audit_expansion_denied(
+                        bundle_id, requesting_node_id,
+                        f"Node '{n.id}' capability exceeds bundle grant: {reason}"
+                    )
+                    return {"decision": "denied", "decision_id": None,
+                            "reason": f"Node '{n.id}' capability exceeds bundle grant: {reason}"}
+
         # If auto-approvable, apply graft in a transaction
         expansion_id = f"exp_{bundle_id}_{len(existing_ids)}"
         now = self.now()
@@ -1067,6 +1106,17 @@ class DagExecutor:
             "VALUES (?, ?, ?, ?, ?)",
             ("dag_expansion_applied", "bundle", bundle_id,
              json.dumps({"expansion_id": expansion_id, "rationale": rationale}),
+             self.now()),
+        )
+
+    async def _audit_expansion_denied(
+        self, bundle_id: str, requesting_node_id: str, reason: str
+    ) -> None:
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("dag_expansion_denied", "bundle", bundle_id,
+             json.dumps({"requesting_node_id": requesting_node_id, "reason": reason}),
              self.now()),
         )
 

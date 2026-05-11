@@ -604,22 +604,69 @@ class MockArtifactStore(ArtifactStore):
 
 
 class SecretStore:
-    def __init__(self, entries: list[dict]) -> None:
-        self._secrets: dict[str, str] = {}
+    """Hybrid secret storage: file store takes precedence, env vars are bootstrap.
+
+    Secrets are read from memory/secrets/<name>.json first, falling back to the
+    configured env var. Rotation writes to the file store.
+    """
+
+    def __init__(self, entries: list[dict], memory_root: str = "memory/") -> None:
+        self._entries: dict[str, dict] = {}
+        self._store_dir = Path(memory_root) / "secrets"
         for entry in entries:
-            env_var = entry.get("env_var", "")
             name = entry.get("name", "")
-            if env_var and name:
-                self._secrets[name] = env_var
+            env_var = entry.get("env_var", "")
+            if name:
+                self._entries[name] = {"env_var": env_var, **entry}
 
     def fetch(self, name: str) -> tuple[str | None, int | None]:
-        env_var = self._secrets.get(name)
-        if env_var is None:
+        if name not in self._entries:
             return None, None
-        value = os.environ.get(env_var)
-        if value is None:
-            return None, None
-        return value, None  # No expiry for env-var secrets
+
+        # File store takes precedence
+        file_path = self._store_dir / f"{name}.json"
+        if file_path.exists():
+            try:
+                data = json.loads(file_path.read_text())
+                return data.get("value"), data.get("expires_at")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Fall back to env var
+        env_var = self._entries[name].get("env_var", "")
+        if env_var:
+            value = os.environ.get(env_var)
+            if value is not None:
+                return value, None
+
+        return None, None
 
     def exists(self, name: str) -> bool:
-        return name in self._secrets and os.environ.get(self._secrets[name]) is not None
+        if name not in self._entries:
+            return False
+        file_path = self._store_dir / f"{name}.json"
+        if file_path.exists():
+            return True
+        env_var = self._entries[name].get("env_var", "")
+        return bool(env_var and os.environ.get(env_var))
+
+    def rotate(self, name: str) -> tuple[str | None, str | None]:
+        """Generate a new secret, write to file store, return (value, error).
+
+        The new value is a hex token. The old value (if any) is NOT returned —
+        callers that need the old value for comparison must fetch before rotating.
+        """
+        if name not in self._entries:
+            return None, f"Unknown secret: {name}"
+
+        import secrets
+        new_value = secrets.token_hex(32)
+        self._store_dir.mkdir(parents=True, exist_ok=True)
+        file_path = self._store_dir / f"{name}.json"
+        data = {
+            "name": name,
+            "value": new_value,
+            "rotated_at": int(time.time()),
+        }
+        file_path.write_text(json.dumps(data))
+        return new_value, None

@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class DatabaseVersionError(RuntimeError):
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS workers (
   bundle_id TEXT NOT NULL REFERENCES bundles(id),
   node_id TEXT NOT NULL,
   token TEXT NOT NULL,
+  token_expires_at INTEGER,
   manifest_json TEXT NOT NULL DEFAULT '{}',
   state TEXT NOT NULL,
   pid INTEGER,
@@ -303,6 +304,18 @@ async def _migrate_v4(conn: aiosqlite.Connection) -> None:
 async def _migrate_v5(conn: aiosqlite.Connection) -> None:
     """Drop the legacy schema_version table (replaced by PRAGMA user_version)."""
     await conn.execute("DROP TABLE IF EXISTS schema_version")
+
+
+@migration(6)
+async def _migrate_v6(conn: aiosqlite.Connection) -> None:
+    """Add token_expires_at column to workers for time-limited tokens (Bundle 3.4)."""
+    # Check if column already exists (SCHEMA_SQL may have created it on new DBs)
+    cursor = await conn.execute("PRAGMA table_info('workers')")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "token_expires_at" not in columns:
+        await conn.execute(
+            "ALTER TABLE workers ADD COLUMN token_expires_at INTEGER"
+        )
 
 
 class Database:

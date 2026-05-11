@@ -120,7 +120,7 @@ class TestStopBundle:
         db_mock.fetch_all.return_value = [{"id": "w1"}]
 
         await executor.stop_bundle("b1")
-        executor.runner.kill_worker.assert_called_once_with(mock_proc)
+        executor.runner.kill_worker.assert_called_once_with(mock_proc, "w1")
         assert "b1" not in executor._active_bundles
 
     @pytest.mark.asyncio

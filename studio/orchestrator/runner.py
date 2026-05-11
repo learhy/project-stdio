@@ -49,11 +49,13 @@ class LocalBwrapWorkerRunner:
         socket_path: str,
         egress_proxy: EgressProxySettings | None = None,
         worker_command: list[str] | None = None,
+        token_expiry_minutes: int = 15,
     ) -> None:
         self.db = db
         self.socket_path = socket_path
         self.egress_proxy = egress_proxy or EgressProxySettings()
         self.worker_command = worker_command or ["studio-worker"]
+        self.token_expiry_minutes = token_expiry_minutes
         # Track proxy processes for cleanup
         self._proxy_processes: dict[str, asyncio.subprocess.Process] = {}
 
@@ -79,21 +81,34 @@ class LocalBwrapWorkerRunner:
         the worker ID, token, process, and proxy process handles.
         """
         token = _generate_token()
+        token_expires_at = self.now() + (self.token_expiry_minutes * 60)
         proxy_socket = f"{self.egress_proxy.socket_dir}/proxy-{worker_id}.sock"
 
         # Insert worker row
         await self.db.execute(
-            "INSERT INTO workers (id, bundle_id, node_id, token, manifest_json, state, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, manifest_json, state, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 worker_id,
                 bundle_id,
                 node_id,
                 token,
+                token_expires_at,
                 json.dumps(manifest.model_dump()),
                 WorkerState.PENDING,
                 self.now(),
             ),
+        )
+        await self.db.conn.commit()
+
+        # Audit: worker spawn
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("worker_spawned", "worker", worker_id,
+             json.dumps({"bundle_id": bundle_id, "node_id": node_id,
+                         "token_expires_at": token_expires_at}),
+             self.now()),
         )
         await self.db.conn.commit()
 
@@ -327,8 +342,9 @@ class LocalBwrapWorkerRunner:
 class NoopWorkerRunner:
     """Runner that spawns no actual process — used for testing."""
 
-    def __init__(self, db: "Database") -> None:
+    def __init__(self, db: "Database", token_expiry_minutes: int = 15) -> None:
         self.db = db
+        self.token_expiry_minutes = token_expiry_minutes
 
     async def spawn_worker(
         self,
@@ -340,11 +356,23 @@ class NoopWorkerRunner:
         task_spec: dict[str, Any] | None = None,
     ) -> WorkerSpawnResult:
         token = _generate_token()
+        token_expires_at = int(time.time()) + (self.token_expiry_minutes * 60)
         await self.db.execute(
-            "INSERT INTO workers (id, bundle_id, node_id, token, manifest_json, state, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (worker_id, bundle_id, node_id, token, json.dumps(manifest.model_dump()),
+            "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, manifest_json, state, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (worker_id, bundle_id, node_id, token, token_expires_at,
+             json.dumps(manifest.model_dump()),
              WorkerState.PENDING, int(time.time())),
+        )
+        await self.db.conn.commit()
+
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("worker_spawned", "worker", worker_id,
+             json.dumps({"bundle_id": bundle_id, "node_id": node_id,
+                         "token_expires_at": token_expires_at}),
+             int(time.time())),
         )
         await self.db.conn.commit()
         # Return a result with no real process
