@@ -45,6 +45,8 @@ uv pip install -e ".[dev]"
 uv run python -m pytest studio/tests/ -v
 
 # Start orchestrator (test mode — no bwrap needed)
+# Env var mapping: CLI uses STUDIO_SOCKET_PATH, but the orchestrator
+# reads its path from STUDIO_ORCH_SOCKET_PATH. Both must match.
 STUDIO_TEST_MODE=1 STUDIO_ORCH_DB_PATH=/tmp/studio.db \
   STUDIO_ORCH_SOCKET_PATH=/tmp/studio.sock \
   uv run python -m studio.orchestrator.main &
@@ -59,12 +61,26 @@ STUDIO_SOCKET_PATH=/tmp/studio.sock \
   uv run python -m studio.orchestrator.cli submit \
   studio/tests/fixtures/hello-world.json
 
+# Check the bundle state
+STUDIO_SOCKET_PATH=/tmp/studio.sock \
+  uv run python -m studio.orchestrator.cli show <bundle-id>
+
 # Approve it
 STUDIO_SOCKET_PATH=/tmp/studio.sock \
   uv run python -m studio.orchestrator.cli approve <bundle-id>
 
 # Run acceptance tests
 STUDIO_TEST_MODE=1 bash studio/tests/acceptance.sh
+
+# Start MCP server (test mode — pointed at same orchestrator)
+# STUDIO_DB_PATH must match STUDIO_ORCH_DB_PATH so the MCP server
+# reads from the same database.
+STUDIO_SOCKET_PATH=/tmp/studio.sock \
+  STUDIO_DB_PATH=/tmp/studio.db \
+  STUDIO_MCP_PORT=8080 \
+  STUDIO_MCP_TOKEN=test-token-123 \
+  uv run python -m studio.mcp.server &
+```
 ```
 
 ## CLI command reference
@@ -239,8 +255,30 @@ All keys and their defaults:
 ### `mcp`
 | Key | Default | Description |
 |-----|---------|-------------|
-| `port` | `8080` | MCP HTTP server port |
-| `bearer_token` | `""` | MCP auth bearer token |
+| `port` | `8080` | MCP HTTP server port. Override with `STUDIO_MCP_PORT` env var. |
+| `bearer_token` | `""` | MCP auth bearer token. Override with `STUDIO_MCP_TOKEN` env var. |
+
+The MCP server reads `STUDIO_DB_PATH` to find the orchestrator's SQLite database.
+
+### MCP tools
+
+The MCP server exposes these tools to Claude Desktop:
+
+| Tool | Description |
+|------|-------------|
+| `list_pending_bundles` | List bundles not in a terminal state. Optional filter by tier, state, repo. |
+| `get_bundle` | Get full details for a bundle by ID (includes workers, DAG nodes, edges). |
+| `approve_bundle` | Approve a bundle. Requires explicit human confirmation. |
+| `reject_bundle` | Reject a bundle with a reason. Requires explicit human confirmation. |
+| `request_modification` | Request modifications to a bundle. Sends it back for revision. |
+| `escalate_bundle` | Escalate a bundle to the next higher review tier. |
+| `pause_bundle` | Pause a bundle that is currently in progress. |
+| `resume_bundle` | Resume a paused bundle. |
+| `kill_worker` | Kill a specific worker in a bundle. |
+| `grant_capability` | Grant a capability request. [DEFERRED to Phase 3] |
+| `revoke_capability` | Revoke a granted capability. [DEFERRED to Phase 3] |
+
+Note: There is no `submit_bundle` MCP tool yet. New bundles must be created via the CLI (`studio submit`) or GitHub Issues.
 
 ### `ollama_cloud`
 | Key | Default | Description |
