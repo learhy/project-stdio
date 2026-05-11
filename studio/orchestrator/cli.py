@@ -314,6 +314,30 @@ async def cmd_status() -> int:
     return 0
 
 
+async def cmd_calibration_report() -> int:
+    """Print calibration report from memory/calibration/."""
+    resp = await _send_rpc(_get_socket_path(), "studio.calibration_report", {})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    result = resp.get("result", {})
+    if "message" in result:
+        print(result["message"])
+        return 0
+
+    print(f"Calibration entries: {result.get('total_entries', 0)} total, "
+          f"{result.get('entries_with_divergence', 0)} with divergence")
+    recent = result.get("recent", [])
+    if recent:
+        print("\nRecent entries:")
+        for entry in recent:
+            bundle_id = entry.get("bundle_id", "unknown")
+            print(f"  {bundle_id}: estimated={entry.get('estimated_score', '?')} "
+                  f"actual={entry.get('actual_score', '?')}")
+    return 0
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -368,6 +392,9 @@ def main() -> None:
     p_rotate = sub.add_parser("rotate-secret", help="Rotate a secret")
     p_rotate.add_argument("name", help="Secret name")
 
+    # calibration-report
+    sub.add_parser("calibration-report", help="Print estimated-vs-actual scoring outcomes")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -400,6 +427,8 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_audit(args.bundle_id))
         elif args.command == "rotate-secret":
             exit_code = loop.run_until_complete(cmd_rotate_secret(args.name))
+        elif args.command == "calibration-report":
+            exit_code = loop.run_until_complete(cmd_calibration_report())
         else:
             print(f"Unknown command: {args.command}", file=sys.stderr)
             exit_code = 1
