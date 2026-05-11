@@ -403,11 +403,12 @@ From `git clone` to a working hello-world bundle:
    chown studio:studio /run/studio /var/lib/studio memory/ memory/secrets/
    ```
 
-2. **Configure `settings.json`:** The repo ships with sensible defaults. Three keys you **must** set before starting:
+2. **Configure `settings.json`:** The repo ships with sensible defaults. Three required keys to set before starting:
    - `orchestrator.socket_path` — path to the Unix socket (default `/run/studio/orchestrator.sock`)
    - `orchestrator.db_path` — path to the SQLite state database (default `/var/lib/studio/state.db`)
    - `orchestrator.memory_root` — path to `memory/` relative to the repo root
-   - If using GitHub Issues: configure all `github.*` keys (`app_id`, `installation_id`, `private_key_path`, `webhook_secret`, `owner`, `repo`)
+
+   If using GitHub Issues, also configure all `github.*` keys (`app_id`, `installation_id`, `private_key_path`, `webhook_secret`, `owner`, `repo`).
 
 3. **Configure Ollama Cloud credentials:** The bundler, developer, and review workers read the `OLLAMA_API_KEY` environment variable. Set it in the orchestrator's environment or add an entry to `secrets_config` in `settings.json`:
    ```json
