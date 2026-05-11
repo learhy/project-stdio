@@ -490,6 +490,7 @@ class Orchestrator:
 
         # 10. Bind socket (single socket for workers + CLI)
         socket_path = cfg.socket_path
+        os.makedirs(os.path.dirname(socket_path), exist_ok=True)
         if os.path.exists(socket_path):
             os.unlink(socket_path)
 
@@ -1542,11 +1543,17 @@ def main() -> None:
     )
 
     settings = Settings()
-    # Allow environment variable overrides for testing
+    # Allow environment variable overrides for testing.
+    # Priority: STUDIO_SOCKET_PATH > STUDIO_ORCH_SOCKET_PATH (backward compat)
+    # > settings.json > /tmp/studio.sock (safe default)
     if os.environ.get("STUDIO_ORCH_DB_PATH"):
         settings.orchestrator.db_path = os.environ["STUDIO_ORCH_DB_PATH"]
-    if os.environ.get("STUDIO_SOCKET_PATH"):
-        settings.orchestrator.socket_path = os.environ["STUDIO_SOCKET_PATH"]
+    socket_path = (
+        os.environ.get("STUDIO_SOCKET_PATH")
+        or os.environ.get("STUDIO_ORCH_SOCKET_PATH")
+    )
+    if socket_path:
+        settings.orchestrator.socket_path = socket_path
 
     app = Orchestrator(settings)
 
