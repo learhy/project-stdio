@@ -4,8 +4,13 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# ── Known content schema versions ────────────────────────────────────────────
+
+KNOWN_CAPABILITY_MANIFEST_VERSIONS = frozenset({"1.0"})
+KNOWN_TASK_DAG_VERSIONS = frozenset({"1.0"})
+KNOWN_SUBMISSION_VERSIONS = frozenset({"1.0-phase-1"})
 
 # ── State enums ──────────────────────────────────────────────────────────────
 
@@ -190,6 +195,16 @@ class CapabilityManifest(BaseModel):
     grants: Grants = Field(default_factory=Grants)
     metadata: ManifestMetadata = Field(default_factory=ManifestMetadata)
 
+    @field_validator("schema_version")
+    @classmethod
+    def _check_schema_version(cls, v: str) -> str:
+        if v not in KNOWN_CAPABILITY_MANIFEST_VERSIONS:
+            raise ValueError(
+                f"Unsupported schema_version: {v!r}. "
+                f"Known: {sorted(KNOWN_CAPABILITY_MANIFEST_VERSIONS)}"
+            )
+        return v
+
 
 # ── Task DAG models ──────────────────────────────────────────────────────────
 
@@ -285,6 +300,16 @@ class TaskDAG(BaseModel):
     exit_nodes: list[str] = Field(default_factory=list)
     expansion_policy: ExpansionPolicy = Field(default_factory=ExpansionPolicy)
     metadata: DAGMetadata = Field(default_factory=DAGMetadata)
+
+    @field_validator("schema_version")
+    @classmethod
+    def _check_schema_version(cls, v: str) -> str:
+        if v not in KNOWN_TASK_DAG_VERSIONS:
+            raise ValueError(
+                f"Unsupported schema_version: {v!r}. "
+                f"Known: {sorted(KNOWN_TASK_DAG_VERSIONS)}"
+            )
+        return v
 
 
 # ── on_property expression AST ────────────────────────────────────────────────
@@ -430,10 +455,20 @@ class BundleInput(BaseModel):
 
 class Submission(BaseModel):
     """Phase 1 kernel submission JSON schema."""
-    schema_version: Literal["1.0-phase-1"] = "1.0-phase-1"
+    schema_version: str = "1.0-phase-1"
     bundle_input: BundleInput = Field(default_factory=BundleInput)
     capability_manifest: CapabilityManifest = Field(default_factory=CapabilityManifest)
     task_dag: TaskDAG = Field(default_factory=TaskDAG)
+
+    @field_validator("schema_version")
+    @classmethod
+    def _check_schema_version(cls, v: str) -> str:
+        if v not in KNOWN_SUBMISSION_VERSIONS:
+            raise ValueError(
+                f"Unsupported schema_version: {v!r}. "
+                f"Known: {sorted(KNOWN_SUBMISSION_VERSIONS)}"
+            )
+        return v
 
 
 # ── Bundle proposal (bundler agent output) ────────────────────────────────────

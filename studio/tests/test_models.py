@@ -193,3 +193,85 @@ def test_illegal_bundle_state_transition():
     for s in BundleState:
         if s in terminal:
             assert s in terminal
+
+
+# ── Schema version validation ──────────────────────────────────────────────
+
+def test_capability_manifest_rejects_unknown_schema_version():
+    from studio.orchestrator.models import CapabilityManifest
+    with pytest.raises(ValueError, match="Unsupported schema_version"):
+        CapabilityManifest.model_validate({
+            "schema_version": "2.0",
+            "subject": {"kind": "bundle", "id": "b-1"},
+            "grants": {},
+        })
+
+
+def test_capability_manifest_accepts_known_version():
+    from studio.orchestrator.models import CapabilityManifest
+    manifest = CapabilityManifest.model_validate({
+        "schema_version": "1.0",
+        "subject": {"kind": "bundle", "id": "b-1"},
+        "grants": {},
+    })
+    assert manifest.schema_version == "1.0"
+
+
+def test_task_dag_rejects_unknown_schema_version():
+    from studio.orchestrator.models import TaskDAG
+    with pytest.raises(ValueError, match="Unsupported schema_version"):
+        TaskDAG.model_validate({
+            "schema_version": "2.0",
+            "nodes": [{"id": "t1", "kind": "worker", "task_manifest_ref": "m1"}],
+            "entry_nodes": ["t1"],
+            "exit_nodes": ["t1"],
+        })
+
+
+def test_task_dag_accepts_known_version():
+    from studio.orchestrator.models import TaskDAG
+    dag = TaskDAG.model_validate({
+        "schema_version": "1.0",
+        "nodes": [{"id": "t1", "kind": "worker", "task_manifest_ref": "m1"}],
+        "entry_nodes": ["t1"],
+        "exit_nodes": ["t1"],
+    })
+    assert dag.schema_version == "1.0"
+
+
+def test_submission_rejects_unknown_schema_version():
+    from studio.orchestrator.models import Submission
+    with pytest.raises(ValueError, match="Unsupported schema_version"):
+        Submission.model_validate({
+            "schema_version": "2.0",
+            "bundle_input": {"idea": "test"},
+            "task_dag": {
+                "nodes": [{"id": "t1", "kind": "worker", "task_manifest_ref": "m1"}],
+                "entry_nodes": ["t1"],
+                "exit_nodes": ["t1"],
+            },
+        })
+
+
+def test_submission_accepts_known_version():
+    from studio.orchestrator.models import Submission
+    submission = Submission.model_validate({
+        "schema_version": "1.0-phase-1",
+        "bundle_input": {"idea": "test"},
+        "task_dag": {
+            "nodes": [{"id": "t1", "kind": "worker", "task_manifest_ref": "m1"}],
+            "entry_nodes": ["t1"],
+            "exit_nodes": ["t1"],
+        },
+    })
+    assert submission.schema_version == "1.0-phase-1"
+
+
+def test_known_version_constants_are_frozensets():
+    from studio.orchestrator import models
+    assert isinstance(models.KNOWN_CAPABILITY_MANIFEST_VERSIONS, frozenset)
+    assert isinstance(models.KNOWN_TASK_DAG_VERSIONS, frozenset)
+    assert isinstance(models.KNOWN_SUBMISSION_VERSIONS, frozenset)
+    assert "1.0" in models.KNOWN_CAPABILITY_MANIFEST_VERSIONS
+    assert "1.0" in models.KNOWN_TASK_DAG_VERSIONS
+    assert "1.0-phase-1" in models.KNOWN_SUBMISSION_VERSIONS
