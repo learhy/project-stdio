@@ -80,6 +80,57 @@ STUDIO_TEST_MODE=1 bash studio/tests/acceptance.sh
 | `studio show <id>` | Show bundle detail and node states |
 | `studio kill <id>` | Kill a running bundle's workers |
 
+#### Bundle JSON format
+
+**Kernel-direct (pre-built DAG):**
+
+```json
+{
+  "schema_version": "1.0-phase-1",
+  "bundle_input": {
+    "idea": "Add a hello-world endpoint to the API",
+    "filed_by": "developer",
+    "filed_at": "2026-05-08T10:00:00Z",
+    "target_repo": "control-plane",
+    "priority_hint": "normal"
+  },
+  "capability_manifest": {
+    "schema_version": "1.0",
+    "grants": {
+      "filesystem": { "reads": [...], "writes": [...] },
+      "network": { "egress": [...], "dns": {"enabled": true} },
+      "process": { "exec": [...] },
+      "rpc": { "methods": [...] },
+      "resources": { "wall_time_limit": 3600, "llm_token_budget": {...} }
+    }
+  },
+  "task_dag": {
+    "schema_version": "1.0",
+    "nodes": [{"id": "...", "kind": "worker", "spec": {"objective": "..."}}],
+    "edges": [],
+    "entry_nodes": ["..."],
+    "exit_nodes": ["..."]
+  }
+}
+```
+
+`task_dag` presence triggers the kernel-direct path. The bundle goes PROPOSED → (kernel approve) → APPROVED → IN_PROGRESS.
+
+**Bundle-input-only (idea, bundler path):**
+
+```json
+{
+  "bundle_input": {
+    "idea": "Add a logout button to the settings page",
+    "filed_by": "developer",
+    "filed_at": "2026-05-11T10:00:00Z",
+    "target_repo": "control-plane"
+  }
+}
+```
+
+No `task_dag` triggers the bundler path. The orchestrator spawns a bundler worker that produces a proposal + DAG, then the bundle enters IN_REVIEW.
+
 ### Operational
 
 | Command | Description |
@@ -341,6 +392,45 @@ cp /var/lib/studio/state.db /backup/state-$(date -I).db
 - SQLite 3.x
 - bubblewrap (for production worker isolation)
 - Linux (Unix domain sockets, bwrap, network namespaces)
+
+## First-time setup
+
+From `git clone` to a working hello-world bundle:
+
+1. **Create required directories:**
+   ```bash
+   mkdir -p memory/secrets /run/studio /var/lib/studio
+   chown studio:studio /run/studio /var/lib/studio memory/ memory/secrets/
+   ```
+
+2. **Configure `settings.json`:** The repo ships with sensible defaults. Three keys you **must** set before starting:
+   - `orchestrator.socket_path` — path to the Unix socket (default `/run/studio/orchestrator.sock`)
+   - `orchestrator.db_path` — path to the SQLite state database (default `/var/lib/studio/state.db`)
+   - `orchestrator.memory_root` — path to `memory/` relative to the repo root
+   - If using GitHub Issues: configure all `github.*` keys (`app_id`, `installation_id`, `private_key_path`, `webhook_secret`, `owner`, `repo`)
+
+3. **Configure Ollama Cloud credentials:** The bundler, developer, and review workers read the `OLLAMA_API_KEY` environment variable. Set it in the orchestrator's environment or add an entry to `secrets_config` in `settings.json`:
+   ```json
+   "secrets_config": [
+     {"name": "ollama_api_key", "env_var": "OLLAMA_API_KEY", "purpose": "llm_api"}
+   ]
+   ```
+
+4. **Test in test mode first:**
+   ```bash
+   STUDIO_TEST_MODE=1 STUDIO_ORCH_DB_PATH=/tmp/studio.db \
+     STUDIO_ORCH_SOCKET_PATH=/tmp/studio.sock \
+     uv run python -m studio.orchestrator.main &
+   STUDIO_SOCKET_PATH=/tmp/studio.sock \
+     uv run python -m studio.orchestrator.cli submit \
+     studio/tests/fixtures/hello-world.json
+   ```
+   Test mode uses `NoopWorkerRunner` — no bubblewrap or real workers needed.
+
+5. **Where things live:**
+   - Unix socket: `/run/studio/orchestrator.sock` — CLI and workers connect here
+   - SQLite DB: `/var/lib/studio/state.db` — all bundle/worker/artifact state, WAL mode
+   - `memory/`: lives at the repo root; contains `secrets/`, `calibration/`, `notifications/`, `post-mortems/`
 
 ## License
 
