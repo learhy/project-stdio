@@ -49,10 +49,10 @@ STUDIO_TEST_MODE=1 STUDIO_ORCH_DB_PATH=/tmp/studio.db \
   STUDIO_ORCH_SOCKET_PATH=/tmp/studio.sock \
   uv run python -m studio.orchestrator.main &
 
-# Submit a bundle (bundler path — idea only)
+# Submit a bundle (bundler path — idea only, via JSON file)
+echo '{"bundle_input": {"idea": "Add a logout button to the settings page"}}' > /tmp/idea.json
 STUDIO_SOCKET_PATH=/tmp/studio.sock \
-  uv run python -m studio.orchestrator.cli submit \
-  -i "Add a logout button to the settings page"
+  uv run python -m studio.orchestrator.cli submit /tmp/idea.json
 
 # Submit a bundle (kernel-direct path — pre-built DAG)
 STUDIO_SOCKET_PATH=/tmp/studio.sock \
@@ -73,21 +73,12 @@ STUDIO_TEST_MODE=1 bash studio/tests/acceptance.sh
 
 | Command | Description |
 |---------|-------------|
-| `studio submit -i "<idea>"` | Submit a bundle idea (bundler path) |
-| `studio submit <file.json>` | Submit a bundle JSON file (kernel-direct path) |
+| `studio submit <file.json>` | Submit a bundle JSON file (bundler path if `bundle_input` present, kernel-direct if `task_dag` present) |
 | `studio approve <id>` | Approve and start execution |
 | `studio reject <id> [-r reason]` | Reject a proposed bundle |
 | `studio list [--state s] [--json]` | List non-terminal bundles |
 | `studio show <id>` | Show bundle detail and node states |
 | `studio kill <id>` | Kill a running bundle's workers |
-
-### Review deck
-
-| Command | Description |
-|---------|-------------|
-| `studio deck` | Show the review deck (bundles awaiting decision) |
-| `studio deck --mine` | Show escalated bundles assigned to the current PM |
-| `studio pending` | Show pending proposals not yet in review |
 
 ### Operational
 
@@ -294,7 +285,7 @@ Key health indicators from `studio health`:
 
 ### Responding to escalations
 
-Escalated bundles appear in `studio deck --mine`. They follow a 5/10/21-day ladder:
+Escalated bundles are visible in `studio health` under the escalation breakdown. They follow a 5/10/21-day ladder:
 
 1. **Day 0**: Bundler places bundle in review deck
 2. **Day 5**: First escalation — PM notified via GitHub issue comment

@@ -25,7 +25,9 @@ studio/
     ops.py         # Stall detection, escalation ladder, recall, health
     notify.py      # Notification dispatcher (file log + GitHub issue comments)
     visualizer.py  # Mermaid DAG renderer
+    expression.py  # Expression evaluator for artifact gate predicates
     reducers.py    # Aggregator reduce functions
+    settings.py    # Settings loader (JSON → Pydantic)
     cli.py         # CLI entry point (submit/approve/reject/list/show/kill/status/...)
     main.py        # Orchestrator: wires all subsystems, Starlette HTTP server, polling
   workers/         # worker processes
@@ -37,8 +39,9 @@ studio/
   mcp/             # MCP server (separate process)
     server.py      # Starlette MCP HTTP server
     tools.py       # MCP tool definitions (submit, approve, reject, modify, status)
-  tests/           # 763 unit tests across 19 test files
-  systemd/         # studio-orchestrator.service, studio-mcp.service
+    resources.py   # MCP resource handlers (bundles, capabilities)
+  tests/           # 763 unit tests across 28 test files
+  systemd/         # studio-orchestrator.service
 pyproject.toml     # Python 3.12, hatchling build
 settings.json      # All runtime configuration
 ```
@@ -150,12 +153,20 @@ Test mode uses `NoopWorkerRunner` (no bubblewrap needed) and in-memory/temp-file
 | test_github.py | GitHubClient, issue creation, comment parsing |
 | test_qa.py | QA verification worker |
 | test_developer.py | Developer worker |
+| test_bundler.py | Bundler agent: idea → proposal + DAG |
 | test_proxy.py | Egress proxy |
 | test_mcp.py | MCP server + RPC client |
 | test_ops.py | Stall detection, escalation, recall, health |
 | test_security.py | Token hardening, subset check, secret store, audit log |
 | test_reconciler.py | Crash recovery |
 | test_scheduler.py | Periodic dispatch |
+| test_capability.py | op_descriptor parsing, is_subset checking |
+| test_cli.py | CLI argument parsing and output formatting |
+| test_db.py | Connection pool, transaction handling |
+| test_expression.py | Artifact property expression evaluator |
+| test_fixtures.py | Test fixture validation |
+| test_main.py | Orchestrator subsystem wiring, HTTP endpoints |
+| test_models.py | Pydantic model validation |
 | test_visualizer.py | Mermaid rendering |
 | test_reducers.py | Reduce functions |
 | test_worker.py | Worker base class |
