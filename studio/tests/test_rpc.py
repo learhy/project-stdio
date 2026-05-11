@@ -1,6 +1,7 @@
 """Tests for rpc.py — JSON-RPC dispatcher, handlers, connection manager."""
 import asyncio
 import json
+import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -476,11 +477,13 @@ class TestConnectionManager:
 
     @pytest.mark.asyncio
     async def test_auth_valid_token_binds_worker(self, conn_mgr, db_mock):
+        import time
         db_mock.fetch_one.return_value = {
             "id": "w1",
             "bundle_id": "b1",
             "node_id": "n1",
             "token": "sec-ret",
+            "token_expires_at": int(time.time()) + 900,
             "manifest_json": json.dumps({
                 "grants": {"rpc": {"methods": ["worker.*", "cap.*"]}}
             }),
@@ -631,7 +634,8 @@ class TestEdgeCases:
         writer.drain = AsyncMock()
         db_mock.fetch_one.return_value = {
             "id": "w1", "bundle_id": "b1", "node_id": "n1",
-            "token": "t", "manifest_json": '{"grants":{"rpc":{"methods":["worker.*"]}}}',
+            "token": "t", "token_expires_at": int(time.time()) + 900,
+            "manifest_json": '{"grants":{"rpc":{"methods":["worker.*"]}}}',
         }
 
         await conn_mgr._handle_connection(reader, writer)

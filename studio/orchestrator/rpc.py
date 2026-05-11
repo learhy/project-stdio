@@ -605,6 +605,7 @@ class RpcHandlers:
                 binding.manifest_cache = json.loads(row["manifest_json"])
 
         if binding.manifest_cache is None:
+            await self._audit_cap_check(binding, op_descriptor, False)
             return {"allowed": False, "capability_id": None}
 
         # Use the pure check_op function — need to import the model
@@ -612,10 +613,21 @@ class RpcHandlers:
         try:
             manifest = CapabilityManifest.model_validate(binding.manifest_cache)
         except Exception:
+            await self._audit_cap_check(binding, op_descriptor, False)
             return {"allowed": False, "capability_id": None}
 
         allowed, _ = check_op(op_descriptor, manifest)
+        await self._audit_cap_check(binding, op_descriptor, allowed)
         return {"allowed": allowed, "capability_id": None}
+
+    async def _audit_cap_check(self, binding: WorkerBinding, op: str, allowed: bool) -> None:
+        await self.db.execute(
+            "INSERT INTO capability_checks (worker_id, bundle_id, requested_op, result, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (binding.worker_id, binding.bundle_id, op,
+             "allowed" if allowed else "denied", self.now()),
+        )
+        await self.db.conn.commit()
 
     # ── mcp.* handlers (system surface, no capability check) ────────────────
     # Called by the MCP server process over the trusted Unix socket.
@@ -954,9 +966,9 @@ class RpcHandlers:
         if value is None:
             return _make_error(-32010, f"secret_not_found: {name}", req_id=req_id)
 
-        # Audit trail
+        # Audit trail: both DB audit_log and file-based credential-use log
         grant = matching[0]
-        audit_line = json.dumps({
+        audit_payload = {
             "worker_id": binding.worker_id,
             "bundle_id": binding.bundle_id,
             "task_id": binding.node_id,
@@ -964,11 +976,18 @@ class RpcHandlers:
             "purpose": grant.get("purpose", "custom"),
             "method": "secrets.fetch",
             "timestamp": self.now(),
-        })
+        }
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("secret_access", "secret", name, json.dumps(audit_payload), self.now()),
+        )
+        await self.db.conn.commit()
+
         audit_dir = Path("memory/audit")
         audit_dir.mkdir(parents=True, exist_ok=True)
         with open(audit_dir / "credential-use.jsonl", "a") as f:
-            f.write(audit_line + "\n")
+            f.write(json.dumps(audit_payload) + "\n")
 
         return _make_result({
             "value": value,
@@ -1032,6 +1051,16 @@ class ConnectionManager:
         binding.writer.write(data)
         await binding.writer.drain()
 
+    async def _audit_security(self, event_type: str, subject_type: str,
+                               subject_id: str, payload: dict) -> None:
+        import time
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (event_type, subject_type, subject_id, json.dumps(payload), int(time.time())),
+        )
+        await self.db.conn.commit()
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Handle a new Unix socket connection — authenticate via token (worker) or role (system)."""
         binding: WorkerBinding | SystemBinding | None = None
@@ -1082,12 +1111,25 @@ class ConnectionManager:
 
             # Validate token and bind to worker
             row = await self.db.fetch_one(
-                "SELECT id, bundle_id, node_id, token, manifest_json FROM workers WHERE token = ?",
+                "SELECT id, bundle_id, node_id, token, token_expires_at, manifest_json FROM workers WHERE token = ?",
                 (token,),
             )
             if row is None:
+                await self._audit_security("worker_auth_failure", "worker", "",
+                                          {"reason": "invalid_token", "token_prefix": token[:8]})
                 writer.write((json.dumps(_make_error(
                     CAPABILITY_DENIED, "Invalid or expired worker token", req_id=auth_msg.get("id")
+                )) + "\n").encode())
+                await writer.drain()
+                return
+
+            # Check token expiry
+            token_expires_at = row["token_expires_at"]
+            if token_expires_at is not None and self.handlers.now() > token_expires_at:
+                await self._audit_security("worker_auth_failure", "worker", row["id"],
+                                          {"reason": "token_expired", "expires_at": token_expires_at})
+                writer.write((json.dumps(_make_error(
+                    CAPABILITY_DENIED, "Worker token expired", req_id=auth_msg.get("id")
                 )) + "\n").encode())
                 await writer.drain()
                 return

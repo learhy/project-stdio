@@ -49,6 +49,7 @@ from .approval import (
     cooldown_seconds,
     MandatoryReviewTrigger,
 )
+from .artifact import SecretStore
 from .ops import OpsTooling
 from .notify import Notifier
 
@@ -78,6 +79,7 @@ class Orchestrator:
         self._last_poll_time: datetime | None = None
         self.ops: OpsTooling | None = None
         self._ops_task: asyncio.Task | None = None
+        self._secret_store: "SecretStore | None" = None
         self._running = False
 
     async def _on_bundler_report(self, bundle_id: str, proposal: dict) -> None:
@@ -403,16 +405,28 @@ class Orchestrator:
         self.handlers.set_on_qa_pass(self._on_qa_pass)
         self.handlers.set_on_qa_fail(self._on_qa_fail)
 
+        # 3.5. Secret store (hybrid file+env, Bundle 3.4)
+        self._secret_store = SecretStore(
+            self.settings.secrets_config,
+            memory_root=cfg.memory_root,
+        )
+        self.handlers.set_secret_store(self._secret_store)
+        logger.info("Secret store initialized (memory_root=%s)", cfg.memory_root)
+
         # 4. Worker runner (use noop for testing if bwrap unavailable)
         if os.environ.get("STUDIO_TEST_MODE") == "1":
             from .runner import NoopWorkerRunner
-            self.runner = NoopWorkerRunner(self.db)
+            self.runner = NoopWorkerRunner(
+                self.db,
+                token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
+            )
             logger.info("Test mode: using NoopWorkerRunner")
         else:
             self.runner = LocalBwrapWorkerRunner(
                 self.db,
                 cfg.socket_path,
                 egress_proxy=self.settings.egress_proxy,
+                token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
             )
 
         # 5. Executor
@@ -716,6 +730,17 @@ class Orchestrator:
             except Exception:
                 pass
 
+    # ── Security audit helper ───────────────────────────────────────────
+
+    async def _audit_security(self, event_type: str, subject_type: str,
+                               subject_id: str, payload: dict) -> None:
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (event_type, subject_type, subject_id, json.dumps(payload), int(time.time())),
+        )
+        await self.db.conn.commit()
+
     # ── Worker session ─────────────────────────────────────────────────────
 
     async def _serve_worker(
@@ -745,16 +770,38 @@ class Orchestrator:
             return
 
         row = await self.db.fetch_one(
-            "SELECT id, bundle_id, node_id, token, manifest_json FROM workers WHERE token = ?",
+            "SELECT id, bundle_id, node_id, token, token_expires_at, manifest_json FROM workers WHERE token = ?",
             (token,),
         )
         if row is None:
+            await self._audit_security("worker_auth_failure", "worker", "",
+                                      {"reason": "invalid_token", "token_prefix": token[:8]})
             writer.write(
                 (
                     json.dumps(
                         _make_error(
                             CAPABILITY_DENIED,
                             "Invalid or expired worker token",
+                            req_id=req_id,
+                        )
+                    )
+                    + "\n"
+                ).encode()
+            )
+            await writer.drain()
+            return
+
+        # Check token expiry
+        token_expires_at = row["token_expires_at"]
+        if token_expires_at is not None and int(time.time()) > token_expires_at:
+            await self._audit_security("worker_auth_failure", "worker", row["id"],
+                                      {"reason": "token_expired", "expires_at": token_expires_at})
+            writer.write(
+                (
+                    json.dumps(
+                        _make_error(
+                            CAPABILITY_DENIED,
+                            "Worker token expired",
                             req_id=req_id,
                         )
                     )
@@ -1231,6 +1278,149 @@ async def _cli_health(app: Orchestrator, params: dict) -> dict:
     }
 
 
+async def _cli_audit(app: Orchestrator, params: dict) -> dict:
+    """Report capability grants, usage, and over-granting for a bundle (Bundle 3.4)."""
+    bundle_id = params.get("bundle_id", "")
+    if not bundle_id:
+        return {"error": "bundle_id is required"}
+
+    # Fetch bundle proposal with capability manifest
+    bundle_row = await app.db.fetch_one(
+        "SELECT proposal_json, state FROM bundles WHERE id = ?", (bundle_id,)
+    )
+    if bundle_row is None:
+        return {"error": f"Bundle {bundle_id} not found"}
+
+    proposal = json.loads(bundle_row["proposal_json"] or "{}")
+    cap_raw = proposal.get("capability_manifest", {})
+
+    # Collect granted capabilities
+    grants_summary: dict[str, list[str]] = {}
+    if cap_raw:
+        grants = cap_raw.get("grants", {})
+        fs = grants.get("filesystem", {})
+        if fs.get("reads"):
+            grants_summary["filesystem.reads"] = [r["path"] for r in fs["reads"]]
+        if fs.get("writes"):
+            grants_summary["filesystem.writes"] = [w["path"] for w in fs["writes"]]
+        net = grants.get("network", {})
+        if net.get("egress"):
+            grants_summary["network.egress"] = [
+                f"{e.get('destination','')}:{e.get('ports','*')}" for e in net["egress"]
+            ]
+        proc = grants.get("process", {})
+        if proc.get("exec"):
+            grants_summary["process.exec"] = [e["binary"] for e in proc["exec"]]
+        secrets_g = grants.get("secrets", [])
+        if secrets_g:
+            grants_summary["secrets"] = [s["name"] for s in secrets_g]
+        rpc_g = grants.get("rpc", {})
+        if rpc_g.get("methods"):
+            grants_summary["rpc.methods"] = rpc_g["methods"]
+
+    # Fetch capability checks for this bundle
+    checks = await app.db.fetch_all(
+        "SELECT requested_op, result FROM capability_checks WHERE bundle_id = ?",
+        (bundle_id,),
+    )
+    used_ops = set()
+    denied_ops: list[str] = []
+    for c in checks:
+        if c["result"] == "allowed":
+            used_ops.add(c["requested_op"])
+        else:
+            denied_ops.append(c["requested_op"])
+
+    # Fetch secret accesses for this bundle
+    secret_rows = await app.db.fetch_all(
+        "SELECT payload_json FROM audit_log WHERE event_type = ? AND subject_type = ? "
+        "AND json_extract(payload_json, '$.bundle_id') = ?",
+        ("secret_access", "secret", bundle_id),
+    )
+    used_secrets: list[str] = []
+    for sr in secret_rows:
+        try:
+            p = json.loads(sr["payload_json"] or "{}")
+            if p.get("secret_name"):
+                used_secrets.append(p["secret_name"])
+        except Exception:
+            pass
+
+    # Classify grants: used vs unused
+    used_grants: list[str] = []
+    unused_grants: list[str] = []
+    for category, items in grants_summary.items():
+        for item in items:
+            label = f"{category}:{item}"
+            if category == "secrets" and item in used_secrets:
+                used_grants.append(label)
+            elif any(item in op or op in item for op in used_ops):
+                used_grants.append(label)
+            else:
+                unused_grants.append(label)
+
+    # Over-granted: grants that were never used
+    over_granted = unused_grants if unused_grants else []
+
+    return {
+        "bundle_id": bundle_id,
+        "state": bundle_row["state"],
+        "granted": grants_summary,
+        "used_grants": used_grants,
+        "unused_grants": unused_grants,
+        "over_granted": over_granted,
+        "denied_operations": denied_ops,
+        "used_secrets": used_secrets,
+    }
+
+
+async def _cli_rotate_secret(app: Orchestrator, params: dict) -> dict:
+    """Rotate a secret: invalidate old, provision new, audit log (Bundle 3.4)."""
+    name = params.get("name", "")
+    if not name:
+        return {"error": "name is required"}
+
+    if app._secret_store is None:
+        return {"error": "Secret store not configured"}
+
+    # Check which workers previously fetched this secret
+    old_access_rows = await app.db.fetch_all(
+        "SELECT payload_json FROM audit_log WHERE event_type = ? AND subject_id = ?",
+        ("secret_access", name),
+    )
+    affected_workers: list[str] = []
+    for row in old_access_rows:
+        try:
+            p = json.loads(row["payload_json"] or "{}")
+            wid = p.get("worker_id", "")
+            if wid and wid not in affected_workers:
+                affected_workers.append(wid)
+        except Exception:
+            pass
+
+    new_value, error = app._secret_store.rotate(name)
+    if error:
+        return {"error": error}
+
+    # Audit log the rotation
+    now = int(time.time())
+    await app.db.execute(
+        "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("secret_rotated", "secret", name,
+         json.dumps({"affected_workers": affected_workers, "rotated_at": now}),
+         now),
+    )
+    await app.db.conn.commit()
+
+    return {
+        "secret": name,
+        "rotated": True,
+        "affected_workers": affected_workers,
+        "message": f"Secret '{name}' rotated. {len(affected_workers)} worker(s) previously accessed old value.",
+    }
+
+
 _CLI_HANDLERS = {
     "studio.submit": _cli_submit,
     "studio.approve": _cli_approve,
@@ -1243,6 +1433,8 @@ _CLI_HANDLERS = {
     "studio.calibration_report": _cli_calibration_report,
     "studio.recall": _cli_recall,
     "studio.health": _cli_health,
+    "studio.audit": _cli_audit,
+    "studio.rotate_secret": _cli_rotate_secret,
 }
 
 

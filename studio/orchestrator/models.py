@@ -214,6 +214,7 @@ class TaskSpec(BaseModel):
     outputs: dict[str, Any] = Field(default_factory=dict)
     success_criteria: list[dict[str, Any]] = Field(default_factory=list)
     retry_policy: dict[str, Any] = Field(default_factory=lambda: {"max_attempts": 1, "backoff": "immediate"})
+    capability_manifest: dict[str, Any] | None = None
 
 
 class DAGNode(BaseModel):
@@ -687,11 +688,12 @@ class SecretsConfigEntry(BaseModel):
 
 
 class OpsSettings(BaseModel):
-    """Operational tooling configuration (Bundle 3.3)."""
+    """Operational tooling configuration (Bundle 3.3, extended in 3.4)."""
     stall_threshold_hours: int = 8
     escalation_days: list[int] = Field(default_factory=lambda: [5, 10, 21])
     recall_window_hours: int = 48
     acting_soon_hours: int = 12
+    worker_token_expiry_minutes: int = 15
 
 
 class Settings(BaseModel):

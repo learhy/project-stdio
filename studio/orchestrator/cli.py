@@ -186,6 +186,88 @@ async def cmd_recall(bundle_id: str) -> int:
     return 0
 
 
+async def cmd_audit(bundle_id: str) -> int:
+    """Audit capability grants and usage for a bundle (Bundle 3.4)."""
+    resp = await _send_rpc(_get_socket_path(), "studio.audit",
+                           {"bundle_id": bundle_id})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    if "error" in data:
+        print(f"Error: {data['error']}", file=sys.stderr)
+        return 1
+
+    print(f"Bundle: {data.get('bundle_id', bundle_id)}")
+    print(f"State: {data.get('state', 'unknown')}")
+    print()
+
+    granted = data.get("granted", {})
+    if granted:
+        print("Granted capabilities:")
+        for category, items in granted.items():
+            print(f"  {category}:")
+            for item in items:
+                print(f"    - {item}")
+    else:
+        print("No capability manifest found in bundle proposal.")
+
+    print()
+    used = data.get("used_grants", [])
+    if used:
+        print(f"Used grants ({len(used)}):")
+        for g in used:
+            print(f"  - {g}")
+
+    unused = data.get("unused_grants", [])
+    if unused:
+        print(f"\nUnused grants ({len(unused)}):")
+        for g in unused:
+            print(f"  - {g}")
+
+    over = data.get("over_granted", [])
+    if over:
+        print(f"\nOver-granted ({len(over)}):")
+        for g in over:
+            print(f"  - {g}")
+
+    denied = data.get("denied_operations", [])
+    if denied:
+        print(f"\nDenied operations ({len(denied)}):")
+        for d in denied:
+            print(f"  - {d}")
+
+    used_secrets = data.get("used_secrets", [])
+    if used_secrets:
+        print(f"\nSecrets accessed ({len(used_secrets)}):")
+        for s in used_secrets:
+            print(f"  - {s}")
+    return 0
+
+
+async def cmd_rotate_secret(name: str) -> int:
+    """Rotate a secret (Bundle 3.4)."""
+    resp = await _send_rpc(_get_socket_path(), "studio.rotate_secret",
+                           {"name": name})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    if "error" in data:
+        print(f"Error: {data['error']}", file=sys.stderr)
+        return 1
+
+    print(f"Secret '{data.get('secret', name)}' rotated.")
+    affected = data.get("affected_workers", [])
+    if affected:
+        print(f"Workers that previously accessed old value: {', '.join(affected)}")
+    else:
+        print("No workers had previously accessed this secret.")
+    return 0
+
+
 async def cmd_health() -> int:
     """Show orchestrator health dashboard."""
     resp = await _send_rpc(_get_socket_path(), "studio.health", {})
@@ -278,6 +360,14 @@ def main() -> None:
     # health
     sub.add_parser("health", help="Show orchestrator health dashboard")
 
+    # audit (Bundle 3.4)
+    p_audit = sub.add_parser("audit", help="Audit capability grants and usage for a bundle")
+    p_audit.add_argument("bundle_id", help="Bundle ID (ULID)")
+
+    # rotate-secret (Bundle 3.4)
+    p_rotate = sub.add_parser("rotate-secret", help="Rotate a secret")
+    p_rotate.add_argument("name", help="Secret name")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -306,6 +396,10 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_recall(args.bundle_id))
         elif args.command == "health":
             exit_code = loop.run_until_complete(cmd_health())
+        elif args.command == "audit":
+            exit_code = loop.run_until_complete(cmd_audit(args.bundle_id))
+        elif args.command == "rotate-secret":
+            exit_code = loop.run_until_complete(cmd_rotate_secret(args.name))
         else:
             print(f"Unknown command: {args.command}", file=sys.stderr)
             exit_code = 1
