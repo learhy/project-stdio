@@ -594,12 +594,27 @@ class TestApprovalMatrixStub:
     """Tests for the approval matrix evaluator stub in Bundle 2.4."""
 
     @pytest.mark.asyncio
-    async def test_evaluate_approval_matrix_stub_always_approves(self):
+    async def test_evaluate_approval_matrix_auto_tier_approves(self):
+        """With low complexity and low risk, auto-approve fires transition 4."""
         from studio.orchestrator.main import Orchestrator
 
         app = Orchestrator()
         app.sm = MagicMock()
         app.sm.transition_4_approve_from_review = AsyncMock()
+        app.sm._github_post_mirror = AsyncMock()
+        app.sm.now = MagicMock(return_value=1700000000)
+
+        # Mock DB to return a low-score bundle proposal
+        app.db = MagicMock()
+        app.db.fetch_one = AsyncMock(return_value={
+            "proposal_json": json.dumps({"proposal": {"complexity_score": 1, "risk_score": 1}}),
+            "complexity_score": 1,
+            "risk_score": 1,
+            "tier": "full_review",
+        })
+        app.db.execute = AsyncMock()
+        app.db.conn = MagicMock()
+        app.db.conn.commit = AsyncMock()
 
         # Mock executor with artifact store
         app.executor = MagicMock()
@@ -608,7 +623,7 @@ class TestApprovalMatrixStub:
         await app._evaluate_approval_matrix("01TEST", {})
 
         app.sm.transition_4_approve_from_review.assert_called_once_with(
-            "01TEST", "approval-matrix-stub"
+            "01TEST", "approval-matrix"
         )
 
 

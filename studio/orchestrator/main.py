@@ -43,7 +43,12 @@ from .runner import LocalBwrapWorkerRunner
 from .executor import DagExecutor
 from .scheduler import Scheduler
 from .reconciler import Reconciler
-from .models import Settings, OrchestratorSettings
+from .models import Settings, OrchestratorSettings, ApprovalTier
+from .approval import (
+    evaluate_approval_matrix,
+    cooldown_seconds,
+    MandatoryReviewTrigger,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,14 +108,10 @@ class Orchestrator:
         await self._evaluate_approval_matrix(bundle_id, merged)
 
     async def _evaluate_approval_matrix(self, bundle_id: str, merged_findings: dict) -> None:
-        """Approval matrix evaluator — stub for Bundle 2.4, always approves.
-
-        Bundle 2.5 replaces this with the full evaluator from the spec pseudocode.
-        """
+        """Evaluate the approval matrix with the real deterministic evaluator."""
         # Publish merged review-summary artifact
         try:
             if self.executor and self.executor._artifact_store:
-                import json
                 await self.executor._artifact_store.publish(
                     namespace="bundle",
                     name="review-summary",
@@ -122,9 +123,115 @@ class Orchestrator:
         except Exception as exc:
             logger.warning("Failed to publish review-summary artifact: %s", exc)
 
-        # Stub: always approve
-        await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix-stub")
-        logger.info("Approval matrix stub approved bundle %s", bundle_id)
+        # Fetch bundle proposal data
+        row = await self.db.fetch_one(
+            "SELECT proposal_json, complexity_score, risk_score, tier FROM bundles WHERE id = ?",
+            (bundle_id,),
+        )
+        if row is None:
+            logger.error("Bundle %s not found for approval matrix evaluation", bundle_id)
+            return
+
+        proposal_json = json.loads(row["proposal_json"] or "{}")
+        bundler_proposal_raw = proposal_json.get("proposal", {})
+
+        # Build a lightweight BundleProposal for the evaluator
+        from .models import BundleProposal
+        proposal = BundleProposal(
+            complexity_score=row["complexity_score"] or 0,
+            risk_score=row["risk_score"] or 0,
+            estimated_loc=bundler_proposal_raw.get("estimated_loc", 0),
+            estimated_duration_seconds=bundler_proposal_raw.get("estimated_duration_seconds", 0),
+            estimated_worker_count=bundler_proposal_raw.get("estimated_worker_count", 0),
+            estimated_tokens=bundler_proposal_raw.get("estimated_tokens", 0),
+            target=bundler_proposal_raw.get("target", "control-plane"),
+            concerns=bundler_proposal_raw.get("concerns", []),
+            requirements_summary=bundler_proposal_raw.get("requirements_summary", ""),
+            rfc_summary=bundler_proposal_raw.get("rfc_summary", ""),
+            implementation_plan=bundler_proposal_raw.get("implementation_plan", ""),
+            irreversible=bundler_proposal_raw.get("irreversible", False),
+            tags=bundler_proposal_raw.get("tags", []),
+            self_escalation_tier=bundler_proposal_raw.get("self_escalation_tier"),
+        )
+
+        # Parse mandatory-review triggers from settings
+        triggers = []
+        for t in self.settings.approval.mandatory_review_triggers:
+            triggers.append(MandatoryReviewTrigger(
+                name=t.get("name", ""),
+                description=t.get("description", ""),
+                path_patterns=t.get("path_patterns", []),
+                tag_matches=t.get("tag_matches", []),
+                min_files_deleted=t.get("min_files_deleted"),
+                target_new_repo=t.get("target_new_repo", False),
+            ))
+
+        decision = evaluate_approval_matrix(
+            proposal=proposal,
+            findings=merged_findings,
+            triggers=triggers,
+            bundle_tags=proposal.tags,
+            self_escalation_tier=proposal.self_escalation_tier,
+            settings=self.settings.approval,
+        )
+
+        tier_str = decision.tier.value
+        logger.info("Approval matrix for bundle %s: tier=%s auto_ship=%s reason=%s",
+                     bundle_id, tier_str, decision.auto_ship, decision.reason)
+
+        # Write tier & decision into the database
+        now = self.sm.now()
+        await self.db.execute(
+            "UPDATE bundles SET tier = ? WHERE id = ?",
+            (tier_str, bundle_id),
+        )
+        await self.db.execute(
+            "INSERT INTO approval_decisions (bundle_id, decision, surface, actor, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (bundle_id, tier_str, "system", "approval-matrix", now),
+        )
+        await self.db.conn.commit()
+
+        # Tier-based surface behavior
+        if decision.tier == ApprovalTier.FULL_REVIEW_COOLDOWN:
+            # Set cooldown_until based on reversibility
+            duration = cooldown_seconds(
+                proposal.irreversible,
+                self.settings.approval.cooldown_hours_reversible,
+                self.settings.approval.cooldown_hours_irreversible,
+            )
+            cooldown_until = now + duration
+            await self.db.execute(
+                "UPDATE bundles SET cooldown_until = ? WHERE id = ?",
+                (cooldown_until, bundle_id),
+            )
+            await self.db.conn.commit()
+            logger.info("Cooldown set for bundle %s until %s (%ss)",
+                        bundle_id, cooldown_until, duration)
+            await self.sm._github_post_mirror(
+                bundle_id,
+                f"Approval matrix: {tier_str}. Cooldown until <t:{cooldown_until}>. Reason: {decision.reason}",
+            )
+        elif decision.tier == ApprovalTier.AUTO:
+            # Auto-approve: fire transition 4 automatically
+            await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix")
+            await self.sm._github_post_mirror(
+                bundle_id,
+                f"Auto-approved (tier: {tier_str}, reason: {decision.reason})",
+            )
+        elif decision.tier == ApprovalTier.AUTO_NOTIFY:
+            # Auto-notify: fire transition 4 automatically, post notification
+            await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix")
+            await self.sm._github_post_mirror(
+                bundle_id,
+                f"Auto-approved with notification (tier: {tier_str}, reason: {decision.reason})",
+            )
+        else:
+            # SUMMARY, FULL_REVIEW: notify PM, wait for explicit decision
+            await self.sm._github_post_mirror(
+                bundle_id,
+                f"Approval matrix: {tier_str}. Awaiting reviewer decision. Reason: {decision.reason}",
+            )
 
     # ── Post-execution QA callbacks ────────────────────────────────────────
 

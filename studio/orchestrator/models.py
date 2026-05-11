@@ -455,6 +455,9 @@ class BundleProposal(BaseModel):
     rfc_summary: str = ""
     implementation_plan: str = ""
     task_dag: dict = Field(default_factory=dict)
+    irreversible: bool = False
+    tags: list[str] = Field(default_factory=list)
+    self_escalation_tier: str | None = None
 
 
 # ── Review track models ───────────────────────────────────────────────────────
@@ -628,6 +631,20 @@ class GitHubSettings(BaseModel):
     repo: str = ""
 
 
+class ApprovalSettings(BaseModel):
+    """Approval matrix configuration (Bundle 2.5)."""
+    low_complexity_max: int = 3
+    med_complexity_max: int = 6
+    low_risk_max: int = 2
+    med_risk_max: int = 5
+    summary_tier_default_action: str = "hold"
+    default_action_overrides: dict[str, str] = Field(default_factory=dict)
+    summary_timeout_hours: int = 4
+    cooldown_hours_reversible: int = 1
+    cooldown_hours_irreversible: int = 24
+    mandatory_review_triggers: list[dict] = Field(default_factory=list)
+
+
 class SecretsConfigEntry(BaseModel):
     name: str
     env_var: str
@@ -643,6 +660,7 @@ class Settings(BaseModel):
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)
+    approval: ApprovalSettings = Field(default_factory=ApprovalSettings)
     secrets_config: list[SecretsConfigEntry] = Field(default_factory=list)
 
 
