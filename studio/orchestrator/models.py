@@ -686,6 +686,14 @@ class SecretsConfigEntry(BaseModel):
     purpose: str = "custom"
 
 
+class OpsSettings(BaseModel):
+    """Operational tooling configuration (Bundle 3.3)."""
+    stall_threshold_hours: int = 8
+    escalation_days: list[int] = Field(default_factory=lambda: [5, 10, 21])
+    recall_window_hours: int = 48
+    acting_soon_hours: int = 12
+
+
 class Settings(BaseModel):
     kernel: KernelSettings = Field(default_factory=KernelSettings)
     egress_proxy: EgressProxySettings = Field(default_factory=EgressProxySettings)
@@ -696,6 +704,7 @@ class Settings(BaseModel):
     mcp: McpSettings = Field(default_factory=McpSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)
     approval: ApprovalSettings = Field(default_factory=ApprovalSettings)
+    ops: OpsSettings = Field(default_factory=OpsSettings)
     secrets_config: list[SecretsConfigEntry] = Field(default_factory=list)
 
 

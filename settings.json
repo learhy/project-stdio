@@ -91,5 +91,11 @@
       }
     ]
   },
+  "ops": {
+    "stall_threshold_hours": 8,
+    "escalation_days": [5, 10, 21],
+    "recall_window_hours": 48,
+    "acting_soon_hours": 12
+  },
   "secrets_config": []
 }
