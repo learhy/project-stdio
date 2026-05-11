@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .models import WorkerState, CapabilityManifest, EgressProxySettings
+from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings
 
 if TYPE_CHECKING:
     from .db import Database
@@ -340,7 +340,12 @@ class LocalBwrapWorkerRunner:
 
 
 class NoopWorkerRunner:
-    """Runner that spawns no actual process — used for testing."""
+    """Runner that spawns no actual process — used for testing.
+
+    Simulates immediate worker completion: after the executor marks the node
+    RUNNING, a background task updates both the worker and node to terminal
+    states so the bundle lifecycle can proceed.
+    """
 
     def __init__(self, db: "Database", token_expiry_minutes: int = 15) -> None:
         self.db = db
@@ -357,12 +362,13 @@ class NoopWorkerRunner:
     ) -> WorkerSpawnResult:
         token = _generate_token()
         token_expires_at = int(time.time()) + (self.token_expiry_minutes * 60)
+        now = int(time.time())
         await self.db.execute(
             "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, manifest_json, state, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (worker_id, bundle_id, node_id, token, token_expires_at,
              json.dumps(manifest.model_dump()),
-             WorkerState.PENDING, int(time.time())),
+             WorkerState.PENDING, now),
         )
         await self.db.conn.commit()
 
@@ -372,8 +378,34 @@ class NoopWorkerRunner:
             ("worker_spawned", "worker", worker_id,
              json.dumps({"bundle_id": bundle_id, "node_id": node_id,
                          "token_expires_at": token_expires_at}),
-             int(time.time())),
+             now),
         )
         await self.db.conn.commit()
-        # Return a result with no real process
+
+        # Simulate immediate worker completion in the background.
+        # The executor marks the node RUNNING after spawn_worker returns,
+        # so we schedule this to run after a brief yield.
+        loop = asyncio.get_running_loop()
+        loop.create_task(self._simulate_completion(worker_id, bundle_id, node_id))
+
         return WorkerSpawnResult(worker_id, token, node_id, None)  # type: ignore[arg-type]
+
+    async def _simulate_completion(
+        self, worker_id: str, bundle_id: str, node_id: str
+    ) -> None:
+        """Simulate a worker completing its work immediately."""
+        # Yield to let the executor mark the node as RUNNING first
+        await asyncio.sleep(0)
+        now = int(time.time())
+        node_db_id = f"{bundle_id}:{node_id}"
+        await self.db.execute(
+            "UPDATE workers SET state = ?, ended_at = ? WHERE id = ?",
+            (WorkerState.COMPLETE, now, worker_id),
+        )
+        await self.db.execute(
+            "UPDATE dag_nodes SET state = ?, ended_at = ?, output_json = ? WHERE id = ?",
+            (NodeState.COMPLETED, now,
+             json.dumps({"outcome": "success", "summary": "noop simulation"}),
+             node_db_id),
+        )
+        await self.db.conn.commit()

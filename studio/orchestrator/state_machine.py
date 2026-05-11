@@ -378,9 +378,9 @@ class BundleStateMachine:
                 "cancel_remaining_on_quorum": False,
             })
             await self.db.execute(
-                "INSERT INTO dag_nodes (id, bundle_id, node_id, kind, aggregator_config_json, state) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (aggregator_id, bundle_id, "review-aggregator", "aggregator", aggregator_config, "pending"),
+                "INSERT INTO dag_nodes (id, bundle_id, node_id, kind, spec_json, aggregator_config_json, state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (aggregator_id, bundle_id, "review-aggregator", "aggregator", "{}", aggregator_config, "pending"),
             )
 
             # Edges: review tracks -> aggregator

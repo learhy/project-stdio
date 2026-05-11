@@ -56,6 +56,10 @@ class Scheduler:
                 await self.executor.process_artifact_events()
                 for bundle_id in list(self.executor._active_bundles):
                     await self.executor._dispatch_ready(bundle_id)
+                    # Also check bundle completion each tick so bundles whose
+                    # nodes were completed externally (e.g. NoopWorkerRunner)
+                    # can transition to VERIFYING / COMPLETE.
+                    await self.executor._check_bundle_completion(bundle_id)
             except Exception:
                 pass
             await asyncio.sleep(self.dispatch_interval)

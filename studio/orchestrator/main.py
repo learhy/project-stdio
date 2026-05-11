@@ -245,7 +245,7 @@ class Orchestrator:
 
     async def _on_bundle_verifying(self, bundle_id: str) -> None:
         """Callback from DagExecutor when bundle enters VERIFYING state. Spawns QA worker."""
-        await self._spawn_qa_worker(bundle_id)
+        await _spawn_qa_worker(self, bundle_id)
 
     async def _on_qa_pass(self, bundle_id: str, verification_report: dict) -> None:
         """QA verification passed: fire Transition 17 (VERIFYING -> COMPLETE)."""
@@ -944,8 +944,71 @@ async def _cli_submit(app: Orchestrator, params: dict) -> dict:
     return {"bundle_id": bundle_id}
 
 
+async def _synthesize_test_bundler_proposal(app: Orchestrator, bundle_id: str, bundle_input: dict) -> None:
+    """In test mode, produce a synthetic bundler proposal without calling an LLM."""
+    now = int(time.time())
+    idea = bundle_input.get("idea", "unspecified")
+
+    worker_id = f"bundler_{bundle_id}"
+    await app.db.execute(
+        "INSERT INTO workers (id, bundle_id, node_id, token, manifest_json, state, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (worker_id, bundle_id, "bundler", "test-mode-noop", "{}", "complete", now),
+    )
+    await app.db.conn.commit()
+
+    # Synthetic bundler output (matches the real bundler's JSON output format)
+    bundler_output = {
+        "complexity_score": 2,
+        "risk_score": 1,
+        "complexity_factors": {
+            "loc": 2, "components_touched": 1, "worker_tasks": 1,
+            "cross_component_coordination": 0, "new_abstractions": 0,
+        },
+        "risk_factors": {
+            "security_sensitive_paths": 0, "data_handling_paths": 0,
+            "public_interfaces": 1, "reversibility": 1,
+            "production_proximity": 0, "net_new_dependencies": 0,
+        },
+        "estimated_loc": 50,
+        "estimated_duration_seconds": 60,
+        "estimated_worker_count": 1,
+        "estimated_tokens": 500,
+        "target": "control-plane",
+        "target_rationale": "Test mode synthetic proposal",
+        "concerns": ["Test mode — no real planning performed"],
+        "requirements_summary": f"Implement: {idea}",
+        "rfc_summary": "Minimal Flask app with single route",
+        "implementation_plan": "Create app.py with Flask and single GET / route returning JSON",
+        "task_dag": {
+            "nodes": [{
+                "id": "implement-idea",
+                "kind": "worker",
+                "spec": {
+                    "objective": idea,
+                    "success_criteria": [{"kind": "tests_pass"}],
+                },
+            }],
+            "edges": [],
+        },
+    }
+
+    # Simulate the same flow as a real bundler worker calling final_report
+    try:
+        await app._on_bundler_report(bundle_id, bundler_output)
+        logger.info("Test mode: synthesized bundler proposal for bundle %s", bundle_id)
+    except Exception:
+        logger.exception("Test mode: bundler synthesis failed for bundle %s", bundle_id)
+        raise
+
+
 async def _spawn_bundler(app: Orchestrator, bundle_id: str, bundle_input: dict) -> None:
     """Spawn a bundler worker as a standalone process (not part of a DAG)."""
+    if os.environ.get("STUDIO_TEST_MODE") == "1":
+        # In test mode, produce a synthetic proposal immediately
+        await _synthesize_test_bundler_proposal(app, bundle_id, bundle_input)
+        return
+
     worker_id = f"bundler_{bundle_id}"
     token = secrets.token_hex(32)
     now = int(time.time())
@@ -1000,6 +1063,10 @@ async def _spawn_bundler(app: Orchestrator, bundle_id: str, bundle_input: dict) 
 
 async def _spawn_qa_worker(app: Orchestrator, bundle_id: str) -> None:
     """Spawn a post-execution QA verification worker as a standalone process."""
+    if os.environ.get("STUDIO_TEST_MODE") == "1":
+        await app._on_qa_pass(bundle_id, {"test_mode": True})
+        return
+
     worker_id = f"qa_{bundle_id}"
     token = secrets.token_hex(32)
     now = int(time.time())

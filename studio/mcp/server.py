@@ -29,12 +29,19 @@ async def _fetchall(db: aiosqlite.Connection, sql: str, params: tuple | None = N
 
 
 def _load_settings() -> dict:
-    """Load settings.json and return the mcp section."""
+    """Load settings.json and return the mcp section, overlaid with env vars."""
     settings_path = Path("settings.json")
-    if not settings_path.exists():
-        return {"port": 8080, "bearer_token": ""}
-    data = json.loads(settings_path.read_text())
-    return data.get("mcp", {"port": 8080, "bearer_token": ""})
+    if settings_path.exists():
+        data = json.loads(settings_path.read_text())
+        base = data.get("mcp", {})
+    else:
+        base = {}
+    settings = {"port": 8080, "bearer_token": "", **base}
+    if os.environ.get("STUDIO_MCP_PORT"):
+        settings["port"] = int(os.environ["STUDIO_MCP_PORT"])
+    if os.environ.get("STUDIO_MCP_TOKEN"):
+        settings["bearer_token"] = os.environ["STUDIO_MCP_TOKEN"]
+    return settings
 
 
 def _make_token_verifier(expected_token: str):
