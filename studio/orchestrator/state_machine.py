@@ -11,6 +11,7 @@ import time
 from typing import TYPE_CHECKING
 
 from .models import BundleState
+from .approval import CooldownError
 
 if TYPE_CHECKING:
     from .db import Database
@@ -491,11 +492,20 @@ class BundleStateMachine:
 
     async def transition_4_approve_from_review(self, bundle_id: str, approved_by: str) -> None:
         """Transition 4: IN_REVIEW -> APPROVED. Trigger: review_approved."""
-        row = await self.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+        row = await self.db.fetch_one(
+            "SELECT state, cooldown_until FROM bundles WHERE id = ?", (bundle_id,)
+        )
         if row is None:
             raise IllegalTransitionError("(missing)", BundleState.APPROVED, f"Bundle {bundle_id} not found")
         current = row["state"]
         _check_legal(current, BundleState.APPROVED)
+
+        # Cooldown enforcement
+        cooldown_until = row.get("cooldown_until")
+        if cooldown_until is not None:
+            now_ts = self.now()
+            if now_ts < cooldown_until:
+                raise CooldownError(bundle_id, cooldown_until)
 
         now = self.now()
         async with self.db.transaction():

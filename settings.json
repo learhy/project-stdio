@@ -53,5 +53,43 @@
     "owner": "",
     "repo": ""
   },
+  "approval": {
+    "low_complexity_max": 3,
+    "med_complexity_max": 6,
+    "low_risk_max": 2,
+    "med_risk_max": 5,
+    "summary_tier_default_action": "hold",
+    "default_action_overrides": {},
+    "summary_timeout_hours": 4,
+    "cooldown_hours_reversible": 1,
+    "cooldown_hours_irreversible": 24,
+    "mandatory_review_triggers": [
+      {
+        "name": "agents_md",
+        "description": "Any modification to AGENTS.md files",
+        "path_patterns": ["**/AGENTS.md"]
+      },
+      {
+        "name": "capability_manifest",
+        "description": "Modification to capability manifest itself",
+        "path_patterns": ["**/capability*.json", "**/capability*.yaml"]
+      },
+      {
+        "name": "control_plane",
+        "description": "Control-plane code or settings.json",
+        "path_patterns": ["studio/orchestrator/**", "settings.json"]
+      },
+      {
+        "name": "ci_config",
+        "description": "GitHub Actions workflows or CI config",
+        "path_patterns": [".github/workflows/**", "**/.github/workflows/**"]
+      },
+      {
+        "name": "new_repo",
+        "description": "Creating a new product repo is irreversible",
+        "target_new_repo": true
+      }
+    ]
+  },
   "secrets_config": []
 }

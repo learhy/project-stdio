@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS bundles (
   approved_by TEXT,
   completed_at INTEGER,
   outcome_json TEXT,
-  github_issue_number INTEGER
+  github_issue_number INTEGER,
+  irreversible INTEGER NOT NULL DEFAULT 0,
+  cooldown_until INTEGER,
+  tags TEXT
 );
 
 CREATE TABLE IF NOT EXISTS workers (
@@ -300,6 +303,23 @@ class Database:
             )
             await self._conn.commit()
             logger.info("Applied migration v3: github_issue_number column added")
+
+        if current_version < 4:
+            # Migration v4: approval matrix columns + drop legacy schema_version table.
+            await self._conn.execute(
+                "ALTER TABLE bundles ADD COLUMN irreversible INTEGER NOT NULL DEFAULT 0"
+            )
+            await self._conn.execute(
+                "ALTER TABLE bundles ADD COLUMN cooldown_until INTEGER"
+            )
+            await self._conn.execute(
+                "ALTER TABLE bundles ADD COLUMN tags TEXT"
+            )
+            await self._conn.execute(
+                "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (4,)
+            )
+            await self._conn.commit()
+            logger.info("Applied migration v4: approval matrix columns added")
 
     async def close(self) -> None:
         if self._conn:
