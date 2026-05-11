@@ -45,10 +45,8 @@ uv pip install -e ".[dev]"
 uv run python -m pytest studio/tests/ -v
 
 # Start orchestrator (test mode — no bwrap needed)
-# Env var mapping: CLI uses STUDIO_SOCKET_PATH, but the orchestrator
-# reads its path from STUDIO_ORCH_SOCKET_PATH. Both must match.
 STUDIO_TEST_MODE=1 STUDIO_ORCH_DB_PATH=/tmp/studio.db \
-  STUDIO_ORCH_SOCKET_PATH=/tmp/studio.sock \
+  STUDIO_SOCKET_PATH=/tmp/studio.sock \
   uv run python -m studio.orchestrator.main &
 
 # Submit a bundle (bundler path — idea only, via JSON file)
@@ -80,7 +78,6 @@ STUDIO_SOCKET_PATH=/tmp/studio.sock \
   STUDIO_MCP_PORT=8080 \
   STUDIO_MCP_TOKEN=test-token-123 \
   uv run python -m studio.mcp.server &
-```
 ```
 
 ## CLI command reference
@@ -458,7 +455,7 @@ From `git clone` to a working hello-world bundle:
 4. **Test in test mode first:**
    ```bash
    STUDIO_TEST_MODE=1 STUDIO_ORCH_DB_PATH=/tmp/studio.db \
-     STUDIO_ORCH_SOCKET_PATH=/tmp/studio.sock \
+     STUDIO_SOCKET_PATH=/tmp/studio.sock \
      uv run python -m studio.orchestrator.main &
    STUDIO_SOCKET_PATH=/tmp/studio.sock \
      uv run python -m studio.orchestrator.cli submit \

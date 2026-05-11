@@ -1545,8 +1545,8 @@ def main() -> None:
     # Allow environment variable overrides for testing
     if os.environ.get("STUDIO_ORCH_DB_PATH"):
         settings.orchestrator.db_path = os.environ["STUDIO_ORCH_DB_PATH"]
-    if os.environ.get("STUDIO_ORCH_SOCKET_PATH"):
-        settings.orchestrator.socket_path = os.environ["STUDIO_ORCH_SOCKET_PATH"]
+    if os.environ.get("STUDIO_SOCKET_PATH"):
+        settings.orchestrator.socket_path = os.environ["STUDIO_SOCKET_PATH"]
 
     app = Orchestrator(settings)
 
