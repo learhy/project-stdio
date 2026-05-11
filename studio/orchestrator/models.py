@@ -662,6 +662,7 @@ class GitHubSettings(BaseModel):
     app_id: str = ""
     installation_id: str = ""
     private_key_path: str = ""
+    webhook_secret: str = ""
     poll_interval_seconds: int = 60
     owner: str = ""
     repo: str = ""

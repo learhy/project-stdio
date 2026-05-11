@@ -1,6 +1,6 @@
 # Studio — Agent Orchestration System
 
-**Phase 1 Kernel**: Python async orchestrator that accepts bundle submissions, drives linear DAGs of worker tasks under bubblewrap isolation, enforces capability-based security, and writes outcomes to SQLite.
+Python async orchestrator that accepts bundle submissions, drives worker tasks through a DAG executor under bubblewrap isolation, enforces capability-based security, and writes outcomes to SQLite.
 
 ## Overview
 
@@ -9,95 +9,347 @@ Studio is an agent orchestration system where a central orchestrator process man
 ### Architecture
 
 ```
-CLI (studio submit/approve/reject/...)
+CLI / MCP / GitHub Issues (approval surfaces)
   │
   ▼
 Orchestrator (single process)
-  ├── SQLite (WAL mode) — single writer
-  ├── BundleStateMachine — 8 transitions, 12 states
-  ├── RpcDispatcher — 14 worker RPC methods
-  ├── ConnectionManager — Unix socket, token auth
-  ├── LinearDagExecutor — FIFO dispatch, concurrency cap
-  ├── LocalBwrapWorkerRunner — bubblewrap isolation
+  ├── SQLite (WAL mode) — single writer, schema v6
+  ├── BundleStateMachine — 20+ transitions, 12 states
+  ├── RpcDispatcher — worker RPC + CLI handlers
+  ├── ConnectionManager — Unix socket, token auth with expiry
+  ├── DagExecutor — worker / gate / aggregator nodes + dynamic expansion
+  ├── LocalBwrapWorkerRunner — bubblewrap isolation + egress proxy
+  ├── GitHubClient — JWT App auth, issue management, rate-limit aware
   ├── Scheduler — periodic dispatch + heartbeat checks
-  └── Reconciler — kill-all crash recovery
+  ├── Reconciler — kill-all crash recovery
+  ├── SecretStore — hybrid file/env secrets with rotation
+  ├── OpsTooling — stall detection, escalation ladder, recall
+  ├── Starlette HTTP server — /health + /github/webhook (HMAC-SHA256)
+  └── Calibration loop — estimated-vs-actual scoring outcomes
   │
   ▼
 Worker subprocesses (bubblewrap containers)
-  └── Developer worker — invokes coding agent, reports results
+  ├── Bundler — idea → proposal + DAG
+  ├── Developer — implements tasks in git worktrees
+  ├── Review (adversarial / security / QA) — pre-execution review tracks
+  └── QA — post-execution verification
 ```
 
-### Quick start
+## Quick start
 
 ```bash
 # Install
-.venv/bin/pip install -e ".[dev]"
+uv pip install -e ".[dev]"
 
 # Run tests
-.venv/bin/python -m pytest studio/tests/ -v
+uv run python -m pytest studio/tests/ -v
 
 # Start orchestrator (test mode — no bwrap needed)
 STUDIO_TEST_MODE=1 STUDIO_ORCH_DB_PATH=/tmp/studio.db \
   STUDIO_ORCH_SOCKET_PATH=/tmp/studio.sock \
-  .venv/bin/python -m studio.orchestrator.main &
+  uv run python -m studio.orchestrator.main &
 
-# Submit a bundle
+# Submit a bundle (bundler path — idea only)
 STUDIO_SOCKET_PATH=/tmp/studio.sock \
-  .venv/bin/python -m studio.orchestrator.cli submit \
+  uv run python -m studio.orchestrator.cli submit \
+  -i "Add a logout button to the settings page"
+
+# Submit a bundle (kernel-direct path — pre-built DAG)
+STUDIO_SOCKET_PATH=/tmp/studio.sock \
+  uv run python -m studio.orchestrator.cli submit \
   studio/tests/fixtures/hello-world.json
 
 # Approve it
 STUDIO_SOCKET_PATH=/tmp/studio.sock \
-  .venv/bin/python -m studio.orchestrator.cli approve <bundle-id>
+  uv run python -m studio.orchestrator.cli approve <bundle-id>
 
 # Run acceptance tests
 STUDIO_TEST_MODE=1 bash studio/tests/acceptance.sh
 ```
 
-## CLI commands
+## CLI command reference
+
+### Bundle management
 
 | Command | Description |
 |---------|-------------|
-| `studio submit <file>` | Submit a bundle JSON file |
+| `studio submit -i "<idea>"` | Submit a bundle idea (bundler path) |
+| `studio submit <file.json>` | Submit a bundle JSON file (kernel-direct path) |
 | `studio approve <id>` | Approve and start execution |
 | `studio reject <id> [-r reason]` | Reject a proposed bundle |
 | `studio list [--state s] [--json]` | List non-terminal bundles |
 | `studio show <id>` | Show bundle detail and node states |
-| `studio show-worker <id>` | Show worker detail and recent logs |
 | `studio kill <id>` | Kill a running bundle's workers |
+
+### Review deck
+
+| Command | Description |
+|---------|-------------|
+| `studio deck` | Show the review deck (bundles awaiting decision) |
+| `studio deck --mine` | Show escalated bundles assigned to the current PM |
+| `studio pending` | Show pending proposals not yet in review |
+
+### Operational
+
+| Command | Description |
+|---------|-------------|
 | `studio status` | Show orchestrator health and active bundles |
+| `studio health` | Detailed health: uptime, DB status, state/tier breakdowns, recent errors |
+| `studio show-worker <id>` | Show worker detail, phase, heartbeat age, recent logs |
+| `studio recall <bundle-id>` | Recall a completed bundle within 48h (creates reversal bundle) |
 
-## Bundle lifecycle (Phase 1)
+### Security
+
+| Command | Description |
+|---------|-------------|
+| `studio audit <bundle-id>` | Report capability grants: used, unused, over-granted, denied operations |
+| `studio rotate-secret <name>` | Rotate a secret: invalidate old value, provision new, audit affected workers |
+
+### Calibration
+
+| Command | Description |
+|---------|-------------|
+| `studio calibration-report` | Print estimated-vs-actual scoring outcomes from memory/calibration/ |
+
+## Configuration reference (settings.json)
+
+All keys and their defaults:
+
+### `kernel`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `mode` | `true` | Kernel mode (Phase 1 direct approve/reject) |
+
+### `orchestrator`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `socket_path` | `/run/studio/orchestrator.sock` | Unix socket for worker + CLI connections |
+| `db_path` | `/var/lib/studio/state.db` | SQLite database path |
+| `socket_permissions` | `"0660"` | Unix socket permissions |
+| `socket_owner` | `"studio:studio"` | Unix socket owner |
+| `memory_root` | `"memory/"` | Root for secrets, calibration, notifications, post-mortems |
+| `http_port` | `7810` | HTTP listener port for health + GitHub webhook |
+
+### `worker`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `global_concurrency` | `4` | Max concurrent worker subprocesses |
+| `default_timeout_hours.small` | `2` | Timeout for small tasks |
+| `default_timeout_hours.medium` | `4` | Timeout for medium tasks |
+| `default_timeout_hours.large` | `8` | Timeout for large tasks |
+| `heartbeat_max_interval_minutes` | `60` | Max time between heartbeats |
+| `heartbeat_timeout_multiplier` | `2.0` | Multiplier on expected duration for timeout |
+
+### `egress_proxy`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Enable per-worker egress proxy |
+| `socket_dir` | `/run/studio` | Directory for proxy Unix sockets |
+| `connect_timeout_seconds` | `10` | Upstream connect timeout |
+| `read_timeout_seconds` | `30` | Upstream read timeout |
+
+### `github`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable GitHub Issues integration |
+| `app_id` | `""` | GitHub App ID |
+| `installation_id` | `""` | GitHub App installation ID |
+| `private_key_path` | `""` | Path to App private key PEM file |
+| `webhook_secret` | `""` | HMAC-SHA256 secret for webhook validation (empty = skip validation) |
+| `poll_interval_seconds` | `60` | Seconds between issue comment polls |
+| `owner` | `""` | GitHub repo owner |
+| `repo` | `""` | GitHub repo name |
+
+### `approval`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `low_complexity_max` | `3` | Max score for "low" complexity |
+| `med_complexity_max` | `6` | Max score for "medium" complexity |
+| `low_risk_max` | `2` | Max score for "low" risk |
+| `med_risk_max` | `5` | Max score for "medium" risk |
+| `summary_tier_default_action` | `"hold"` | Default for summary tier: "hold" or "ship" |
+| `default_action_overrides` | `{}` | Per-bundle-type action overrides |
+| `summary_timeout_hours` | `4` | Hours before summary-tier auto-action |
+| `cooldown_hours_reversible` | `1` | Cooldown for reversible changes |
+| `cooldown_hours_irreversible` | `24` | Cooldown for irreversible changes |
+| `mandatory_review_triggers` | `[...]` | Triggers that force full_review (path patterns, tag matches, new repo) |
+
+### `ops`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `stall_threshold_hours` | `8` | Hours without progress before stall escalation |
+| `escalation_days` | `[5, 10, 21]` | Days before escalating parked/cooldown bundles |
+| `recall_window_hours` | `48` | Hours after completion that recall is allowed |
+| `acting_soon_hours` | `12` | Hours before auto-action to notify PM |
+| `worker_token_expiry_minutes` | `15` | Worker token lifetime in minutes |
+
+### `artifacts`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `inline_threshold_bytes` | `4096` | Max bytes to inline in DB (larger → file store) |
+| `global_storage_cap_bytes` | `50000000000` | 50 GB global artifact cap |
+| `per_bundle_cap_bytes` | `1000000000` | 1 GB per-bundle cap |
+| `per_artifact_limit_bytes` | `100000000` | 100 MB per-artifact limit |
+| `task_retention_seconds` | `86400` | 24h task-scoped artifact retention |
+| `bundle_retention_complete_seconds` | `604800` | 7 days for completed bundle artifacts |
+| `bundle_retention_failed_seconds` | `2592000` | 30 days for failed bundle artifacts |
+
+### `mcp`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `port` | `8080` | MCP HTTP server port |
+| `bearer_token` | `""` | MCP auth bearer token |
+
+### `ollama_cloud`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `base_url` | `"https://ollama.com/api"` | Ollama Cloud API base URL |
+| `health_check_interval_seconds` | `30` | Health check interval |
+| `grace_window_minutes` | `5` | Grace period after health check failure |
+
+### `secrets_config`
+Array of `{"name": "...", "env_var": "...", "purpose": "..."}` entries. Purpose must be one of: `github_auth`, `llm_api`, `registry_auth`, `custom`.
+
+## Bundle lifecycle
 
 ```
-(none) ──1──► PROPOSED ──1a──► APPROVED ──6──► IN_PROGRESS
-                  │                                │
-                  └──1b──► REJECTED                ├──9──► VERIFYING ──17──► COMPLETE
-                                                   │        │
-                                                   │        └──19──► FAILED
-                                                   │
-                                                   └──25──► FAILED
+(none) ──1──► PROPOSED ──→ IN_REVIEW ──4──► APPROVED ──6──► IN_PROGRESS
+                 │  ↑          │                    │
+                 │  └──3───────┘                    ├──8──► PAUSED
+                 │  (modify)                        │
+                 └──1b──► REJECTED                  ├──9──► VERIFYING ──17──► COMPLETE
+                                                    │        │
+                                                    │        └──19──► FAILED
+                                                    │
+                                                    ├──25──► FAILED (execution)
+                                                    └──7──► FAILED (timeout)
 ```
+
+Approval matrix tier assignment (from complexity + risk scores):
+
+| Complexity | Risk | Tier |
+|------------|------|------|
+| Low (≤3) | Low (≤2) | auto |
+| Low (≤3) | Med (≤5) | auto_notify |
+| Low-Med | Low-Med | summary |
+| High (>6) | — | full_review |
+| — | High (>5) | full_review |
+| Irreversible | Any | full_review_cooldown |
 
 ## Capability manifest
 
 Every bundle includes a capability manifest declaring its required grants:
 
-- **filesystem**: read/write paths with recursive and create flags
-- **network**: egress destinations and ports, ingress, DNS
+- **filesystem**: read/write paths with recursive and create flags, working tree config
+- **network**: egress destinations/ports/protocols, ingress, DNS
 - **process**: allowed binaries, subtask spawning limits
 - **secrets**: named secrets (env, file, or RPC delivery)
 - **rpc**: allowed RPC methods and artifact access patterns
 - **resources**: CPU, memory, disk, wall time, LLM token budgets
 
-Capability enforcement uses `op_descriptor` format: `<category>.<operation>[:<resource>]` with algorithmic `is_subset()` checking.
+Capability enforcement uses `op_descriptor` format: `<category>.<operation>[:<resource>]` with algorithmic `is_subset()` checking across all 6 categories. DAG expansion nodes are validated as subsets of the bundle-level approved grant.
+
+## Approval surfaces
+
+All three surfaces write to the same state machine and are not differentially trusted:
+
+- **CLI**: `studio approve/reject <id>` — lowest latency, always available
+- **GitHub Issues**: `/approve`, `/reject <reason>`, `/modify <instructions>` comments — async, structured, permanent record
+- **MCP**: Claude Desktop tool interface — human must click to confirm each action
+
+## Operational runbook
+
+### Starting the orchestrator
+
+```bash
+# Production (systemd)
+systemctl start studio-orchestrator
+
+# Manual (foreground)
+uv run python -m studio.orchestrator.main
+```
+
+The orchestrator uses `sd_notify` (Type=notify) to signal readiness. systemd starts `studio-mcp` only after the orchestrator is accepting connections.
+
+### Monitoring
+
+```bash
+# Quick status
+studio status
+
+# Detailed health (includes DB ok, state/tier breakdowns, recent errors)
+studio health
+
+# Watch bundle state
+watch -n 5 'STUDIO_SOCKET_PATH=/run/studio/orchestrator.sock studio list'
+
+# Check calibration drift
+studio calibration-report
+```
+
+Key health indicators from `studio health`:
+- `orchestrator_ok` / `db_ok`: should both be `true`
+- `stalled_bundles > 0`: investigate immediately
+- `recent_errors`: look for patterns in failure messages
+
+### Responding to escalations
+
+Escalated bundles appear in `studio deck --mine`. They follow a 5/10/21-day ladder:
+
+1. **Day 0**: Bundler places bundle in review deck
+2. **Day 5**: First escalation — PM notified via GitHub issue comment
+3. **Day 10**: Second escalation — issue labeled `escalated`, PM pinged
+4. **Day 21**: Final escalation — issue labeled `escalated:critical`
+
+For each escalated bundle, the PM should:
+1. Run `studio show <bundle-id>` to review the proposal
+2. Run `studio audit <bundle-id>` to review capability grants
+3. Decide: `/approve`, `/reject <reason>`, or `/modify <instructions>`
+
+### Responding to stalled bundles
+
+A stalled bundle is one in `IN_PROGRESS` with no heartbeat for > 8 hours.
+
+1. Run `studio show <bundle-id>` to check node states
+2. Run `studio show-worker <worker-id>` for each stuck worker
+3. If the worker is unreachable, run `studio kill <bundle-id>` to terminate
+4. If the worker is stuck in a phase, consider recalling or manually intervening
+
+### Rotating secrets
+
+```bash
+studio rotate-secret llm_api
+```
+
+This:
+1. Generates a new `token_hex(32)` value
+2. Writes it to `memory/secrets/<name>.json`
+3. Audit-logs the rotation with affected worker IDs
+4. Workers that previously fetched the old value continue using it until they re-fetch (push notification via `worker.inject_context` is deferred)
+
+After rotation, restart any running workers that depend on the rotated secret.
+
+### Database backup
+
+```bash
+# The SQLite file is safe to copy while the orchestrator is running (WAL mode)
+cp /var/lib/studio/state.db /backup/state-$(date -I).db
+```
+
+### Upgrading the orchestrator
+
+1. Pull new code
+2. Stop orchestrator: `systemctl stop studio-orchestrator`
+3. The new code may include schema migrations — they run automatically on `connect()`
+4. If the on-disk DB is ahead of the code version, `DatabaseVersionError` is raised and the process exits. Upgrade the code, not the DB.
+5. Start orchestrator: `systemctl start studio-orchestrator`
 
 ## Requirements
 
 - Python 3.12+
 - SQLite 3.x
 - bubblewrap (for production worker isolation)
-- Linux (Unix domain sockets, bwrap)
+- Linux (Unix domain sockets, bwrap, network namespaces)
 
 ## License
 

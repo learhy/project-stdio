@@ -7,6 +7,8 @@ token-authenticated) and CLI/admin requests (one-shot JSON-RPC).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -76,7 +78,7 @@ class Orchestrator:
         self._http_task: asyncio.Task | None = None
         self.github_client: "GitHubClient | None" = None
         self._processed_comment_ids: set[int] = set()
-        self._last_poll_time: datetime | None = None
+        self._bundle_last_polled: dict[str, datetime] = {}
         self.ops: OpsTooling | None = None
         self._ops_task: asyncio.Task | None = None
         self._secret_store: "SecretStore | None" = None
@@ -562,8 +564,20 @@ class Orchestrator:
                 return JSONResponse({"status": "ok"})
 
             async def webhook(request) -> JSONResponse:
+                # Validate HMAC-SHA256 signature if webhook secret is configured
+                webhook_secret = self.settings.github.webhook_secret
+                if webhook_secret:
+                    sig_header = request.headers.get("X-Hub-Signature-256", "")
+                    if not sig_header.startswith("sha256="):
+                        return JSONResponse({"error": "unsigned"}, status_code=401)
+                    body_bytes = await request.body()
+                    expected = "sha256=" + hmac.new(
+                        webhook_secret.encode(), body_bytes, hashlib.sha256
+                    ).hexdigest()
+                    if not hmac.compare_digest(sig_header, expected):
+                        return JSONResponse({"error": "invalid signature"}, status_code=401)
                 try:
-                    body = await request.json()
+                    body = await request.json() if not webhook_secret else json.loads(body_bytes)
                     event = request.headers.get("X-GitHub-Event", "")
                     if event == "issue_comment":
                         action = body.get("action", "")
@@ -624,19 +638,21 @@ class Orchestrator:
         if self.github_client is None:
             return
         rows = await self.db.fetch_all(
-            "SELECT id, github_issue_number FROM bundles WHERE github_issue_number IS NOT NULL AND state IN (?, ?)",
-            (BundleState.IN_REVIEW, BundleState.PROPOSED),
+            "SELECT id, github_issue_number FROM bundles "
+            "WHERE github_issue_number IS NOT NULL AND state IN (?, ?)",
+            (BundleState.IN_REVIEW, BundleState.PAUSED),
         )
         for row in rows:
             bundle_id = row["id"]
             issue_number = row["github_issue_number"]
-            comments = await self.github_client.get_comments_since(issue_number, self._last_poll_time)
+            since = self._bundle_last_polled.get(bundle_id)
+            comments = await self.github_client.get_comments_since(issue_number, since)
             for comment in comments:
                 comment_id = comment.get("id", 0)
                 if comment_id not in self._processed_comment_ids:
                     await self._process_comment(bundle_id, comment)
                     self._processed_comment_ids.add(comment_id)
-        self._last_poll_time = datetime.now(timezone.utc)
+            self._bundle_last_polled[bundle_id] = datetime.now(timezone.utc)
 
     async def _resolve_bundle_by_issue(self, issue_number: int) -> str | None:
         row = await self.db.fetch_one(
