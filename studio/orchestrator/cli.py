@@ -169,6 +169,53 @@ async def cmd_kill(bundle_id: str) -> int:
     return 0
 
 
+async def cmd_recall(bundle_id: str) -> int:
+    """Recall a COMPLETE bundle within the 48h window."""
+    resp = await _send_rpc(_get_socket_path(), "studio.recall",
+                           {"bundle_id": bundle_id})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    result = resp.get("result", {})
+    if result.get("eligible"):
+        print(f"Recall eligible. Submit a rollback bundle with idea: "
+              f"'Revert bundle {bundle_id}'")
+    else:
+        print(f"Not eligible: {result.get('reason', 'unknown')}")
+    return 0
+
+
+async def cmd_health() -> int:
+    """Show orchestrator health dashboard."""
+    resp = await _send_rpc(_get_socket_path(), "studio.health", {})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    print(f"Orchestrator: {'OK' if data.get('orchestrator_ok') else 'DEGRADED'}")
+    print(f"DB:           {'OK' if data.get('db_ok') else 'FAILED'}")
+    print(f"Uptime:       {data.get('uptime_seconds', 0):.0f}s")
+    print(f"Bundles:      {data.get('total_bundles', 0)} total, "
+          f"{data.get('active_bundles', 0)} active, "
+          f"{data.get('stalled_bundles', 0)} stalled")
+    print(f"By state:     {data.get('by_state', {})}")
+    print(f"By tier:      {data.get('by_tier', {})}")
+
+    cal = data.get('calibration', {})
+    if cal and 'pass_rate' in cal:
+        print(f"Calibration:  {cal.get('total_outcomes', 0)} outcomes, "
+              f"pass rate {cal.get('pass_rate', 'N/A')}")
+
+    errors = data.get('recent_errors', [])
+    if errors:
+        print("Recent errors:")
+        for e in errors[-5:]:
+            print(f"  - {e}")
+    return 0
+
+
 async def cmd_status() -> int:
     """Show orchestrator status."""
     resp = await _send_rpc(_get_socket_path(), "studio.status", {})
@@ -224,6 +271,13 @@ def main() -> None:
     # status
     sub.add_parser("status", help="Show orchestrator status")
 
+    # recall
+    p_recall = sub.add_parser("recall", help="Recall a COMPLETE bundle (48h window)")
+    p_recall.add_argument("bundle_id", help="Bundle ID (ULID)")
+
+    # health
+    sub.add_parser("health", help="Show orchestrator health dashboard")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -248,6 +302,10 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_kill(args.bundle_id))
         elif args.command == "status":
             exit_code = loop.run_until_complete(cmd_status())
+        elif args.command == "recall":
+            exit_code = loop.run_until_complete(cmd_recall(args.bundle_id))
+        elif args.command == "health":
+            exit_code = loop.run_until_complete(cmd_health())
         else:
             print(f"Unknown command: {args.command}", file=sys.stderr)
             exit_code = 1

@@ -49,6 +49,8 @@ from .approval import (
     cooldown_seconds,
     MandatoryReviewTrigger,
 )
+from .ops import OpsTooling
+from .notify import Notifier
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,8 @@ class Orchestrator:
         self.github_client: "GitHubClient | None" = None
         self._processed_comment_ids: set[int] = set()
         self._last_poll_time: datetime | None = None
+        self.ops: OpsTooling | None = None
+        self._ops_task: asyncio.Task | None = None
         self._running = False
 
     async def _on_bundler_report(self, bundle_id: str, proposal: dict) -> None:
@@ -451,6 +455,23 @@ class Orchestrator:
             self._poll_task = asyncio.create_task(self._poll_github_issues())
             logger.info("HTTP server + GitHub polling started")
 
+        # 9.6. Initialize ops tooling (Bundle 3.3)
+        post_comment = None
+        if self.github_client is not None:
+            async def _post(issue_number: int, body: str) -> None:
+                await self.github_client.post_comment(issue_number, body)
+            post_comment = _post
+
+        notifier = Notifier(
+            log_path=Path(self.settings.orchestrator.memory_root) / "notifications" / "log.jsonl",
+            post_comment=post_comment,
+        )
+        self.ops = OpsTooling(self.db.conn, self.settings.ops, notifier)
+        self._ops_task = asyncio.create_task(self._run_ops_loop())
+        logger.info("Ops tooling started (stall threshold=%dh, recall=%dh)",
+                     self.settings.ops.stall_threshold_hours,
+                     self.settings.ops.recall_window_hours)
+
         # 10. Bind socket (single socket for workers + CLI)
         socket_path = cfg.socket_path
         if os.path.exists(socket_path):
@@ -472,6 +493,13 @@ class Orchestrator:
             self._poll_task.cancel()
             try:
                 await self._poll_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._ops_task:
+            self._ops_task.cancel()
+            try:
+                await self._ops_task
             except asyncio.CancelledError:
                 pass
 
@@ -566,6 +594,17 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("GitHub poll error: %s", exc)
             await asyncio.sleep(interval)
+
+    async def _run_ops_loop(self) -> None:
+        """Periodic ops checks: stall detection, escalation, acting-soon (Bundle 3.3)."""
+        while self._running:
+            try:
+                await self.ops.check_stalled_bundles()
+                await self.ops.check_escalation_ladder()
+                await self.ops.check_acting_soon()
+            except Exception as exc:
+                logger.warning("Ops loop error: %s", exc)
+            await asyncio.sleep(60)
 
     async def _poll_once(self) -> None:
         if self.github_client is None:
@@ -1128,6 +1167,30 @@ async def _cli_status(app: Orchestrator, params: dict) -> dict:
     }
 
 
+async def _cli_recall(app: Orchestrator, params: dict) -> dict:
+    bundle_id = params.get("bundle_id", "")
+    if not bundle_id:
+        return {"error": "bundle_id is required"}
+
+    return await app.ops.recall_bundle(bundle_id, actor="cli")
+
+
+async def _cli_health(app: Orchestrator, params: dict) -> dict:
+    snap = await app.ops.get_health()
+    return {
+        "orchestrator_ok": snap.orchestrator_ok,
+        "db_ok": snap.db_ok,
+        "uptime_seconds": snap.uptime_seconds,
+        "total_bundles": snap.total_bundles,
+        "active_bundles": snap.active_bundles,
+        "stalled_bundles": snap.stalled_bundles,
+        "by_state": snap.by_state,
+        "by_tier": snap.by_tier,
+        "calibration": snap.calibration,
+        "recent_errors": snap.recent_errors,
+    }
+
+
 _CLI_HANDLERS = {
     "studio.submit": _cli_submit,
     "studio.approve": _cli_approve,
@@ -1138,6 +1201,8 @@ _CLI_HANDLERS = {
     "studio.kill": _cli_kill,
     "studio.status": _cli_status,
     "studio.calibration_report": _cli_calibration_report,
+    "studio.recall": _cli_recall,
+    "studio.health": _cli_health,
 }
 
 
