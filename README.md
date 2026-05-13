@@ -38,7 +38,8 @@ Worker subprocesses (bubblewrap containers)
 ## Quick start
 
 ```bash
-# Install
+# Create virtual environment and install
+uv venv
 uv pip install -e ".[dev]"
 
 # Run tests
@@ -89,9 +90,30 @@ STUDIO_SOCKET_PATH=/tmp/studio.sock \
 | `studio submit <file.json>` | Submit a bundle JSON file (bundler path if `bundle_input` present, kernel-direct if `task_dag` present) |
 | `studio approve <id>` | Approve and start execution |
 | `studio reject <id> [-r reason]` | Reject a proposed bundle |
-| `studio list [--state s] [--json]` | List non-terminal bundles |
-| `studio show <id>` | Show bundle detail and node states |
+| `studio list [--state s] [--tier t] [--json]` | List non-terminal bundles with tier and age |
+| `studio show <id> [--verbose] [--json]` | Show bundle detail: review deck with complexity, risk, estimates, plan, concerns, DAG status, and recent events |
 | `studio kill <id>` | Kill a running bundle's workers |
+
+Example `studio show` output:
+
+```
+Bundle: 01KRHT91RB58JND8JTN1XWMYBN
+State: in_review (pending_review) — age 5m
+Idea: Build a hello-world app using flask and docker.
+
+Complexity: 2/10    Risk: 1/10    Irreversible: no
+Estimate: 50 loc · 1m 0s · 1 worker(s) · 500 tokens
+Plan: Create app.py with Flask and single GET / route returning JSON
+Concerns: Test mode — no real planning performed
+
+DAG: 5 nodes (0 completed, 0 running, 5 pending)
+
+Recent events:
+  5m ago  bundle_input_received — proposed (idea only)
+  5m ago  bundle_planning_complete — proposed → in_review
+
+Approve: studio approve 01KRHT91RB58JND8JTN1XWMYBN
+```
 
 #### Bundle JSON format
 
@@ -150,6 +172,18 @@ No `task_dag` triggers the bundler path. The orchestrator spawns a bundler worke
 |---------|-------------|
 | `studio status` | Show orchestrator health and active bundles |
 | `studio health` | Detailed health: uptime, DB status, state/tier breakdowns, recent errors |
+
+Example `studio health` output:
+
+```
+Orchestrator: OK | DB: OK | Uptime: 5m 30s
+Bundles: 3 total, 1 in_progress, 2 in_review, 0 stalled
+  By state        By tier
+  in_progress   1  pending_review  2
+  in_review     2  full_review     1
+Calibration: 12 outcomes, pass rate 75%
+Recent errors: (none)
+```
 | `studio show-worker <id>` | Show worker detail, phase, heartbeat age, recent logs |
 | `studio recall <bundle-id>` | Recall a completed bundle within 48h (creates reversal bundle) |
 

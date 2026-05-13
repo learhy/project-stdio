@@ -255,7 +255,7 @@ class TestCliHandlers:
     @pytest.mark.asyncio
     async def test_cli_list(self, app_mock):
         app_mock.db.fetch_all = AsyncMock(return_value=[
-            {"id": "01T", "state": "in_progress", "created_at": 1699999900, "proposal_json": '{"bundle_input":{"idea":"Build"}}'},
+            {"id": "01T", "state": "in_progress", "created_at": 1699999900, "proposal_json": '{"bundle_input":{"idea":"Build"}}', "tier": "full_review", "repo": "control-plane"},
         ])
         result = await _cli_list(app_mock, {})
         assert len(result["bundles"]) == 1
@@ -270,14 +270,14 @@ class TestCliHandlers:
     @pytest.mark.asyncio
     async def test_cli_show(self, app_mock):
         app_mock.db.fetch_one = AsyncMock(return_value={
-            "id": "01TEST", "state": "in_progress", "proposal_json": '{"bundle_input":{"idea":"Test idea"}}',
+            "id": "01TEST", "state": "in_progress", "proposal_json": '{"bundle_input":{"idea":"Test idea"}}', "tier": "full_review",
         })
         app_mock.db.fetch_all = AsyncMock(return_value=[
             {"id": "01TEST:task-1", "node_id": "task-1", "kind": "worker", "state": "completed"},
         ])
         result = await _cli_show(app_mock, {"bundle_id": "01TEST"})
-        assert result["bundle_id"] == "01TEST"
-        assert result["state"] == "in_progress"
+        assert result["bundle"]["id"] == "01TEST"
+        assert result["bundle"]["state"] == "in_progress"
         assert len(result["nodes"]) == 1
 
     @pytest.mark.asyncio
@@ -288,17 +288,22 @@ class TestCliHandlers:
 
     @pytest.mark.asyncio
     async def test_cli_show_worker(self, app_mock):
-        app_mock.db.fetch_one = AsyncMock(return_value={
-            "id": "w1", "bundle_id": "b1", "node_id": "n1",
-            "state": "running", "current_phase": "writing-code",
-            "last_heartbeat": 1699999990,
-        })
+        app_mock.db.fetch_one = AsyncMock(side_effect=[
+            {"id": "w1", "bundle_id": "b1", "node_id": "n1",
+             "state": "running", "current_phase": "writing-code",
+             "last_heartbeat": 1699999990, "created_at": 1699999900,
+             "manifest_json": "{}"},
+            {"spec_json": '{"objective":"Test task"}', "output_json": None},
+        ])
         app_mock.db.fetch_all = AsyncMock(return_value=[
-            {"payload_json": '{"message":"Wrote main.py"}'},
+            {"result": "allowed"},
+            {"result": "allowed"},
+            {"result": "denied"},
         ])
         result = await _cli_show_worker(app_mock, {"worker_id": "w1"})
-        assert result["worker_id"] == "w1"
-        assert result["phase"] == "writing-code"
+        assert result["worker"]["id"] == "w1"
+        assert result["worker"]["current_phase"] == "writing-code"
+        assert result["cap_checks"] == {"allowed": 2, "denied": 1}
 
     @pytest.mark.asyncio
     async def test_cli_kill(self, app_mock):
@@ -309,12 +314,14 @@ class TestCliHandlers:
 
     @pytest.mark.asyncio
     async def test_cli_status(self, app_mock):
-        app_mock.db.fetch_all = AsyncMock(return_value=[
-            {"id": "01T", "state": "in_progress", "proposal_json": '{"bundle_input":{"idea":"Build"}}'},
+        app_mock.db.fetch_one = AsyncMock(side_effect=[
+            {"cnt": 2},  # running workers
+            {"cnt": 1},  # ready nodes
         ])
         result = await _cli_status(app_mock, {})
-        assert result["uptime"] == 0
-        assert len(result["bundles"]) == 1
+        assert "uptime" in result
+        assert result["worker_count"] == 2
+        assert result["queue_depth"] == 1
 
     @pytest.mark.asyncio
     async def test_cli_kill_no_workers(self, app_mock):

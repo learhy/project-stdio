@@ -11,6 +11,15 @@ import os
 import sys
 from typing import Any
 
+from .display import (
+    format_bundle_show,
+    format_bundle_list,
+    format_worker_show,
+    format_health,
+    format_status,
+    format_calibration,
+)
+
 
 async def _send_rpc(socket_path: str, method: str, params: dict[str, Any] | None = None) -> dict:
     """Send a JSON-RPC request over the Unix socket and return the result."""
@@ -85,11 +94,13 @@ async def cmd_reject(bundle_id: str, reason: str = "") -> int:
     return 0
 
 
-async def cmd_list(state: str | None = None, json_output: bool = False) -> int:
+async def cmd_list(state: str | None = None, tier: str | None = None, json_output: bool = False) -> int:
     """List non-terminal bundles."""
     params: dict[str, Any] = {}
     if state:
         params["state"] = state
+    if tier:
+        params["tier"] = tier
 
     resp = await _send_rpc(_get_socket_path(), "studio.list", params)
     if "error" in resp:
@@ -100,16 +111,11 @@ async def cmd_list(state: str | None = None, json_output: bool = False) -> int:
     if json_output:
         print(json.dumps(bundles, indent=2))
     else:
-        if not bundles:
-            print("No bundles found.")
-        else:
-            print(f"{'ID':<28} {'STATE':<14} {'AGE':<8} IDEA")
-            for b in bundles:
-                print(f"{b['id']:<28} {b['state']:<14} {b.get('age', ''):<8} {b.get('idea', '')}")
+        print(format_bundle_list(bundles))
     return 0
 
 
-async def cmd_show(bundle_id: str) -> int:
+async def cmd_show(bundle_id: str, verbose: bool = False, json_output: bool = False) -> int:
     """Show bundle detail."""
     resp = await _send_rpc(_get_socket_path(), "studio.show",
                            {"bundle_id": bundle_id})
@@ -117,18 +123,19 @@ async def cmd_show(bundle_id: str) -> int:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
 
-    data = resp.get("result", {})
-    print(f"Bundle: {data.get('bundle_id', bundle_id)}")
-    print(f"State: {data.get('state', 'unknown')}")
-    if data.get("idea"):
-        print(f"Idea: {data['idea']}")
-    if data.get("nodes"):
-        nodes = data["nodes"]
-        total = len(nodes)
-        completed = sum(1 for n in nodes if n["state"] == "completed")
-        running = sum(1 for n in nodes if n["state"] == "running")
-        pending = sum(1 for n in nodes if n["state"] in ("pending", "ready"))
-        print(f"Nodes: {total} total, {completed} completed, {running} running, {pending} pending")
+    result = resp.get("result", {})
+    if json_output:
+        print(json.dumps(result, indent=2))
+        return 0
+
+    bundle = result.get("bundle", {})
+    proposal = result.get("proposal", {})
+    nodes = result.get("nodes", [])
+    edges = result.get("edges", [])
+    audit_entries = result.get("audit_entries", [])
+    artifacts = result.get("artifacts", [])
+
+    print(format_bundle_show(bundle, proposal, nodes, edges, audit_entries, artifacts, verbose=verbose))
     return 0
 
 
@@ -141,16 +148,11 @@ async def cmd_show_worker(worker_id: str) -> int:
         return 1
 
     data = resp.get("result", {})
-    print(f"Worker:       {data.get('worker_id', worker_id)}")
-    print(f"Bundle:       {data.get('bundle_id', 'unknown')}")
-    print(f"State:        {data.get('state', 'unknown')}")
-    print(f"Phase:        {data.get('phase', 'unknown')}")
-    print(f"Last hb:      {data.get('last_heartbeat_ago', 'unknown')}")
-    logs = data.get("recent_logs", [])
-    if logs:
-        print("Log (last 20 lines):")
-        for log in logs:
-            print(f"  [{log.get('level', 'info')}] {log.get('message', '')}")
+    worker = data.get("worker", {})
+    node = data.get("node")
+    cap_checks = data.get("cap_checks", {})
+
+    print(format_worker_show(worker, node, cap_checks))
     return 0
 
 
@@ -276,25 +278,7 @@ async def cmd_health() -> int:
         return 1
 
     data = resp.get("result", {})
-    print(f"Orchestrator: {'OK' if data.get('orchestrator_ok') else 'DEGRADED'}")
-    print(f"DB:           {'OK' if data.get('db_ok') else 'FAILED'}")
-    print(f"Uptime:       {data.get('uptime_seconds', 0):.0f}s")
-    print(f"Bundles:      {data.get('total_bundles', 0)} total, "
-          f"{data.get('active_bundles', 0)} active, "
-          f"{data.get('stalled_bundles', 0)} stalled")
-    print(f"By state:     {data.get('by_state', {})}")
-    print(f"By tier:      {data.get('by_tier', {})}")
-
-    cal = data.get('calibration', {})
-    if cal and 'pass_rate' in cal:
-        print(f"Calibration:  {cal.get('total_outcomes', 0)} outcomes, "
-              f"pass rate {cal.get('pass_rate', 'N/A')}")
-
-    errors = data.get('recent_errors', [])
-    if errors:
-        print("Recent errors:")
-        for e in errors[-5:]:
-            print(f"  - {e}")
+    print(format_health(data))
     return 0
 
 
@@ -306,11 +290,11 @@ async def cmd_status() -> int:
         return 1
 
     data = resp.get("result", {})
-    if data.get("uptime") is not None:
-        print(f"Orchestrator: running (uptime: {data['uptime']}s)")
-    bundles = data.get("bundles", [])
-    for b in bundles:
-        print(f"{b['id']:<28} {b['state']:<14} {b.get('idea', '')}")
+    print(format_status(
+        uptime=data.get("uptime", 0),
+        worker_count=data.get("worker_count", 0),
+        queue_depth=data.get("queue_depth", 0),
+    ))
     return 0
 
 
@@ -321,20 +305,7 @@ async def cmd_calibration_report() -> int:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
 
-    result = resp.get("result", {})
-    if "message" in result:
-        print(result["message"])
-        return 0
-
-    print(f"Calibration entries: {result.get('total_entries', 0)} total, "
-          f"{result.get('entries_with_divergence', 0)} with divergence")
-    recent = result.get("recent", [])
-    if recent:
-        print("\nRecent entries:")
-        for entry in recent:
-            bundle_id = entry.get("bundle_id", "unknown")
-            print(f"  {bundle_id}: estimated={entry.get('estimated_score', '?')} "
-                  f"actual={entry.get('actual_score', '?')}")
+    print(format_calibration(resp.get("result", {})))
     return 0
 
 
@@ -360,11 +331,14 @@ def main() -> None:
     # list
     p_list = sub.add_parser("list", help="List non-terminal bundles")
     p_list.add_argument("--state", "-s", help="Filter by state")
+    p_list.add_argument("--tier", "-t", help="Filter by tier")
     p_list.add_argument("--json", "-j", action="store_true", help="Machine-readable output")
 
     # show
     p_show = sub.add_parser("show", help="Show bundle detail")
     p_show.add_argument("bundle_id", help="Bundle ID (ULID)")
+    p_show.add_argument("--verbose", "-v", action="store_true", help="Show full detail")
+    p_show.add_argument("--json", "-j", action="store_true", help="Machine-readable output")
 
     # show-worker
     p_sw = sub.add_parser("show-worker", help="Show worker detail")
@@ -410,9 +384,9 @@ def main() -> None:
         elif args.command == "reject":
             exit_code = loop.run_until_complete(cmd_reject(args.bundle_id, args.reason))
         elif args.command == "list":
-            exit_code = loop.run_until_complete(cmd_list(args.state, args.json))
+            exit_code = loop.run_until_complete(cmd_list(args.state, args.tier, args.json))
         elif args.command == "show":
-            exit_code = loop.run_until_complete(cmd_show(args.bundle_id))
+            exit_code = loop.run_until_complete(cmd_show(args.bundle_id, args.verbose, args.json))
         elif args.command == "show-worker":
             exit_code = loop.run_until_complete(cmd_show_worker(args.worker_id))
         elif args.command == "kill":

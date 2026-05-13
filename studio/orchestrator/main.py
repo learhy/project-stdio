@@ -1155,10 +1155,27 @@ async def _cli_calibration_report(app: Orchestrator, params: dict) -> dict:
     # Summarize: per-axis avg divergence
     total = len(entries)
     diverged_count = sum(1 for e in entries if e.get("divergence_threshold_exceeded"))
+    recent = []
+    for e in entries[-10:]:
+        recent.append({
+            "bundle_id": e.get("bundle_id", "unknown"),
+            "estimated": {
+                "loc": e.get("estimated_loc"),
+                "duration_seconds": e.get("estimated_duration_seconds"),
+                "workers": e.get("estimated_worker_count"),
+                "tokens": e.get("estimated_tokens"),
+            },
+            "actual": {
+                "loc": e.get("actual_loc"),
+                "duration_seconds": e.get("actual_duration_seconds"),
+                "workers": e.get("actual_worker_count"),
+                "tokens": e.get("actual_tokens"),
+            },
+        })
     return {
         "total_entries": total,
         "entries_with_divergence": diverged_count,
-        "recent": entries[-10:],
+        "recent": recent,
     }
 
 
@@ -1182,27 +1199,39 @@ async def _cli_reject(app: Orchestrator, params: dict) -> dict:
 
 async def _cli_list(app: Orchestrator, params: dict) -> dict:
     state = params.get("state")
+    tier = params.get("tier")
+    where = []
+    vals: list[str] = []
+
     if state:
-        rows = await app.db.fetch_all(
-            "SELECT id, state, created_at, proposal_json FROM bundles WHERE state = ?",
-            (state,),
-        )
+        where.append("state = ?")
+        vals.append(state)
     else:
-        rows = await app.db.fetch_all(
-            "SELECT id, state, created_at, proposal_json FROM bundles WHERE state NOT IN (?, ?, ?, ?, ?)",
-            ("complete", "failed", "rejected", "parked", "aborted"),
-        )
+        where.append("state NOT IN (?, ?, ?, ?, ?)")
+        vals.extend(("complete", "failed", "rejected", "parked", "aborted"))
+
+    if tier:
+        where.append("tier = ?")
+        vals.append(tier)
+
+    query = f"SELECT id, state, created_at, proposal_json, tier, repo FROM bundles WHERE {' AND '.join(where)}"
+    rows = await app.db.fetch_all(query, tuple(vals))
 
     bundles = []
     for r in rows:
         secs = app.sm.now() - (r["created_at"] or 0)
         age = _format_age(secs)
         proposal = json.loads(r["proposal_json"] or "{}")
+        p = proposal.get("proposal", {})
         bundles.append({
             "id": r["id"],
             "state": r["state"],
+            "tier": r["tier"],
             "age": age,
             "idea": proposal.get("bundle_input", {}).get("idea", ""),
+            "complexity_score": p.get("complexity_score"),
+            "risk_score": p.get("risk_score"),
+            "repo": r["repo"],
         })
     return {"bundles": bundles}
 
@@ -1210,58 +1239,63 @@ async def _cli_list(app: Orchestrator, params: dict) -> dict:
 async def _cli_show(app: Orchestrator, params: dict) -> dict:
     bundle_id = params.get("bundle_id", "")
     row = await app.db.fetch_one(
-        "SELECT id, state, proposal_json FROM bundles WHERE id = ?", (bundle_id,)
+        "SELECT * FROM bundles WHERE id = ?", (bundle_id,)
     )
     if row is None:
         raise ValueError(f"Bundle {bundle_id} not found")
 
     proposal = json.loads(row["proposal_json"] or "{}")
     nodes = await app.db.fetch_all(
-        "SELECT id, node_id, kind, state FROM dag_nodes WHERE bundle_id = ?", (bundle_id,)
+        "SELECT * FROM dag_nodes WHERE bundle_id = ?", (bundle_id,)
+    )
+    edges = await app.db.fetch_all(
+        "SELECT * FROM dag_edges WHERE bundle_id = ?", (bundle_id,)
+    )
+    audit_entries = await app.db.fetch_all(
+        "SELECT * FROM audit_log WHERE subject_id = ? ORDER BY created_at DESC LIMIT 5",
+        (bundle_id,)
+    )
+    artifacts = await app.db.fetch_all(
+        "SELECT namespace, name, version, content_type, size_bytes, hash, published_at "
+        "FROM artifact_metadata WHERE bundle_id = ?",
+        (bundle_id,)
     )
 
     return {
-        "bundle_id": row["id"],
-        "state": row["state"],
-        "idea": proposal.get("bundle_input", {}).get("idea", ""),
+        "bundle": dict(row),
+        "proposal": proposal,
         "nodes": [dict(n) for n in nodes],
+        "edges": [dict(e) for e in edges],
+        "audit_entries": [dict(a) for a in audit_entries],
+        "artifacts": [dict(a) for a in artifacts],
     }
 
 
 async def _cli_show_worker(app: Orchestrator, params: dict) -> dict:
     worker_id = params.get("worker_id", "")
     row = await app.db.fetch_one(
-        "SELECT id, bundle_id, node_id, state, current_phase, last_heartbeat FROM workers WHERE id = ?",
+        "SELECT * FROM workers WHERE id = ?",
         (worker_id,),
     )
     if row is None:
         raise ValueError(f"Worker {worker_id} not found")
 
-    heartbeat_ago = ""
-    if row["last_heartbeat"]:
-        secs = app.sm.now() - row["last_heartbeat"]
-        heartbeat_ago = _format_age(secs)
-
-    logs = await app.db.fetch_all(
-        "SELECT payload_json FROM audit_log WHERE subject_id = ? AND event_type LIKE 'worker.log.%' ORDER BY id DESC LIMIT 20",
-        (worker_id,),
+    node = await app.db.fetch_one(
+        "SELECT * FROM dag_nodes WHERE id = ?",
+        (f"{row['bundle_id']}:{row['node_id']}",),
     )
 
-    recent_logs = []
-    for l in logs:
-        try:
-            payload = json.loads(l["payload_json"] or "{}")
-            recent_logs.append({"level": "info", "message": payload.get("message", "")})
-        except Exception:
-            pass
+    cap_checks = await app.db.fetch_all(
+        "SELECT result FROM capability_checks WHERE worker_id = ?",
+        (worker_id,),
+    )
+    allowed = sum(1 for c in cap_checks if c["result"] == "allowed")
+    denied = sum(1 for c in cap_checks if c["result"] == "denied")
 
     return {
-        "worker_id": row["id"],
-        "bundle_id": row["bundle_id"],
-        "state": row["state"],
-        "phase": row["current_phase"] or "unknown",
-        "last_heartbeat_ago": heartbeat_ago,
-        "recent_logs": recent_logs,
+        "worker": dict(row),
+        "node": dict(node) if node else None,
+        "cap_checks": {"allowed": allowed, "denied": denied},
     }
 
 
@@ -1281,20 +1315,19 @@ async def _cli_kill(app: Orchestrator, params: dict) -> dict:
 
 
 async def _cli_status(app: Orchestrator, params: dict) -> dict:
-    bundles = await app.db.fetch_all(
-        "SELECT id, state, proposal_json FROM bundles WHERE state NOT IN (?, ?, ?, ?, ?)",
-        ("complete", "failed", "rejected", "parked", "aborted"),
+    uptime = time.time() - app.ops._start_time if hasattr(app.ops, '_start_time') else 0
+    workers = await app.db.fetch_one(
+        "SELECT COUNT(*) as cnt FROM workers WHERE state = 'running'"
     )
+    worker_count = workers["cnt"] if workers else 0
+    ready_nodes = await app.db.fetch_one(
+        "SELECT COUNT(*) as cnt FROM dag_nodes WHERE state = 'ready'"
+    )
+    queue_depth = ready_nodes["cnt"] if ready_nodes else 0
     return {
-        "uptime": 0,  # Phase 1: not tracking precise uptime
-        "bundles": [
-            {
-                "id": b["id"],
-                "state": b["state"],
-                "idea": json.loads(b["proposal_json"] or "{}").get("bundle_input", {}).get("idea", ""),
-            }
-            for b in bundles
-        ],
+        "uptime": uptime,
+        "worker_count": worker_count,
+        "queue_depth": queue_depth,
     }
 
 
