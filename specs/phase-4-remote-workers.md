@@ -303,6 +303,229 @@ Some capability grants that are locally enforced by bwrap cannot be enforced on 
 
 ---
 
+## Bundle 4.5: DockerWorkerRunner
+
+### Background
+
+The three runners in Bundles 4.2-4.3 all require Linux kernel namespaces for worker isolation -- bubblewrap directly (local and SSH), or Kubernetes (which itself requires Linux nodes). None of them work on macOS or Windows hosts.
+
+`DockerWorkerRunner` replaces bwrap with Docker as the isolation layer. Each worker runs as its own container. The orchestrator runs in its own container (or natively on Linux). Workers connect back to the orchestrator over TCP/TLS using the endpoint from Bundle 4.1. Network isolation, resource limits, and filesystem isolation are all enforced at the Docker layer rather than the bwrap layer.
+
+This is not a monolith pattern. The orchestrator is one container. Each worker is a separate container with its own lifecycle, resource limits, network namespace, and filesystem. The capability manifest translates to `docker run` flags the same way it translates to bwrap flags or a Pod spec. Standard container tooling (docker stats, docker logs, docker inspect) works on each worker independently.
+
+### Prerequisites
+
+- Bundle 4.1 (TCP/TLS listener) must be merged. Workers connect to the orchestrator over TCP, not Unix socket.
+- Docker Engine installed and accessible. The orchestrator process must be able to call the Docker API -- either via the Docker socket (/var/run/docker.sock) mounted into the orchestrator container, or via a remote Docker daemon configured in settings.json.
+- The studio-worker base image must be built and available locally or in a registry. See Worker image below.
+
+### Capability manifest to docker run translation
+
+The `capability_to_docker_args()` function in `runner.py` translates a capability manifest into `docker run` flags:
+
+**Filesystem grants** become `--volume` mounts. Read-only mounts use `:ro`. The working tree is a named Docker volume created per worker and deleted after the worker exits. The restricted-paths enforcement uses `--volume src:dst:ro` to mount only the declared paths rather than the full working tree.
+
+**Network grants** become Docker network configuration. Workers are attached to a per-worker Docker network (created before container start, deleted after). The network is created with `--internal` (no external routing by default). Allowed egress destinations are enforced by the per-worker egress proxy running as a sidecar container on the same network (see Egress proxy below). DNS is controlled via `--dns` flags.
+
+**Process grants (exec allowlist)** are enforced by the worker's own `cap.check` RPC calls against the orchestrator, identical to the k8s runner. Docker does not provide binary-level exec allowlisting without a custom seccomp profile; the installer generates a base seccomp profile that blocks the most dangerous syscalls but cannot enforce the per-manifest exec list at the kernel level. This is a known limitation, documented in the container startup logs.
+
+**Secrets grants** become environment variables passed via `--env` or Docker secrets via `--secret`. Short-lived: the orchestrator creates the secret, passes it to the container, and removes it after the container exits.
+
+**Resource grants** become `--memory`, `--cpus`, and `--pids-limit` flags. `wall_time_limit` becomes a timeout wrapper around `docker run` that sends SIGTERM then SIGKILL.
+
+**Security defaults applied to every worker container:**
+
+```
+--read-only                          # read-only root filesystem
+--tmpfs /tmp                         # writable /tmp
+--no-new-privileges                  # no privilege escalation
+--cap-drop ALL                       # drop all capabilities
+--cap-add <only what manifest needs> # add back only declared caps
+--security-opt no-new-privileges
+--user 10000:10000                   # non-root user
+```
+
+These defaults match the Kubernetes securityContext from Bundle 4.3, preserving consistent security semantics across runners.
+
+### Worker image
+
+Add `docker/Dockerfile.worker` to the repo:
+
+```dockerfile
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    python3.12 python3-pip git curl bubblewrap \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:$PATH"
+
+# Install opencode
+RUN curl -fsSL https://opencode.ai/install | bash
+
+# Install studio-worker only (not the full orchestrator)
+COPY . /build
+RUN cd /build && uv pip install --system -e ".[worker]"
+
+# Non-root user
+RUN useradd -u 10000 -m studio
+USER studio
+WORKDIR /home/studio
+
+ENTRYPOINT ["studio-worker"]
+```
+
+Add a `worker` extras group to `pyproject.toml` that installs only the worker dependencies (not the orchestrator, MCP server, or bundler). This keeps the worker image small.
+
+Add `docker/Dockerfile.orchestrator` for running the orchestrator itself in Docker:
+
+```dockerfile
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    python3.12 python3-pip git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:$PATH"
+
+COPY . /build
+RUN cd /build && uv pip install --system -e .
+
+EXPOSE 7810 7811
+
+ENTRYPOINT ["studio-orchestrator"]
+```
+
+Add `docker-compose.yml` at the repo root:
+
+```yaml
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.orchestrator
+    restart: unless-stopped
+    volumes:
+      - ./data:/var/lib/studio
+      - ./config/settings.json:/etc/studio/settings.json:ro
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket for spawning worker containers
+    ports:
+      - "7810:7810"
+      - "7811:7811"
+    environment:
+      - OLLAMA_CLOUD_API_KEY=${OLLAMA_CLOUD_API_KEY}
+      - STUDIO_SOCKET_PATH=/var/lib/studio/orchestrator.sock
+    networks:
+      - studio-internal
+
+networks:
+  studio-internal:
+    driver: bridge
+```
+
+Note: `docker-compose.yml` does not define a worker service. Workers are spawned dynamically by the orchestrator via the Docker API, not declared statically in compose.
+
+### Egress proxy as sidecar container
+
+The per-worker egress proxy runs as a sidecar container on the same Docker network as the worker. The orchestrator starts the proxy container first, then starts the worker container with `--network container:<proxy-container-id>` to share the proxy's network namespace.
+
+The proxy container is built from `docker/Dockerfile.proxy`:
+
+```dockerfile
+FROM debian:bookworm-slim
+COPY . /build
+RUN cd /build && uv pip install --system -e ".[proxy]"
+ENTRYPOINT ["studio-proxy"]
+```
+
+The capability manifest's network grants are passed to the proxy container as a JSON env var. The proxy enforces the allowlist exactly as it does in the local and SSH runners. When the worker container exits, the orchestrator stops and removes the proxy container.
+
+This preserves identical egress enforcement semantics across all four runner implementations.
+
+### DockerWorkerRunner class
+
+Implements the WorkerRunner interface. `spawn()` does:
+
+1. Pull or verify the worker image is available locally.
+2. Create a per-worker Docker network (internal, no external routing).
+3. Start the egress proxy container on the worker network with the manifest's egress allowlist.
+4. Create a named Docker volume for the working tree.
+5. Clone the bundle's feature branch into the volume via a short-lived init container.
+6. Start the worker container with the translated docker run flags, connected to the worker network.
+7. Return a `DockerWorkerHandle`.
+
+`DockerWorkerHandle` tracks container IDs for the worker and proxy, the volume name, and the network name. `cancel()` stops the worker container, then removes the proxy container, volume, and network. `is_alive()` checks container status via the Docker API.
+
+On handle drop (worker completed or cancelled), all resources are cleaned up: worker container removed, proxy container removed, volume removed, network removed. No orphaned containers or volumes.
+
+### Docker socket security
+
+Mounting `/var/run/docker.sock` into the orchestrator container gives the orchestrator full Docker API access on the host, which is effectively root-equivalent. This is a standard pattern (used by Portainer, Watchtower, CI runners) but it is a meaningful privilege.
+
+Document this clearly in docs/install.md and in the docker-compose.yml comments:
+
+```yaml
+# WARNING: Mounting the Docker socket gives the orchestrator root-equivalent
+# access to the host. This is required for the DockerWorkerRunner and is the
+# standard pattern for container-spawning orchestrators. If this is a concern,
+# use the K8sJobWorkerRunner instead, which scopes permissions to a namespace.
+```
+
+An alternative is Docker-in-Docker (dind), which gives the orchestrator its own isolated Docker daemon. This avoids the socket privilege issue but adds complexity and performance overhead. Add it to DEFERRED.md as a future hardening option.
+
+### Settings
+
+```json
+"docker_runner": {
+  "enabled": false,
+  "socket_path": "/var/run/docker.sock",
+  "worker_image": "project-stdio-worker:latest",
+  "proxy_image": "project-stdio-proxy:latest",
+  "network_prefix": "studio-worker",
+  "volume_prefix": "studio-worktree",
+  "registry": null,
+  "pull_policy": "if_not_present"
+}
+```
+
+`registry: null` means use local images only. Set to a registry URL to pull from a remote registry.
+
+### macOS and Windows support
+
+With `DockerWorkerRunner`, the orchestrator and all workers run inside Linux containers on any host OS. Docker Desktop on macOS and Windows provides a Linux VM; the containers run in that VM with full Linux kernel namespaces available, including user namespaces for bwrap compatibility.
+
+Note: the orchestrator container itself does not use bwrap. Workers use Docker isolation instead of bwrap isolation. The security model is equivalent: each worker has its own network namespace, filesystem namespace, and resource limits. The enforcement mechanism is Docker rather than bwrap, which is more observable (docker stats, docker events) but slightly coarser for exec allowlisting.
+
+### Update installer.sh
+
+Add a `--docker` flag to installer.sh that:
+1. Skips the bwrap and opencode installation checks (not needed on the host)
+2. Checks for Docker Engine and docker compose
+3. Builds the worker and proxy images: `docker compose build`
+4. Sets `docker_runner.enabled: true` in settings.json
+5. Starts the orchestrator via `docker compose up -d`
+6. Verifies with `docker compose ps`
+
+### New CLI commands
+
+- `studio docker-status`: shows running worker containers, their bundle IDs, resource usage (from docker stats), and uptime.
+- `studio docker-images`: shows the worker and proxy image versions currently in use. Flags if the images are out of date relative to the installed studio version.
+
+### Acceptance criteria
+
+1. On macOS with Docker Desktop: `docker compose up -d` starts the orchestrator. Submit a bundle, approve it. A worker container appears (`docker ps`), heartbeats to the orchestrator over TCP, and the bundle completes.
+2. `studio docker-status` shows the worker container during execution and no containers after completion.
+3. The egress proxy sidecar container blocks a worker attempting to reach an unlisted host.
+4. `docker stats` shows per-worker resource usage during execution.
+5. `studio kill <bundle-id>` stops and removes the worker container cleanly.
+6. All worker containers, volumes, and networks are removed after bundle completion (no orphans after `docker ps -a` and `docker volume ls`).
+7. The installer --docker flag builds images, starts the orchestrator, and passes verification on a fresh macOS machine with only Docker Desktop installed.
+
+---
+
 ## Security notes
 
 **Trust boundary extension.** Phase 4 extends the trust boundary beyond a single machine. The orchestrator's TCP/TLS endpoint is a new attack surface. Workers connecting via TCP present a token, but the token is transmitted over the wire (TLS protects it in transit). Compared to Unix socket workers where the token never leaves the host, TCP workers have a slightly wider token exposure window. Mitigations: TLS with certificate pinning (configurable), token expiry already at 15 minutes (from Bundle 3.4), single-use tokens.
