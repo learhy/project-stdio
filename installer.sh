@@ -551,6 +551,64 @@ create_directories() {
     color_ok "Directories created"
 }
 
+generate_tls_cert() {
+    local tls_dir
+    tls_dir="$(dirname "$CONFIG_FILE")/tls"
+    local ca_cert="${tls_dir}/ca.crt"
+    local ca_key="${tls_dir}/ca.key"
+    local server_cert="${tls_dir}/server.crt"
+    local server_key="${tls_dir}/server.key"
+
+    if [[ -f "$ca_cert" ]] && [[ -f "$ca_key" ]] && [[ -f "$server_cert" ]] && [[ -f "$server_key" ]]; then
+        color_warn "mTLS certs already exist at $tls_dir — leaving in place"
+        return
+    fi
+
+    info "Generating mTLS certificates (CA + server cert)"
+
+    if ! should_skip "generate mTLS certificates"; then
+        mkdir -p "$tls_dir"
+
+        # Generate CA private key
+        openssl genrsa -out "$ca_key" 4096 2>/dev/null
+        chmod 600 "$ca_key"
+
+        # Generate self-signed CA certificate (10 years)
+        openssl req -x509 -new -nodes -key "$ca_key" -sha256 -days 3650 \
+            -out "$ca_cert" \
+            -subj "/CN=Studio Orchestrator CA/O=Studio" 2>/dev/null
+        chmod 644 "$ca_cert"
+
+        # Generate server private key
+        openssl genrsa -out "$server_key" 4096 2>/dev/null
+        chmod 600 "$server_key"
+
+        # Generate server CSR
+        local server_csr="${tls_dir}/server.csr"
+        openssl req -new -key "$server_key" -out "$server_csr" \
+            -subj "/CN=studio-orchestrator/O=Studio" 2>/dev/null
+
+        # Sign server cert with CA
+        openssl x509 -req -in "$server_csr" -CA "$ca_cert" -CAkey "$ca_key" \
+            -CAcreateserial -out "$server_cert" -days 365 -sha256 2>/dev/null
+        chmod 644 "$server_cert"
+
+        # Clean up CSR
+        rm -f "$server_csr"
+
+        if [[ "$INSTALL_MODE" == "system" ]]; then
+            chown studio:studio "$ca_cert" "$ca_key" "$server_cert" "$server_key" 2>/dev/null || true
+        fi
+
+        color_ok "mTLS certificates generated:"
+        info "  CA cert:  $ca_cert"
+        info "  CA key:   $ca_key"
+        info "  Server cert: $server_cert"
+        info "  Server key:  $server_key"
+        info "  Worker certs are issued automatically at spawn time (20 min validity)."
+    fi
+}
+
 install_default_config() {
     info "Installing default configuration"
 
@@ -945,6 +1003,7 @@ main() {
     install_python_package
     create_bin_wrappers
     create_directories
+    generate_tls_cert
     install_default_config
     install_systemd_units
 

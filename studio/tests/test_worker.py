@@ -1,13 +1,22 @@
 """Tests for worker.py — Phase 1 developer worker."""
 import asyncio
 import json
+import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from studio.workers.worker import Worker, RpcClient
+from studio.workers.worker import Worker
+from studio.workers.client import RpcClient
+
+TEST_SOCKET = "/tmp/test.sock"
 
 
 class TestRpcClient:
+    @pytest.fixture(autouse=True)
+    def _set_socket_path(self, monkeypatch):
+        monkeypatch.setenv("STUDIO_SOCKET_PATH", TEST_SOCKET)
+        monkeypatch.delenv("STUDIO_ORCHESTRATOR_ADDR", raising=False)
+
     @pytest.mark.asyncio
     async def test_call_sends_jsonrpc_message(self):
         reader = AsyncMock()
@@ -21,7 +30,7 @@ class TestRpcClient:
         writer.close = MagicMock()
         writer.wait_closed = AsyncMock()
 
-        client = RpcClient("/tmp/test.sock")
+        client = RpcClient()
         client.reader = reader
         client.writer = writer
 
@@ -40,7 +49,7 @@ class TestRpcClient:
         writer.close = MagicMock()
         writer.wait_closed = AsyncMock()
 
-        client = RpcClient("/tmp/test.sock")
+        client = RpcClient()
         client.reader = AsyncMock()
         client.writer = writer
 
@@ -51,11 +60,40 @@ class TestRpcClient:
 
     @pytest.mark.asyncio
     async def test_connect_opens_unix_socket(self):
-        with patch("studio.workers.worker.asyncio.open_unix_connection") as mock_conn:
+        with patch("studio.workers.client.asyncio.open_unix_connection") as mock_conn:
             mock_conn.return_value = (AsyncMock(), MagicMock())
-            client = RpcClient("/tmp/test.sock")
+            client = RpcClient()
             await client.connect()
-            mock_conn.assert_called_once_with("/tmp/test.sock")
+            mock_conn.assert_called_once_with(TEST_SOCKET)
+
+    @pytest.mark.asyncio
+    async def test_connect_tcp(self, monkeypatch):
+        monkeypatch.setenv("STUDIO_ORCHESTRATOR_ADDR", "tcp://127.0.0.1:7811")
+        with patch("studio.workers.client.asyncio.open_connection") as mock_conn, \
+             patch("studio.workers.client._build_mtls_context") as mock_build_ctx:
+            mock_ctx = MagicMock()
+            mock_build_ctx.return_value = mock_ctx
+            mock_conn.return_value = (AsyncMock(), MagicMock())
+            client = RpcClient()
+            await client.connect()
+            mock_build_ctx.assert_called_once()
+            mock_conn.assert_called_once()
+            args = mock_conn.call_args
+            assert args[0][0] == "127.0.0.1"
+            assert args[0][1] == 7811
+            assert args[1]["ssl"] is mock_ctx
+
+    @pytest.mark.asyncio
+    async def test_connect_tcp_default_port(self, monkeypatch):
+        monkeypatch.setenv("STUDIO_ORCHESTRATOR_ADDR", "tcp://10.0.0.1")
+        with patch("studio.workers.client.asyncio.open_connection") as mock_conn, \
+             patch("studio.workers.client._build_mtls_context") as mock_build_ctx:
+            mock_build_ctx.return_value = MagicMock()
+            mock_conn.return_value = (AsyncMock(), MagicMock())
+            client = RpcClient()
+            await client.connect()
+            args = mock_conn.call_args
+            assert args[0][1] == 7811
 
     @pytest.mark.asyncio
     async def test_close(self):
@@ -63,10 +101,17 @@ class TestRpcClient:
         writer.close = MagicMock()
         writer.wait_closed = AsyncMock()
 
-        client = RpcClient("/tmp/test.sock")
+        client = RpcClient()
         client.writer = writer
         await client.close()
         writer.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_tcp_without_certs_raises(self, monkeypatch):
+        monkeypatch.setenv("STUDIO_ORCHESTRATOR_ADDR", "tcp://127.0.0.1:7811")
+        with pytest.raises(RuntimeError, match="TCP transport requires mTLS"):
+            client = RpcClient()
+            await client.connect()
 
     @pytest.mark.asyncio
     async def test_call_empty_response(self):
@@ -77,7 +122,7 @@ class TestRpcClient:
         writer.write = MagicMock()
         writer.drain = AsyncMock()
 
-        client = RpcClient("/tmp/test.sock")
+        client = RpcClient()
         client.reader = reader
         client.writer = writer
 

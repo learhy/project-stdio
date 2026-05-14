@@ -31,6 +31,14 @@
     "memory_root": "memory/",
     "http_port": 7810
   },
+  "remote_workers": {
+    "enabled": false,
+    "listen_addr": "0.0.0.0:7811",
+    "tls_ca_cert_path": "/etc/studio/tls/ca.crt",
+    "tls_ca_key_path": "/etc/studio/tls/ca.key",
+    "tls_server_cert_path": "/etc/studio/tls/server.crt",
+    "tls_server_key_path": "/etc/studio/tls/server.key"
+  },
   "artifacts": {
     "inline_threshold_bytes": 4096,
     "global_storage_cap_bytes": 50000000000,

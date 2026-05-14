@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings
+from . import tls as tls_helpers
 
 if TYPE_CHECKING:
     from .db import Database
@@ -50,12 +51,16 @@ class LocalBwrapWorkerRunner:
         egress_proxy: EgressProxySettings | None = None,
         worker_command: list[str] | None = None,
         token_expiry_minutes: int = 15,
+        ca_cert_path: str = "",
+        ca_key_path: str = "",
     ) -> None:
         self.db = db
         self.socket_path = socket_path
         self.egress_proxy = egress_proxy or EgressProxySettings()
         self.worker_command = worker_command or ["studio-worker"]
         self.token_expiry_minutes = token_expiry_minutes
+        self.ca_cert_path = ca_cert_path
+        self.ca_key_path = ca_key_path
         # Track proxy processes for cleanup
         self._proxy_processes: dict[str, asyncio.subprocess.Process] = {}
 
@@ -126,6 +131,23 @@ class LocalBwrapWorkerRunner:
                     error=f"Worktree creation failed: {exc}",
                 )
 
+        # Issue mTLS worker certificate (Bundle 4.1 mTLS)
+        worker_cert_path = ""
+        worker_key_path = ""
+        if self.ca_cert_path and self.ca_key_path:
+            cert_pem, key_pem = tls_helpers.issue_worker_cert(
+                self.ca_cert_path, self.ca_key_path, worker_id
+            )
+            certs_dir = os.path.join(worktree_path, ".studio", "mtls")
+            os.makedirs(certs_dir, exist_ok=True)
+            worker_cert_path = os.path.join(certs_dir, "worker.crt")
+            worker_key_path = os.path.join(certs_dir, "worker.key")
+            with open(worker_cert_path, "wb") as f:
+                f.write(cert_pem)
+            with open(worker_key_path, "wb") as f:
+                f.write(key_pem)
+            os.chmod(worker_key_path, 0o600)
+
         # Spawn egress proxy subprocess
         proxy_process: asyncio.subprocess.Process | None = None
         proxy_error: str = ""
@@ -174,6 +196,12 @@ class LocalBwrapWorkerRunner:
 
         if task_spec:
             worker_env["STUDIO_TASK_SPEC"] = json.dumps(task_spec)
+
+        # mTLS cert paths for TCP connections (Bundle 4.1 mTLS)
+        if worker_cert_path:
+            worker_env["STUDIO_WORKER_CERT"] = worker_cert_path
+            worker_env["STUDIO_WORKER_KEY"] = worker_key_path
+            worker_env["STUDIO_ORCHESTRATOR_CA"] = self.ca_cert_path
 
         process = await asyncio.create_subprocess_exec(
             *bwrap_args,

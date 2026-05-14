@@ -184,6 +184,155 @@ class TestOrchestratorLifecycle:
             mock_db.close.assert_called_once()
 
 
+class TestTcpTlsListener:
+    @pytest.mark.asyncio
+    async def test_remote_workers_disabled_no_tcp_server(self):
+        app = Orchestrator()
+        app.settings.orchestrator.db_path = "/tmp/test-no-tcp.db"
+        app.settings.orchestrator.socket_path = "/tmp/test-no-tcp.sock"
+        app.settings.remote_workers.enabled = False
+
+        with patch("studio.orchestrator.main.create_database") as mock_create_db, \
+             patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
+             patch("studio.orchestrator.main.LocalBwrapWorkerRunner"), \
+             patch("studio.orchestrator.main.DagExecutor"), \
+             patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
+             patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
+             patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
+             patch("studio.orchestrator.main.asyncio.start_server") as mock_tcp_server, \
+             patch("studio.orchestrator.main.os.chmod"), \
+             patch("studio.orchestrator.main.os.path.exists", return_value=False), \
+             patch("studio.orchestrator.main.os.unlink"):
+            mock_db = MagicMock()
+            mock_db.fetch_all = AsyncMock()
+            mock_db.fetch_one = AsyncMock()
+            mock_db.close = AsyncMock()
+            mock_db.execute = AsyncMock()
+            mock_db.conn = MagicMock()
+            mock_db.conn.commit = AsyncMock()
+            mock_create_db.return_value = mock_db
+            mock_create_rpc.return_value = (MagicMock(), MagicMock(), MagicMock())
+
+            mock_sched_cls.return_value = MagicMock(start=AsyncMock(), stop=AsyncMock())
+            mock_recon_cls.return_value = MagicMock(reconcile=AsyncMock(return_value={
+                "workers_killed": 0, "nodes_failed": 0, "bundles_recovered": 0}))
+
+            mock_server = MagicMock()
+            mock_server.close = MagicMock()
+            mock_server.wait_closed = AsyncMock()
+            mock_start_server.return_value = mock_server
+
+            await app.start()
+
+            mock_start_server.assert_called_once()
+            mock_tcp_server.assert_not_called()
+            assert app._tcp_server is None
+
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_remote_workers_enabled_starts_tcp_server(self):
+        app = Orchestrator()
+        app.settings.orchestrator.db_path = "/tmp/test-tcp.db"
+        app.settings.orchestrator.socket_path = "/tmp/test-tcp.sock"
+        app.settings.remote_workers.enabled = True
+        app.settings.remote_workers.listen_addr = "0.0.0.0:7811"
+
+        with patch("studio.orchestrator.main.create_database") as mock_create_db, \
+             patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
+             patch("studio.orchestrator.main.LocalBwrapWorkerRunner"), \
+             patch("studio.orchestrator.main.DagExecutor"), \
+             patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
+             patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
+             patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
+             patch("studio.orchestrator.main.asyncio.start_server") as mock_tcp_server, \
+             patch("studio.orchestrator.main.tls_helpers.generate_ca") as mock_gen_ca, \
+             patch("studio.orchestrator.main.tls_helpers.create_server_tls_context") as mock_create_ctx, \
+             patch("studio.orchestrator.main.os.chmod"), \
+             patch("studio.orchestrator.main.os.path.exists", return_value=False), \
+             patch("studio.orchestrator.main.os.unlink"):
+            mock_db = MagicMock()
+            mock_db.fetch_all = AsyncMock()
+            mock_db.fetch_one = AsyncMock()
+            mock_db.close = AsyncMock()
+            mock_db.execute = AsyncMock()
+            mock_db.conn = MagicMock()
+            mock_db.conn.commit = AsyncMock()
+            mock_create_db.return_value = mock_db
+            mock_create_rpc.return_value = (MagicMock(), MagicMock(), MagicMock())
+
+            mock_sched_cls.return_value = MagicMock(start=AsyncMock(), stop=AsyncMock())
+            mock_recon_cls.return_value = MagicMock(reconcile=AsyncMock(return_value={
+                "workers_killed": 0, "nodes_failed": 0, "bundles_recovered": 0}))
+
+            mock_server = MagicMock()
+            mock_server.close = MagicMock()
+            mock_server.wait_closed = AsyncMock()
+            mock_start_server.return_value = mock_server
+
+            mock_tcp = MagicMock()
+            mock_tcp.close = MagicMock()
+            mock_tcp.wait_closed = AsyncMock()
+            mock_tcp_server.return_value = mock_tcp
+
+            mock_tls_ctx = MagicMock()
+            mock_create_ctx.return_value = mock_tls_ctx
+
+            await app.start()
+
+            mock_gen_ca.assert_called_once()
+            mock_create_ctx.assert_called_once()
+            mock_tcp_server.assert_called_once_with(
+                app._handle_connection,
+                host="0.0.0.0",
+                port=7811,
+                ssl=mock_tls_ctx,
+            )
+            assert app._tcp_server is not None
+
+            # Verify audit trail was written
+            mock_db.execute.assert_called()
+
+            await app.stop()
+
+    def test_create_server_tls_context(self, tmp_path):
+        from studio.orchestrator.tls import create_server_tls_context, generate_ca
+        import ssl as ssl_mod
+
+        # Generate CA
+        ca_cert_path = tmp_path / "ca.crt"
+        ca_key_path = tmp_path / "ca.key"
+        generate_ca(str(ca_cert_path), str(ca_key_path))
+
+        # Generate server cert signed by CA
+        import subprocess
+        server_key_path = tmp_path / "server.key"
+        server_csr_path = tmp_path / "server.csr"
+        server_cert_path = tmp_path / "server.crt"
+
+        subprocess.run([
+            "openssl", "genrsa", "-out", str(server_key_path), "2048",
+        ], check=True, capture_output=True)
+        subprocess.run([
+            "openssl", "req", "-new", "-key", str(server_key_path),
+            "-out", str(server_csr_path),
+            "-subj", "/CN=test-orchestrator",
+        ], check=True, capture_output=True)
+        subprocess.run([
+            "openssl", "x509", "-req", "-in", str(server_csr_path),
+            "-CA", str(ca_cert_path), "-CAkey", str(ca_key_path),
+            "-CAcreateserial", "-out", str(server_cert_path),
+            "-days", "1", "-sha256",
+        ], check=True, capture_output=True)
+
+        ctx = create_server_tls_context(
+            str(ca_cert_path), str(server_cert_path), str(server_key_path)
+        )
+        assert isinstance(ctx, ssl_mod.SSLContext)
+        assert ctx.minimum_version == ssl_mod.TLSVersion.TLSv1_2
+        assert ctx.verify_mode == ssl_mod.CERT_REQUIRED
+
+
 class TestCliHandlers:
     @pytest.fixture
     def app_mock(self):

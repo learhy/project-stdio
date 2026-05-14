@@ -303,6 +303,7 @@ async def cmd_status() -> int:
         uptime=data.get("uptime", 0),
         worker_count=data.get("worker_count", 0),
         queue_depth=data.get("queue_depth", 0),
+        listeners=data.get("listeners"),
     ))
     return 0
 

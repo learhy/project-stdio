@@ -386,10 +386,14 @@ def format_health(snap: dict[str, Any]) -> str:
 
 # ── studio status ──────────────────────────────────────────────────────────────
 
-def format_status(uptime: float, worker_count: int, queue_depth: int) -> str:
+def format_status(uptime: float, worker_count: int, queue_depth: int,
+                  listeners: list[str] | None = None) -> str:
     """Format terse status line."""
     uptime_str = _format_duration(int(uptime)) if uptime else "0s"
-    return f"Orchestrator: running | Uptime: {uptime_str} | Workers: {worker_count} running | Queue: {queue_depth}"
+    base = f"Orchestrator: running | Uptime: {uptime_str} | Workers: {worker_count} running | Queue: {queue_depth}"
+    if listeners:
+        base += "\nListeners: " + ", ".join(listeners)
+    return base
 
 
 # ── studio calibration-report ──────────────────────────────────────────────────

@@ -697,12 +697,23 @@ class OpsSettings(BaseModel):
     worker_token_expiry_minutes: int = 15
 
 
+class RemoteWorkersSettings(BaseModel):
+    """TCP/TLS listener for remote worker connections with mutual TLS (Bundle 4.1)."""
+    enabled: bool = False
+    listen_addr: str = "0.0.0.0:7811"
+    tls_ca_cert_path: str = "/etc/studio/tls/ca.crt"
+    tls_ca_key_path: str = "/etc/studio/tls/ca.key"
+    tls_server_cert_path: str = "/etc/studio/tls/server.crt"
+    tls_server_key_path: str = "/etc/studio/tls/server.key"
+
+
 class Settings(BaseModel):
     kernel: KernelSettings = Field(default_factory=KernelSettings)
     egress_proxy: EgressProxySettings = Field(default_factory=EgressProxySettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     ollama_cloud: OllamaCloudSettings = Field(default_factory=OllamaCloudSettings)
     orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)
+    remote_workers: RemoteWorkersSettings = Field(default_factory=RemoteWorkersSettings)
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)

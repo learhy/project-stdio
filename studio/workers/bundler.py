@@ -17,7 +17,6 @@ from typing import Any
 # ── Configuration from environment ────────────────────────────────────────────
 
 _TOKEN = os.environ.get("STUDIO_WORKER_TOKEN", "")
-_SOCKET_PATH = os.environ.get("STUDIO_SOCKET_PATH", "/run/studio/orchestrator.sock")
 _WORKER_ID = os.environ.get("STUDIO_WORKER_ID", "bundler-unknown")
 _BUNDLE_ID = os.environ.get("STUDIO_BUNDLE_ID", "unknown")
 _NODE_ID = os.environ.get("STUDIO_NODE_ID", "bundler")
@@ -142,51 +141,8 @@ def _load_task_spec() -> dict[str, Any]:
 
 
 # ── JSON-RPC helpers ──────────────────────────────────────────────────────────
-# (Mirrors studio/workers/worker.py RpcClient)
 
-
-class RpcClient:
-    """Minimal JSON-RPC 2.0 client over a Unix domain socket."""
-
-    def __init__(self, socket_path: str) -> None:
-        self.socket_path = socket_path
-        self.reader: asyncio.StreamReader | None = None
-        self.writer: asyncio.StreamWriter | None = None
-        self._req_id = 0
-
-    async def connect(self) -> None:
-        self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
-
-    async def close(self) -> None:
-        if self.writer:
-            self.writer.close()
-            await self.writer.wait_closed()
-
-    async def call(self, method: str, params: dict | None = None) -> dict:
-        self._req_id += 1
-        msg = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-            "id": self._req_id,
-        }
-        self.writer.write((json.dumps(msg) + "\n").encode())
-        await self.writer.drain()
-
-        line = await self.reader.readline()
-        if not line:
-            return {"error": {"code": -1, "message": "Connection closed"}}
-
-        return json.loads(line.decode("utf-8"))
-
-    async def notify(self, method: str, params: dict | None = None) -> None:
-        msg = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-        }
-        self.writer.write((json.dumps(msg) + "\n").encode())
-        await self.writer.drain()
+from .client import RpcClient, get_orchestrator_addr_display
 
 
 # ── Memory readers ────────────────────────────────────────────────────────────
@@ -346,7 +302,7 @@ class BundlerWorker:
     """Bundler agent: reads an idea, consults memory, produces a full bundle proposal."""
 
     def __init__(self) -> None:
-        self.rpc = RpcClient(_SOCKET_PATH)
+        self.rpc = RpcClient()
         self.task_spec = _load_task_spec()
         self._heartbeat_task: asyncio.Task | None = None
         self._running = False
@@ -361,7 +317,8 @@ class BundlerWorker:
         try:
             await self.rpc.connect()
         except Exception as exc:
-            self._log(f"ERROR: cannot connect to orchestrator at {_SOCKET_PATH}: {exc}")
+            addr_display = get_orchestrator_addr_display()
+            self._log(f"ERROR: cannot connect to orchestrator at {addr_display}: {exc}")
             return 1
 
         auth_resp = await self.rpc.call("auth", {"token": _TOKEN})
