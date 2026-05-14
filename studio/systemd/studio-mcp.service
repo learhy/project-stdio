@@ -1,0 +1,44 @@
+[Unit]
+Description=Studio MCP Server — Model Context Protocol endpoint
+Documentation=https://github.com/learhy/studio
+After=network.target studio-orchestrator.service
+Wants=studio-orchestrator.service
+
+[Service]
+Type=simple
+User=studio
+Group=studio
+ExecStart=/usr/bin/studio-mcp
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/studio /run/studio
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+# Runtime directories
+RuntimeDirectory=studio
+StateDirectory=studio
+WorkingDirectory=/var/lib/studio
+
+# Environment
+Environment=STUDIO_ORCH_DB_PATH=/var/lib/studio/state.db
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=studio-mcp
+
+[Install]
+WantedBy=multi-user.target
