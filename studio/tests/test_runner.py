@@ -9,6 +9,7 @@ from studio.orchestrator.runner import (
     NoopWorkerRunner,
     WorkerSpawnResult,
     _generate_token,
+    capability_to_bwrap_args,
 )
 from studio.orchestrator.models import (
     CapabilityManifest,
@@ -95,7 +96,7 @@ class TestLocalBwrapWorkerRunner:
 
     def test_bwrap_basic_args(self, runner):
         manifest = make_manifest()
-        args = runner._build_bwrap_args(manifest, "/tmp/worktree", "token123")
+        args = capability_to_bwrap_args(manifest, "/tmp/worktree", socket_path=runner.socket_path)
 
         assert args[0] == "bwrap"
         assert "--die-with-parent" in args
@@ -111,27 +112,27 @@ class TestLocalBwrapWorkerRunner:
     def test_bwrap_readonly_mounts(self, runner):
         manifest = make_manifest()
         with patch("os.path.exists", return_value=True):
-            args = runner._build_bwrap_args(manifest, "/tmp/wt", "tok")
+            args = capability_to_bwrap_args(manifest, "/tmp/wt", socket_path=runner.socket_path)
         assert "--ro-bind" in args
         assert "/usr/lib" in args
 
     def test_bwrap_writable_mounts(self, runner):
         manifest = make_manifest()
         with patch("os.path.exists", return_value=True):
-            args = runner._build_bwrap_args(manifest, "/tmp/wt", "tok")
+            args = capability_to_bwrap_args(manifest, "/tmp/wt", socket_path=runner.socket_path)
         # Should have bind for /tmp/build
         assert "--bind" in args
         assert "/tmp/build" in args
 
     def test_bwrap_always_unshare_net(self, runner):
         manifest = make_manifest()
-        args = runner._build_bwrap_args(manifest, "/tmp/wt", "tok")
+        args = capability_to_bwrap_args(manifest, "/tmp/wt", socket_path=runner.socket_path)
         assert "--unshare-net" in args
 
     def test_bwrap_socket_directory_bound(self, runner):
         manifest = make_manifest()
         with patch("os.path.exists", return_value=True):
-            args = runner._build_bwrap_args(manifest, "/tmp/wt", "tok")
+            args = capability_to_bwrap_args(manifest, "/tmp/wt", socket_path=runner.socket_path)
         assert "/run/studio" in args
 
     @pytest.mark.asyncio

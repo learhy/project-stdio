@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class DatabaseVersionError(RuntimeError):
@@ -332,6 +332,15 @@ async def _migrate_v7(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         "INSERT OR IGNORE INTO settings_metadata (key, value, updated_at) VALUES (?, ?, ?)",
         ("remote_workers_enabled", "0", 0),
+    )
+
+
+@migration(8)
+async def _migrate_v8(conn: aiosqlite.Connection) -> None:
+    """Record remote_fleet_enabled in settings_metadata (Bundle 4.2)."""
+    await conn.execute(
+        "INSERT OR IGNORE INTO settings_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+        ("remote_fleet_enabled", "0", 0),
     )
 
 

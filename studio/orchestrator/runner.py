@@ -6,21 +6,92 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings
+import asyncssh
+
+from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost
 from . import tls as tls_helpers
 
 if TYPE_CHECKING:
     from .db import Database
 
+logger = logging.getLogger(__name__)
+
 
 def _generate_token() -> str:
     return secrets.token_hex(32)
+
+
+def capability_to_bwrap_args(
+    manifest: CapabilityManifest,
+    worktree_path: str,
+    socket_path: str = "",
+    proxy_socket: str = "",
+) -> list[str]:
+    """Translate a capability manifest into bubblewrap arguments.
+
+    Phase 3 network model:
+    - Always --unshare-net (no host network access)
+    - Egress proxy reachable via bind-mounted Unix socket
+    - Working directory read-write bound to the worktree path
+    - Explicit read-only mounts from filesystem.reads
+    - Explicit read-write mounts from filesystem.writes (create: true)
+
+    Shared between LocalBwrapWorkerRunner and RemoteSSHWorkerRunner (Bundle 4.2).
+    """
+    args = ["bwrap"]
+
+    # Basic container setup
+    args.extend(["--die-with-parent"])
+    args.extend(["--tmpfs", "/tmp"])
+
+    # Working directory (read-write)
+    args.extend(["--bind", worktree_path, "/work"])
+    args.extend(["--chdir", "/work"])
+
+    # Explicit filesystem grants
+    fs = manifest.grants.filesystem
+
+    # Read-only mounts
+    for read_grant in fs.reads:
+        p = read_grant.path
+        if os.path.exists(p):
+            args.extend(["--ro-bind", p, p])
+
+    # Read-write mounts
+    for write_grant in fs.writes:
+        p = write_grant.path
+        if os.path.exists(p) and write_grant.create:
+            args.extend(["--bind", p, p])
+
+    # Bind the orchestrator socket directory (local workers only)
+    if socket_path:
+        socket_dir = os.path.dirname(socket_path)
+        if os.path.exists(socket_dir):
+            args.extend(["--ro-bind", socket_dir, socket_dir])
+
+    # Bind the proxy socket
+    if proxy_socket:
+        proxy_dir = os.path.dirname(proxy_socket)
+        if proxy_dir and os.path.exists(proxy_dir):
+            args.extend(["--ro-bind", proxy_dir, proxy_dir])
+
+    # Network: always isolate — no host network
+    args.append("--unshare-net")
+
+    # Proc
+    args.extend(["--proc", "/proc"])
+
+    # Dev
+    args.extend(["--dev", "/dev"])
+
+    return args
 
 
 class WorkerSpawnResult:
@@ -29,7 +100,7 @@ class WorkerSpawnResult:
         worker_id: str,
         token: str,
         node_id: str,
-        process: asyncio.subprocess.Process | None = None,
+        process: asyncio.subprocess.Process | "RemoteWorkerHandle | None" = None,
         proxy_process: asyncio.subprocess.Process | None = None,
         error: str = "",
     ) -> None:
@@ -170,7 +241,7 @@ class LocalBwrapWorkerRunner:
                 )
 
         # Build bwrap args (always --unshare-net)
-        bwrap_args = self._build_bwrap_args(manifest, worktree_path, token, proxy_socket)
+        bwrap_args = capability_to_bwrap_args(manifest, worktree_path, self.socket_path, proxy_socket)
 
         # http_proxy over Unix socket: httpx and some tools support this
         proxy_url = f"http+unix://{proxy_socket.replace('/', '%2F')}"
@@ -262,71 +333,6 @@ class LocalBwrapWorkerRunner:
                 stderr=asyncio.subprocess.PIPE,
             )
             await proc.wait()
-
-    def _build_bwrap_args(
-        self,
-        manifest: CapabilityManifest,
-        worktree_path: str,
-        token: str,
-        proxy_socket: str = "",
-    ) -> list[str]:
-        """Translate a capability manifest into bubblewrap arguments.
-
-        Phase 3 network model:
-        - Always --unshare-net (no host network access)
-        - Egress proxy reachable via bind-mounted Unix socket
-        - Working directory read-write bound to the worktree path
-        - Explicit read-only mounts from filesystem.reads
-        - Explicit read-write mounts from filesystem.writes (create: true)
-        """
-        args = ["bwrap"]
-
-        # Basic container setup
-        args.extend(["--die-with-parent"])
-        args.extend(["--tmpfs", "/tmp"])
-
-        # Working directory (read-write)
-        args.extend(["--bind", worktree_path, "/work"])
-        args.extend(["--chdir", "/work"])
-
-        # Explicit filesystem grants
-        fs = manifest.grants.filesystem
-
-        # Read-only mounts
-        for read_grant in fs.reads:
-            p = read_grant.path
-            if os.path.exists(p):
-                args.extend(["--ro-bind", p, p])
-
-        # Read-write mounts
-        for write_grant in fs.writes:
-            p = write_grant.path
-            if os.path.exists(p) and write_grant.create:
-                args.extend(["--bind", p, p])
-
-        # Bind the orchestrator socket
-        socket_dir = os.path.dirname(self.socket_path)
-        if os.path.exists(socket_dir):
-            args.extend(["--ro-bind", socket_dir, socket_dir])
-
-        # Bind the proxy socket
-        if proxy_socket:
-            # The proxy socket file itself needs to be accessible
-            # Bind its parent directory so it's reachable inside the namespace
-            proxy_dir = os.path.dirname(proxy_socket)
-            if proxy_dir and os.path.exists(proxy_dir):
-                args.extend(["--ro-bind", proxy_dir, proxy_dir])
-
-        # Network: always isolate — no host network
-        args.append("--unshare-net")
-
-        # Proc
-        args.extend(["--proc", "/proc"])
-
-        # Dev
-        args.extend(["--dev", "/dev"])
-
-        return args
 
     async def kill_worker(
         self,
@@ -437,3 +443,359 @@ class NoopWorkerRunner:
              node_db_id),
         )
         await self.db.conn.commit()
+
+
+# ── Bundle 4.2: Remote SSH runner ──────────────────────────────────────────────
+
+class RemoteWorkerHandle:
+    """Tracks a worker process running on a remote fleet host via SSH."""
+
+    def __init__(
+        self,
+        conn: asyncssh.SSHClientConnection,
+        remote_pid: int,
+        host: FleetHost,
+        workdir: str,
+        worker_id: str,
+    ) -> None:
+        self.conn = conn
+        self.remote_pid = remote_pid
+        self.host = host
+        self.workdir = workdir
+        self.worker_id = worker_id
+        self._returncode: int | None = None
+
+    @property
+    def returncode(self) -> int | None:
+        return self._returncode
+
+    @returncode.setter
+    def returncode(self, value: int | None) -> None:
+        self._returncode = value
+
+    async def cancel(self) -> None:
+        """Send SIGTERM, wait up to 30s, then SIGKILL the remote process."""
+        try:
+            await self.conn.run(f"kill -TERM {self.remote_pid}", check=False)
+            for _ in range(30):
+                result = await self.conn.run(f"kill -0 {self.remote_pid}", check=False)
+                if result.exit_status != 0:
+                    self._returncode = -1
+                    return
+                await asyncio.sleep(1)
+            await self.conn.run(f"kill -9 {self.remote_pid}", check=False)
+            self._returncode = -9
+        except Exception:
+            self._returncode = -1
+
+    async def is_alive(self) -> bool:
+        """Check if the remote process is still running."""
+        if self._returncode is not None:
+            return False
+        try:
+            result = await self.conn.run(f"kill -0 {self.remote_pid}", check=False)
+            alive = result.exit_status == 0
+            if not alive:
+                self._returncode = 1
+            return alive
+        except Exception:
+            self._returncode = -1
+            return False
+
+    async def cleanup(self) -> None:
+        """Remove the temporary working directory from the remote host."""
+        if self.workdir:
+            try:
+                await self.conn.run(f"rm -rf {self.workdir}", check=False)
+            except Exception:
+                pass
+
+
+class RemoteSSHWorkerRunner:
+    """Spawns worker subprocesses on remote fleet hosts via SSH + bubblewrap."""
+
+    def __init__(
+        self,
+        db: "Database",
+        fleet: RemoteFleetSettings,
+        egress_proxy: EgressProxySettings | None = None,
+        worker_command: list[str] | None = None,
+        token_expiry_minutes: int = 15,
+        ca_cert_path: str = "",
+        ca_key_path: str = "",
+    ) -> None:
+        self.db = db
+        self.fleet = fleet
+        self.egress_proxy = egress_proxy or EgressProxySettings()
+        self.worker_command = worker_command or ["studio-worker"]
+        self.token_expiry_minutes = token_expiry_minutes
+        self.ca_cert_path = ca_cert_path
+        self.ca_key_path = ca_key_path
+        self._host_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._host_health: dict[str, bool] = {}
+        self._host_last_ping: dict[str, float] = {}
+        for host in fleet.hosts:
+            self._host_semaphores[host.name] = asyncio.Semaphore(host.max_concurrent_workers)
+            self._host_health[host.name] = True
+
+    @staticmethod
+    def now() -> int:
+        return int(time.time())
+
+    def _select_host(self) -> FleetHost | None:
+        """Select a fleet host per the configured selection policy (least_loaded or round_robin)."""
+        healthy = [h for h in self.fleet.hosts if self._host_health.get(h.name, False)]
+        if not healthy:
+            return None
+        # Find first host with available capacity
+        for host in healthy:
+            sem = self._host_semaphores.get(host.name)
+            if sem and not sem.locked():
+                return host
+        return None
+
+    async def _preflight(self, conn: asyncssh.SSHClientConnection) -> list[str]:
+        """Verify required binaries exist on the remote host. Returns list of missing items."""
+        missing: list[str] = []
+        for binary in ["bwrap", "studio-worker", "studio-proxy"]:
+            result = await conn.run(f"command -v {binary}", check=False)
+            if result.exit_status != 0:
+                missing.append(binary)
+        return missing
+
+    async def spawn_worker(
+        self,
+        worker_id: str,
+        bundle_id: str,
+        node_id: str,
+        manifest: CapabilityManifest,
+        worktree_path: str,
+        task_spec: dict[str, Any] | None = None,
+        base_branch: str = "main",
+    ) -> WorkerSpawnResult:
+        """Spawn a worker on a remote fleet host via SSH + bubblewrap."""
+        token = _generate_token()
+        token_expires_at = self.now() + (self.token_expiry_minutes * 60)
+
+        host = self._select_host()
+        if host is None:
+            return WorkerSpawnResult(
+                worker_id=worker_id, token=token, node_id=node_id,
+                error="No healthy fleet host available with capacity",
+            )
+
+        sem = self._host_semaphores[host.name]
+        await sem.acquire()
+
+        try:
+            try:
+                conn = await asyncssh.connect(
+                    host.addr,
+                    username=host.ssh_user,
+                    client_keys=[host.ssh_key_path] if host.ssh_key_path else None,
+                    known_hosts=None,
+                )
+            except Exception as exc:
+                sem.release()
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token=token, node_id=node_id,
+                    error=f"SSH connection to {host.name} ({host.addr}) failed: {exc}",
+                )
+
+            missing = await self._preflight(conn)
+            if missing:
+                conn.close()
+                await conn.wait_closed()
+                sem.release()
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token=token, node_id=node_id,
+                    error=f"Missing binaries on {host.name}: {', '.join(missing)}. "
+                          f"Install them before using this host as a worker.",
+                )
+
+            workdir = f"/tmp/studio-worker-{worker_id}"
+            await conn.run(f"mkdir -p {workdir}", check=True)
+
+            if host.worktree_mode == "clone":
+                worker_branch = f"bundle/{bundle_id}/{node_id}"
+                await conn.run(
+                    f"cd {workdir} && git clone --single-branch "
+                    f"--branch {worker_branch} {os.getcwd()} repo 2>/dev/null || "
+                    f"git clone --single-branch --branch main {os.getcwd()} repo",
+                    check=False,
+                )
+                remote_workdir = f"{workdir}/repo"
+            else:
+                remote_workdir = worktree_path
+
+            task_json = json.dumps(task_spec or {})
+            escaped = task_json.replace("'", "'\\''")
+            await conn.run(f"echo '{escaped}' > {workdir}/task-spec.json", check=True)
+
+            manifest_json = json.dumps(manifest.model_dump())
+            escaped_mf = manifest_json.replace("'", "'\\''")
+            await conn.run(f"echo '{escaped_mf}' > {workdir}/manifest.json", check=True)
+
+            # Spawn egress proxy on remote host
+            proxy_socket = f"/tmp/studio-proxy-{worker_id}.sock"
+            proxy_env_str = (
+                f"STUDIO_PROXY_SOCKET={proxy_socket} "
+                f"STUDIO_MANIFEST_JSON='{escaped_mf}'"
+            )
+            await conn.run(
+                f"nohup env {proxy_env_str} studio-proxy > {workdir}/proxy.log 2>&1 & "
+                f"echo $! > {workdir}/proxy.pid",
+                check=False,
+            )
+            await asyncio.sleep(0.5)
+
+            bwrap_args = capability_to_bwrap_args(
+                manifest, remote_workdir, socket_path="", proxy_socket=proxy_socket
+            )
+
+            orchestrator_host = os.environ.get("STUDIO_ORCHESTRATOR_HOST", "localhost")
+            worker_env = {
+                "STUDIO_WORKER_TOKEN": token,
+                "STUDIO_ORCHESTRATOR_ADDR": f"tcp://{orchestrator_host}:7811",
+                "STUDIO_WORKER_ID": worker_id,
+                "STUDIO_BUNDLE_ID": bundle_id,
+                "STUDIO_NODE_ID": node_id,
+                "STUDIO_WORKTREE_PATH": remote_workdir,
+                "STUDIO_BASE_BRANCH": base_branch,
+                "STUDIO_PROXY_SOCKET": proxy_socket,
+                "http_proxy": f"http+unix://{proxy_socket.replace('/', '%2F')}",
+                "https_proxy": f"http+unix://{proxy_socket.replace('/', '%2F')}",
+                "no_proxy": "",
+            }
+
+            if task_spec:
+                worker_env["STUDIO_TASK_SPEC"] = task_json
+
+            if self.ca_cert_path and self.ca_key_path:
+                cert_pem, key_pem = tls_helpers.issue_worker_cert(
+                    self.ca_cert_path, self.ca_key_path, worker_id
+                )
+                cert_escaped = cert_pem.decode().replace("'", "'\\''")
+                key_escaped = key_pem.decode().replace("'", "'\\''")
+                await conn.run(f"echo '{cert_escaped}' > {workdir}/worker.crt", check=True)
+                await conn.run(f"echo '{key_escaped}' > {workdir}/worker.key", check=True)
+                await conn.run(f"chmod 600 {workdir}/worker.key", check=True)
+                ca_pem = Path(self.ca_cert_path).read_bytes()
+                ca_escaped = ca_pem.decode().replace("'", "'\\''")
+                await conn.run(f"echo '{ca_escaped}' > {workdir}/ca.crt", check=True)
+                worker_env["STUDIO_WORKER_CERT"] = f"{workdir}/worker.crt"
+                worker_env["STUDIO_WORKER_KEY"] = f"{workdir}/worker.key"
+                worker_env["STUDIO_ORCHESTRATOR_CA"] = f"{workdir}/ca.crt"
+
+            cmd_parts = bwrap_args + self.worker_command
+            cmd_str = " ".join(cmd_parts)
+
+            worker_env_str = " ".join(
+                f"{k}='{v.replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'"
+                for k, v in worker_env.items()
+            )
+
+            result = await conn.run(
+                f"cd {remote_workdir} && nohup env {worker_env_str} {cmd_str} "
+                f"> {workdir}/worker.log 2>&1 & echo $!",
+                check=True,
+            )
+            remote_pid_str = result.stdout.strip()
+            try:
+                remote_pid = int(remote_pid_str)
+            except ValueError:
+                conn.close()
+                await conn.wait_closed()
+                sem.release()
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token=token, node_id=node_id,
+                    error=f"Failed to capture remote PID from: {remote_pid_str}",
+                )
+
+            await self.db.execute(
+                "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, manifest_json, state, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (worker_id, bundle_id, node_id, token, token_expires_at,
+                 json.dumps(manifest.model_dump()), WorkerState.PENDING, self.now()),
+            )
+            await self.db.conn.commit()
+
+            await self.db.execute(
+                "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("worker_spawned", "worker", worker_id,
+                 json.dumps({"bundle_id": bundle_id, "node_id": node_id,
+                             "token_expires_at": token_expires_at,
+                             "remote_host": host.name, "remote_pid": remote_pid}),
+                 self.now()),
+            )
+            await self.db.conn.commit()
+
+            handle = RemoteWorkerHandle(conn, remote_pid, host, workdir, worker_id)
+            logger.info("Remote worker %s spawned on %s (pid %s)", worker_id, host.name, remote_pid)
+
+            return WorkerSpawnResult(worker_id, token, node_id, process=handle)
+
+        except Exception as exc:
+            sem.release()
+            return WorkerSpawnResult(
+                worker_id=worker_id, token=token, node_id=node_id,
+                error=f"Remote spawn failed: {exc}",
+            )
+
+    async def kill_worker(
+        self,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle,
+        worker_id: str = "",
+    ) -> None:
+        """Kill a remote worker by its handle."""
+        if isinstance(process, RemoteWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+            try:
+                process.conn.close()
+                await process.conn.wait_closed()
+            except Exception:
+                pass
+            sem = self._host_semaphores.get(process.host.name)
+            if sem:
+                sem.release()
+        elif isinstance(process, asyncio.subprocess.Process):
+            try:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            except ProcessLookupError:
+                pass
+
+    async def ping_hosts(self) -> dict[str, str]:
+        """Ping all fleet hosts, update health status. Returns host->status map."""
+        statuses: dict[str, str] = {}
+        for host in self.fleet.hosts:
+            try:
+                conn = await asyncio.wait_for(
+                    asyncssh.connect(
+                        host.addr,
+                        username=host.ssh_user,
+                        client_keys=[host.ssh_key_path] if host.ssh_key_path else None,
+                        known_hosts=None,
+                    ),
+                    timeout=10.0,
+                )
+                self._host_health[host.name] = True
+                self._host_last_ping[host.name] = time.time()
+                statuses[host.name] = "healthy"
+                conn.close()
+                try:
+                    await conn.wait_closed()
+                except Exception:
+                    pass
+            except Exception:
+                statuses[host.name] = "degraded"
+                self._host_health[host.name] = False
+                self._host_last_ping[host.name] = time.time()
+                logger.warning("Fleet host %s (%s) is degraded", host.name, host.addr)
+        return statuses
