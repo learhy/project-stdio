@@ -551,6 +551,36 @@ create_directories() {
     color_ok "Directories created"
 }
 
+generate_tls_cert() {
+    local tls_dir
+    tls_dir="$(dirname "$CONFIG_FILE")/tls"
+    local cert_file="${tls_dir}/server.crt"
+    local key_file="${tls_dir}/server.key"
+
+    if [[ -f "$cert_file" ]] && [[ -f "$key_file" ]]; then
+        color_warn "TLS cert already exists at $tls_dir — leaving in place"
+        return
+    fi
+
+    info "Generating self-signed TLS certificate for development"
+
+    if ! should_skip "generate self-signed TLS cert"; then
+        mkdir -p "$tls_dir"
+        openssl req -x509 -newkey rsa:4096 -keyout "$key_file" \
+            -out "$cert_file" -days 365 -nodes \
+            -subj "/CN=studio-orchestrator" 2>/dev/null
+        chmod 600 "$key_file"
+        chmod 644 "$cert_file"
+
+        if [[ "$INSTALL_MODE" == "system" ]]; then
+            chown studio:studio "$key_file" "$cert_file"
+        fi
+        color_ok "TLS certificate: $cert_file"
+        info "  key: $key_file"
+        info "  This is a self-signed cert for development. Replace with a real cert for production."
+    fi
+}
+
 install_default_config() {
     info "Installing default configuration"
 
@@ -945,6 +975,7 @@ main() {
     install_python_package
     create_bin_wrappers
     create_directories
+    generate_tls_cert
     install_default_config
     install_systemd_units
 

@@ -16,47 +16,11 @@ import time
 import uuid
 from typing import Any
 
-# ── RPC client (embedded, same pattern as bundler / review workers) ────────────
-
-
-class RpcClient:
-    def __init__(self, socket_path: str) -> None:
-        self.socket_path = socket_path
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._seq = 0
-
-    async def connect(self) -> None:
-        self._reader, self._writer = await asyncio.open_unix_connection(self.socket_path)
-
-    async def close(self) -> None:
-        if self._writer:
-            self._writer.close()
-            try:
-                await self._writer.wait_closed()
-            except Exception:
-                pass
-
-    async def call(self, method: str, params: dict | None = None) -> dict:
-        self._seq += 1
-        msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params or {}, "id": self._seq})
-        self._writer.write((msg + "\n").encode())
-        await self._writer.drain()
-        while True:
-            line = await self._reader.readline()
-            if not line:
-                raise ConnectionError("Connection closed by orchestrator")
-            resp = json.loads(line.decode())
-            if resp.get("id") == self._seq:
-                if "error" in resp:
-                    raise RuntimeError(resp["error"].get("message", "RPC error"))
-                return resp.get("result", {})
-
+from .client import RpcClient, get_orchestrator_addr_display
 
 # ── Configuration from environment ────────────────────────────────────────────
 
 _TOKEN = os.environ.get("STUDIO_WORKER_TOKEN", "")
-_SOCKET_PATH = os.environ.get("STUDIO_SOCKET_PATH", "/run/studio/orchestrator.sock")
 _WORKER_ID = os.environ.get("STUDIO_WORKER_ID", "qa-verification-unknown")
 _BUNDLE_ID = os.environ.get("STUDIO_BUNDLE_ID", "unknown")
 _TASK_SPEC_RAW = os.environ.get("STUDIO_TASK_SPEC", "{}")
@@ -241,7 +205,7 @@ async def run() -> None:
     repo_path = task_spec.get("repo_path", _REPO_PATH)
     verification_plan = task_spec.get("verification_plan", {})
 
-    rpc = RpcClient(_SOCKET_PATH)
+    rpc = RpcClient()
     await rpc.connect()
 
     try:

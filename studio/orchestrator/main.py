@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import signal
+import ssl
 import sys
 import time
 from datetime import datetime, timezone
@@ -73,6 +74,7 @@ class Orchestrator:
         self.scheduler: Scheduler | None = None
         self.reconciler: Reconciler | None = None
         self._server: asyncio.AbstractServer | None = None
+        self._tcp_server: asyncio.AbstractServer | None = None
         self._http_server: "uvicorn.Server | None" = None
         self._poll_task: asyncio.Task | None = None
         self._http_task: asyncio.Task | None = None
@@ -488,7 +490,7 @@ class Orchestrator:
                      self.settings.ops.stall_threshold_hours,
                      self.settings.ops.recall_window_hours)
 
-        # 10. Bind socket (single socket for workers + CLI)
+        # 10. Bind Unix socket (always — workers + CLI + MCP)
         socket_path = cfg.socket_path
         os.makedirs(os.path.dirname(socket_path), exist_ok=True)
         if os.path.exists(socket_path):
@@ -498,8 +500,35 @@ class Orchestrator:
             self._handle_connection, path=socket_path
         )
         os.chmod(socket_path, 0o660)
-        self._running = True
         logger.info("Orchestrator listening on %s", socket_path)
+
+        # 10.5. Start TCP/TLS listener for remote workers (Bundle 4.1)
+        if self.settings.remote_workers.enabled:
+            tls_ctx = _create_tls_context(
+                self.settings.remote_workers.tls_cert_path,
+                self.settings.remote_workers.tls_key_path,
+            )
+            addr = self.settings.remote_workers.listen_addr
+            host, _, port_str = addr.partition(":")
+            port = int(port_str)
+
+            self._tcp_server = await asyncio.start_server(
+                self._handle_connection,
+                host=host,
+                port=port,
+                ssl=tls_ctx,
+            )
+            logger.info("Orchestrator TCP/TLS listener on %s", addr)
+
+            # Record remote workers enabled in audit trail
+            await self.db.execute(
+                "INSERT OR REPLACE INTO settings_metadata (key, value, updated_at) "
+                "VALUES (?, ?, ?)",
+                ("remote_workers_enabled", "1", int(time.time())),
+            )
+            await self.db.conn.commit()
+
+        self._running = True
 
     async def stop(self) -> None:
         """Graceful shutdown: stop accepting, drain loops, close DB."""
@@ -537,6 +566,10 @@ class Orchestrator:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+
+        if self._tcp_server:
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
 
         # Close lingering worker connections
         if self.conn_mgr:
@@ -703,6 +736,7 @@ class Orchestrator:
         - "auth"  → persistent worker session
         - "studio.*" → one-shot CLI request
         """
+        peername = writer.get_extra_info("peername")  # non-None for TCP connections
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=10.0)
             if not line:
@@ -720,7 +754,7 @@ class Orchestrator:
             method = body.get("method", "")
 
             if method == "auth":
-                await self._serve_worker(reader, writer, body)
+                await self._serve_worker(reader, writer, body, peername=peername)
             elif method.startswith("studio."):
                 await self._serve_cli(writer, body)
             else:
@@ -765,8 +799,10 @@ class Orchestrator:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         auth_body: dict,
+        peername: tuple | None = None,
     ) -> None:
         """Authenticate a worker, then pump RPC messages until disconnect."""
+        source_ip = f"{peername[0]}:{peername[1]}" if peername else "local"
         token = auth_body.get("token", "")
         req_id = auth_body.get("id")
 
@@ -792,7 +828,8 @@ class Orchestrator:
         )
         if row is None:
             await self._audit_security("worker_auth_failure", "worker", "",
-                                      {"reason": "invalid_token", "token_prefix": token[:8]})
+                                      {"reason": "invalid_token", "token_prefix": token[:8],
+                                       "source_ip": source_ip})
             writer.write(
                 (
                     json.dumps(
@@ -812,7 +849,8 @@ class Orchestrator:
         token_expires_at = row["token_expires_at"]
         if token_expires_at is not None and int(time.time()) > token_expires_at:
             await self._audit_security("worker_auth_failure", "worker", row["id"],
-                                      {"reason": "token_expired", "expires_at": token_expires_at})
+                                      {"reason": "token_expired", "expires_at": token_expires_at,
+                                       "source_ip": source_ip})
             writer.write(
                 (
                     json.dumps(
@@ -861,6 +899,15 @@ class Orchestrator:
             ).encode()
         )
         await writer.drain()
+
+        # Log successful auth with source IP for TCP connections
+        if peername:
+            await self._audit_security(
+                "worker_auth_success", "worker", worker_id,
+                {"bundle_id": bundle_id, "node_id": node_id, "source_ip": source_ip},
+            )
+            logger.info("Worker %s authenticated from %s (bundle %s, node %s)",
+                        worker_id, source_ip, bundle_id, node_id)
 
         try:
             while True:
@@ -1324,10 +1371,16 @@ async def _cli_status(app: Orchestrator, params: dict) -> dict:
         "SELECT COUNT(*) as cnt FROM dag_nodes WHERE state = 'ready'"
     )
     queue_depth = ready_nodes["cnt"] if ready_nodes else 0
+
+    listeners = [f"unix:{app.settings.orchestrator.socket_path}"]
+    if app.settings.remote_workers.enabled:
+        listeners.append(f"tcp:{app.settings.remote_workers.listen_addr}")
+
     return {
         "uptime": uptime,
         "worker_count": worker_count,
         "queue_depth": queue_depth,
+        "listeners": listeners,
     }
 
 
@@ -1556,6 +1609,14 @@ _CLI_HANDLERS = {
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _create_tls_context(cert_path: str, key_path: str) -> ssl.SSLContext:
+    """Create a server-side TLS context from cert and key files (Bundle 4.1)."""
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert_path, key_path)
+    return ctx
+
 
 def _format_age(seconds: int) -> str:
     if seconds < 60:

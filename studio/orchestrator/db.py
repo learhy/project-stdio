@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class DatabaseVersionError(RuntimeError):
@@ -316,6 +316,23 @@ async def _migrate_v6(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE workers ADD COLUMN token_expires_at INTEGER"
         )
+
+
+@migration(7)
+async def _migrate_v7(conn: aiosqlite.Connection) -> None:
+    """Create settings_metadata table for audit trail of feature flags (Bundle 4.1)."""
+    await conn.executescript("""
+        CREATE TABLE IF NOT EXISTS settings_metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+    """)
+    # Record current remote_workers_enabled state
+    await conn.execute(
+        "INSERT OR IGNORE INTO settings_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+        ("remote_workers_enabled", "0", 0),
+    )
 
 
 class Database:
