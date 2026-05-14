@@ -35,55 +35,200 @@ Worker subprocesses (bubblewrap containers)
   └── QA — post-execution verification
 ```
 
+## Prerequisites
+
+- **Linux** — the orchestrator uses Unix domain sockets, bubblewrap, and network namespaces. Test mode works on any Linux distribution; production needs kernel 5.x or later.
+- **Python 3.12+** — verify with `python3 --version`. Install via `apt install python3.12` (Debian/Ubuntu), `dnf install python3.12` (Fedora), or [pyenv](https://github.com/pyenv/pyenv).
+- **SQLite 3.x** — bundled with Python 3.12. Verify: `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"`.
+- **bubblewrap** — required for production worker isolation. Install with `apt install bubblewrap` (Debian/Ubuntu) or `dnf install bubblewrap` (Fedora). Verify with `bwrap --version`. Test mode does not need bubblewrap.
+- **uv** — Python package manager used throughout. Install: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
+
 ## Quick start
 
+A single walkthrough from clone to working system using test mode (no bubblewrap, no real subprocesses).
+
+### 1. Clone and install
+
 ```bash
+git clone https://github.com/learhy/project-stdio.git
+cd project-stdio
+
 # Create virtual environment and install
 uv venv
 uv pip install -e ".[dev]"
 
-# The studio CLI is now available:
-#   uv run studio <command>          (no activation needed)
-#   source .venv/bin/activate && studio <command>  (activate first)
+# The studio CLI is now available via uv run:
+#   uv run studio <command>
+```
 
-# Run tests
-uv run python -m pytest studio/tests/ -v
+### 2. Start the orchestrator in test mode
 
-# Start orchestrator (test mode — no bwrap needed)
-STUDIO_TEST_MODE=1 STUDIO_ORCH_DB_PATH=/tmp/studio.db \
+Test mode uses `NoopWorkerRunner` — workers are simulated, no bubblewrap isolation, no real subprocesses.
+
+```bash
+STUDIO_TEST_MODE=1 \
+  STUDIO_ORCH_DB_PATH=/tmp/studio.db \
   STUDIO_SOCKET_PATH=/tmp/studio.sock \
-  uv run python -m studio.orchestrator.main &
+  uv run studio-orchestrator &
+```
 
-# Submit a bundle (bundler path — idea only, via JSON file)
+### 3. Verify it's working
+
+```bash
+# CLI health dashboard
+STUDIO_SOCKET_PATH=/tmp/studio.sock uv run studio health
+# Expected: Orchestrator: OK | DB: OK | Uptime: ...
+
+# HTTP health endpoint (for monitoring tools)
+curl http://localhost:7810/health
+# Expected: {"status":"ok"}
+```
+
+### 4. Submit a hello-world bundle
+
+```bash
+# Kernel-direct path (pre-built DAG)
+STUDIO_SOCKET_PATH=/tmp/studio.sock \
+  uv run studio submit studio/tests/fixtures/hello-world.json
+# Prints: Bundle submitted: <bundle-id>
+```
+
+You can also submit an idea and let the bundler worker build the DAG:
+
+```bash
 echo '{"bundle_input": {"idea": "Add a logout button to the settings page"}}' > /tmp/idea.json
-STUDIO_SOCKET_PATH=/tmp/studio.sock \
-  uv run python -m studio.orchestrator.cli submit /tmp/idea.json
+STUDIO_SOCKET_PATH=/tmp/studio.sock uv run studio submit /tmp/idea.json
+```
 
-# Submit a bundle (kernel-direct path — pre-built DAG)
-STUDIO_SOCKET_PATH=/tmp/studio.sock \
-  uv run python -m studio.orchestrator.cli submit \
-  studio/tests/fixtures/hello-world.json
+### 5. Walk the bundle lifecycle
 
-# Check the bundle state
-STUDIO_SOCKET_PATH=/tmp/studio.sock \
-  uv run python -m studio.orchestrator.cli show <bundle-id>
+```bash
+BUNDLE_ID="<your-bundle-id>"
 
-# Approve it
-STUDIO_SOCKET_PATH=/tmp/studio.sock \
-  uv run python -m studio.orchestrator.cli approve <bundle-id>
+# Inspect the proposal
+STUDIO_SOCKET_PATH=/tmp/studio.sock uv run studio show "$BUNDLE_ID"
 
-# Run acceptance tests
+# Approve it — this starts execution
+STUDIO_SOCKET_PATH=/tmp/studio.sock uv run studio approve "$BUNDLE_ID"
+
+# Check the result (test mode completes near-instantly)
+STUDIO_SOCKET_PATH=/tmp/studio.sock uv run studio show "$BUNDLE_ID"
+```
+
+### 6. Run the test suite
+
+```bash
+uv run python -m pytest studio/tests/ -v
+```
+
+### 7. Optional: acceptance tests and MCP server
+
+```bash
+# End-to-end acceptance test
 STUDIO_TEST_MODE=1 bash studio/tests/acceptance.sh
 
-# Start MCP server (test mode — pointed at same orchestrator)
-# STUDIO_DB_PATH must match STUDIO_ORCH_DB_PATH so the MCP server
-# reads from the same database.
+# Start the MCP server (pointed at the same database)
 STUDIO_SOCKET_PATH=/tmp/studio.sock \
   STUDIO_DB_PATH=/tmp/studio.db \
   STUDIO_MCP_PORT=8080 \
   STUDIO_MCP_TOKEN=test-token-123 \
-  uv run python -m studio.mcp.server &
+  uv run studio-mcp &
 ```
+
+## Production deployment
+
+Running without `STUDIO_TEST_MODE` switches to full production mode: the orchestrator spawns real worker subprocesses under bubblewrap isolation with per-worker egress proxies.
+
+### What changes from test mode
+
+| Aspect | Test mode (`STUDIO_TEST_MODE=1`) | Production |
+|--------|----------------------------------|------------|
+| Worker runner | `NoopWorkerRunner` — simulated, instant completion | `LocalBwrapWorkerRunner` — real bubblewrap containers |
+| Bubblewrap | Not needed | Required (`bwrap` must be on PATH) |
+| Egress proxy | None | Per-worker Unix socket proxy enforcing network grants |
+| Git worktrees | Not created | Real `git worktree add` per worker node |
+| Database path | `/tmp/studio.db` | `/var/lib/studio/state.db` |
+| Socket path | `/tmp/studio.sock` | `/run/studio/orchestrator.sock` |
+
+### System dependencies
+
+```bash
+# Install bubblewrap
+apt install bubblewrap
+
+# Create the studio system user
+useradd -r -s /sbin/nologin studio
+
+# Verify bwrap is available
+bwrap --version
+```
+
+### Directory setup
+
+```bash
+mkdir -p /run/studio /var/lib/studio memory/secrets
+chown studio:studio /run/studio /var/lib/studio memory/ memory/secrets/
+```
+
+The orchestrator process needs write access to:
+- `/run/studio/` — Unix domain socket (created at startup)
+- `/var/lib/studio/` — SQLite state database (WAL mode)
+- `memory/secrets/` — secret storage (at the repo root)
+
+### Configuration
+
+The orchestrator uses built-in defaults from the model classes and does not read `settings.json` at runtime. The shipped `settings.json` is a reference file (used by the MCP server, which does load it).
+
+Override key paths via environment variables:
+
+```bash
+export STUDIO_ORCH_DB_PATH=/var/lib/studio/state.db
+export STUDIO_SOCKET_PATH=/run/studio/orchestrator.sock
+export OLLAMA_API_KEY="your-ollama-api-key"
+```
+
+`OLLAMA_API_KEY` is required for any LLM-dependent worker (bundler, developer, review, QA). Without it, worker subprocesses that call the Ollama Cloud API will fail.
+
+### Running with systemd
+
+The repo ships a unit file at `studio/systemd/studio-orchestrator.service`:
+
+```bash
+cp studio/systemd/studio-orchestrator.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now studio-orchestrator
+```
+
+Check status and logs:
+
+```bash
+systemctl status studio-orchestrator
+journalctl -u studio-orchestrator -f
+```
+
+The unit file uses `Type=simple` with `Restart=on-failure`. It sets `WorkingDirectory=/var/lib/studio` and provides `STUDIO_ORCH_DB_PATH` and `STUDIO_ORCH_SOCKET_PATH` environment variables. Logs go to journald via `StandardOutput=journal` + `StandardError=journal`.
+
+### Manual foreground run
+
+```bash
+STUDIO_ORCH_DB_PATH=/var/lib/studio/state.db \
+  STUDIO_SOCKET_PATH=/run/studio/orchestrator.sock \
+  OLLAMA_API_KEY="your-key" \
+  uv run studio-orchestrator
+```
+
+Logs are written to stderr via Python's `logging.basicConfig`.
+
+### Health check
+
+The HTTP listener on port `7810` exposes a health endpoint suitable for external monitoring:
+
+```bash
+curl http://localhost:7810/health
+# {"status":"ok"}
+```
+
+Use this with your monitoring stack — Nagios, Prometheus blackbox exporter, AWS target group health checks, etc. The port is configurable via `orchestrator.http_port` in the model defaults (change by setting the env var if needed).
 
 ## CLI command reference
 
@@ -327,6 +472,23 @@ Note: There is no `submit_bundle` MCP tool yet. New bundles must be created via 
 ### `secrets_config`
 Array of `{"name": "...", "env_var": "...", "purpose": "..."}` entries. Purpose must be one of: `github_auth`, `llm_api`, `registry_auth`, `custom`.
 
+## Environment variables
+
+These override settings at runtime. The orchestrator reads them in `main()`; the CLI and MCP server read a subset.
+
+| Variable | Overrides | Default (when unset) |
+|----------|-----------|---------------------|
+| `STUDIO_TEST_MODE` | Worker runner selection | (empty — production mode) |
+| `STUDIO_ORCH_DB_PATH` | `orchestrator.db_path` | `/var/lib/studio/state.db` |
+| `STUDIO_SOCKET_PATH` | `orchestrator.socket_path` | `/run/studio/orchestrator.sock` |
+| `STUDIO_ORCH_SOCKET_PATH` | `orchestrator.socket_path` (fallback) | (none) |
+| `STUDIO_DB_PATH` | MCP server DB read path | (must match `STUDIO_ORCH_DB_PATH`) |
+| `STUDIO_MCP_PORT` | `mcp.port` | `8080` |
+| `STUDIO_MCP_TOKEN` | `mcp.bearer_token` | (empty — no auth) |
+| `OLLAMA_API_KEY` | LLM API key for worker subprocesses | (none — required for production) |
+
+Socket path resolution order: `STUDIO_SOCKET_PATH` → `STUDIO_ORCH_SOCKET_PATH` (backward compat) → `settings.json` value → model default.
+
 ## Bundle lifecycle
 
 ```
@@ -495,15 +657,19 @@ STUDIO_SOCKET_PATH=/tmp/studio.sock uv run studio health
 
 ### Starting the orchestrator
 
+See [Production deployment](#production-deployment) above for the full setup. Quick reference:
+
 ```bash
 # Production (systemd)
 systemctl start studio-orchestrator
 
 # Manual (foreground)
-uv run python -m studio.orchestrator.main
+STUDIO_ORCH_DB_PATH=/var/lib/studio/state.db \
+  STUDIO_SOCKET_PATH=/run/studio/orchestrator.sock \
+  uv run studio-orchestrator
 ```
 
-The orchestrator uses `sd_notify` (Type=notify) to signal readiness. systemd starts `studio-mcp` only after the orchestrator is accepting connections.
+Logs: `journalctl -u studio-orchestrator -f` (systemd) or stderr (foreground).
 
 ### Monitoring
 
@@ -577,53 +743,6 @@ cp /var/lib/studio/state.db /backup/state-$(date -I).db
 3. The new code may include schema migrations — they run automatically on `connect()`
 4. If the on-disk DB is ahead of the code version, `DatabaseVersionError` is raised and the process exits. Upgrade the code, not the DB.
 5. Start orchestrator: `systemctl start studio-orchestrator`
-
-## Requirements
-
-- Python 3.12+
-- SQLite 3.x
-- bubblewrap (for production worker isolation)
-- Linux (Unix domain sockets, bwrap, network namespaces)
-
-## First-time setup
-
-From `git clone` to a working hello-world bundle:
-
-1. **Create required directories:**
-   ```bash
-   mkdir -p memory/secrets /run/studio /var/lib/studio
-   chown studio:studio /run/studio /var/lib/studio memory/ memory/secrets/
-   ```
-
-2. **Configure `settings.json`:** The repo ships with sensible defaults. Three required keys to set before starting:
-   - `orchestrator.socket_path` — path to the Unix socket (default `/run/studio/orchestrator.sock`)
-   - `orchestrator.db_path` — path to the SQLite state database (default `/var/lib/studio/state.db`)
-   - `orchestrator.memory_root` — path to `memory/` relative to the repo root
-
-   If using GitHub Issues, also configure all `github.*` keys (`app_id`, `installation_id`, `private_key_path`, `webhook_secret`, `owner`, `repo`).
-
-3. **Configure Ollama Cloud credentials:** The bundler, developer, and review workers read the `OLLAMA_API_KEY` environment variable. Set it in the orchestrator's environment or add an entry to `secrets_config` in `settings.json`:
-   ```json
-   "secrets_config": [
-     {"name": "ollama_api_key", "env_var": "OLLAMA_API_KEY", "purpose": "llm_api"}
-   ]
-   ```
-
-4. **Test in test mode first:**
-   ```bash
-   STUDIO_TEST_MODE=1 STUDIO_ORCH_DB_PATH=/tmp/studio.db \
-     STUDIO_SOCKET_PATH=/tmp/studio.sock \
-     uv run python -m studio.orchestrator.main &
-   STUDIO_SOCKET_PATH=/tmp/studio.sock \
-     uv run python -m studio.orchestrator.cli submit \
-     studio/tests/fixtures/hello-world.json
-   ```
-   Test mode uses `NoopWorkerRunner` — no bubblewrap or real workers needed.
-
-5. **Where things live:**
-   - Unix socket: `/run/studio/orchestrator.sock` — CLI and workers connect here
-   - SQLite DB: `/var/lib/studio/state.db` — all bundle/worker/artifact state, WAL mode
-   - `memory/`: lives at the repo root; contains `secrets/`, `calibration/`, `notifications/`, `post-mortems/`
 
 ## License
 
