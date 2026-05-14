@@ -554,30 +554,58 @@ create_directories() {
 generate_tls_cert() {
     local tls_dir
     tls_dir="$(dirname "$CONFIG_FILE")/tls"
-    local cert_file="${tls_dir}/server.crt"
-    local key_file="${tls_dir}/server.key"
+    local ca_cert="${tls_dir}/ca.crt"
+    local ca_key="${tls_dir}/ca.key"
+    local server_cert="${tls_dir}/server.crt"
+    local server_key="${tls_dir}/server.key"
 
-    if [[ -f "$cert_file" ]] && [[ -f "$key_file" ]]; then
-        color_warn "TLS cert already exists at $tls_dir — leaving in place"
+    if [[ -f "$ca_cert" ]] && [[ -f "$ca_key" ]] && [[ -f "$server_cert" ]] && [[ -f "$server_key" ]]; then
+        color_warn "mTLS certs already exist at $tls_dir — leaving in place"
         return
     fi
 
-    info "Generating self-signed TLS certificate for development"
+    info "Generating mTLS certificates (CA + server cert)"
 
-    if ! should_skip "generate self-signed TLS cert"; then
+    if ! should_skip "generate mTLS certificates"; then
         mkdir -p "$tls_dir"
-        openssl req -x509 -newkey rsa:4096 -keyout "$key_file" \
-            -out "$cert_file" -days 365 -nodes \
-            -subj "/CN=studio-orchestrator" 2>/dev/null
-        chmod 600 "$key_file"
-        chmod 644 "$cert_file"
+
+        # Generate CA private key
+        openssl genrsa -out "$ca_key" 4096 2>/dev/null
+        chmod 600 "$ca_key"
+
+        # Generate self-signed CA certificate (10 years)
+        openssl req -x509 -new -nodes -key "$ca_key" -sha256 -days 3650 \
+            -out "$ca_cert" \
+            -subj "/CN=Studio Orchestrator CA/O=Studio" 2>/dev/null
+        chmod 644 "$ca_cert"
+
+        # Generate server private key
+        openssl genrsa -out "$server_key" 4096 2>/dev/null
+        chmod 600 "$server_key"
+
+        # Generate server CSR
+        local server_csr="${tls_dir}/server.csr"
+        openssl req -new -key "$server_key" -out "$server_csr" \
+            -subj "/CN=studio-orchestrator/O=Studio" 2>/dev/null
+
+        # Sign server cert with CA
+        openssl x509 -req -in "$server_csr" -CA "$ca_cert" -CAkey "$ca_key" \
+            -CAcreateserial -out "$server_cert" -days 365 -sha256 2>/dev/null
+        chmod 644 "$server_cert"
+
+        # Clean up CSR
+        rm -f "$server_csr"
 
         if [[ "$INSTALL_MODE" == "system" ]]; then
-            chown studio:studio "$key_file" "$cert_file"
+            chown studio:studio "$ca_cert" "$ca_key" "$server_cert" "$server_key" 2>/dev/null || true
         fi
-        color_ok "TLS certificate: $cert_file"
-        info "  key: $key_file"
-        info "  This is a self-signed cert for development. Replace with a real cert for production."
+
+        color_ok "mTLS certificates generated:"
+        info "  CA cert:  $ca_cert"
+        info "  CA key:   $ca_key"
+        info "  Server cert: $server_cert"
+        info "  Server key:  $server_key"
+        info "  Worker certs are issued automatically at spawn time (20 min validity)."
     fi
 }
 

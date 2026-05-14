@@ -1,6 +1,11 @@
-"""Shared JSON-RPC 2.0 client supporting Unix socket and TCP/TLS transports (Bundle 4.1).
+"""Shared JSON-RPC 2.0 client supporting Unix socket and TCP/mTLS transports.
 
 Used by all worker types (developer, bundler, review, qa).
+
+TCP connections require mutual TLS. Cert paths are read from environment:
+  STUDIO_WORKER_CERT - path to worker certificate PEM file
+  STUDIO_WORKER_KEY  - path to worker private key PEM file
+  STUDIO_ORCHESTRATOR_CA - path to CA certificate PEM file
 """
 
 from __future__ import annotations
@@ -9,6 +14,7 @@ import asyncio
 import json
 import os
 import ssl
+from pathlib import Path
 from typing import Any
 
 
@@ -42,8 +48,27 @@ def get_orchestrator_addr_display() -> str:
     )
 
 
+def _build_mtls_context() -> ssl.SSLContext:
+    """Build an mTLS client SSL context from env-provided cert/key/CA paths."""
+    cert_path = os.environ.get("STUDIO_WORKER_CERT", "")
+    key_path = os.environ.get("STUDIO_WORKER_KEY", "")
+    ca_path = os.environ.get("STUDIO_ORCHESTRATOR_CA", "")
+
+    if not cert_path or not key_path or not ca_path:
+        raise RuntimeError(
+            "TCP transport requires mTLS: set STUDIO_WORKER_CERT, STUDIO_WORKER_KEY, "
+            "and STUDIO_ORCHESTRATOR_CA environment variables"
+        )
+
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_path)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.check_hostname = False
+    ctx.load_cert_chain(cert_path, key_path)
+    return ctx
+
+
 class RpcClient:
-    """Minimal JSON-RPC 2.0 client over Unix socket or TCP/TLS."""
+    """Minimal JSON-RPC 2.0 client over Unix socket or TCP/mTLS."""
 
     def __init__(self) -> None:
         scheme, target, port = _parse_orchestrator_addr()
@@ -58,9 +83,7 @@ class RpcClient:
         if self._scheme == "unix":
             self.reader, self.writer = await asyncio.open_unix_connection(self._target)
         else:
-            tls_ctx = ssl.create_default_context()
-            tls_ctx.check_hostname = False
-            tls_ctx.verify_mode = ssl.CERT_NONE
+            tls_ctx = _build_mtls_context()
             self.reader, self.writer = await asyncio.open_connection(
                 self._target, self._port, ssl=tls_ctx,
             )

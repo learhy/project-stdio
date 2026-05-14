@@ -43,6 +43,7 @@ from .rpc import (
     INTERNAL_ERROR,
 )
 from .runner import LocalBwrapWorkerRunner
+from . import tls as tls_helpers
 from .executor import DagExecutor
 from .scheduler import Scheduler
 from .reconciler import Reconciler
@@ -431,6 +432,8 @@ class Orchestrator:
                 cfg.socket_path,
                 egress_proxy=self.settings.egress_proxy,
                 token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
+                ca_cert_path=self.settings.remote_workers.tls_ca_cert_path,
+                ca_key_path=self.settings.remote_workers.tls_ca_key_path,
             )
 
         # 5. Executor
@@ -502,11 +505,13 @@ class Orchestrator:
         os.chmod(socket_path, 0o660)
         logger.info("Orchestrator listening on %s", socket_path)
 
-        # 10.5. Start TCP/TLS listener for remote workers (Bundle 4.1)
+        # 10.5. Start TCP/TLS listener for remote workers with mutual TLS (Bundle 4.1)
         if self.settings.remote_workers.enabled:
-            tls_ctx = _create_tls_context(
-                self.settings.remote_workers.tls_cert_path,
-                self.settings.remote_workers.tls_key_path,
+            rw = self.settings.remote_workers
+            # Generate CA at startup (idempotent)
+            tls_helpers.generate_ca(rw.tls_ca_cert_path, rw.tls_ca_key_path)
+            tls_ctx = tls_helpers.create_server_tls_context(
+                rw.tls_ca_cert_path, rw.tls_server_cert_path, rw.tls_server_key_path
             )
             addr = self.settings.remote_workers.listen_addr
             host, _, port_str = addr.partition(":")
@@ -869,6 +874,47 @@ class Orchestrator:
         worker_id = row["id"]
         bundle_id = row["bundle_id"]
         node_id = row["node_id"]
+
+        # For TCP connections, validate mTLS client cert CN matches worker_id
+        if peername:
+            ssl_obj = writer.get_extra_info("ssl_object")
+            if ssl_obj is None:
+                await self._audit_security("worker_auth_failure", "worker", worker_id,
+                                          {"reason": "no_tls_for_tcp", "source_ip": source_ip})
+                writer.write(
+                    (json.dumps(_make_error(CAPABILITY_DENIED, "mTLS required for TCP connections", req_id=req_id)) + "\n").encode()
+                )
+                await writer.drain()
+                return
+
+            peer_cert = ssl_obj.getpeercert(binary_form=False)
+            if peer_cert is None:
+                await self._audit_security("worker_auth_failure", "worker", worker_id,
+                                          {"reason": "no_client_cert", "source_ip": source_ip})
+                writer.write(
+                    (json.dumps(_make_error(CAPABILITY_DENIED, "Client certificate required", req_id=req_id)) + "\n").encode()
+                )
+                await writer.drain()
+                return
+
+            # Extract CN from peer cert subject
+            cert_cn = ""
+            for field in peer_cert.get("subject", ()):
+                for attr in field:
+                    if attr[0] == "commonName":
+                        cert_cn = attr[1]
+                        break
+
+            if cert_cn != worker_id:
+                await self._audit_security("worker_auth_failure", "worker", worker_id,
+                                          {"reason": "cert_cn_mismatch", "cert_cn": cert_cn, "source_ip": source_ip})
+                writer.write(
+                    (json.dumps(_make_error(CAPABILITY_DENIED, "Certificate CN does not match worker identity", req_id=req_id)) + "\n").encode()
+                )
+                await writer.drain()
+                return
+
+            logger.info("mTLS CN verified: %s", cert_cn)
 
         rpc_methods: list[str] = ["worker.*"]
         if row["manifest_json"]:
@@ -1609,14 +1655,6 @@ _CLI_HANDLERS = {
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _create_tls_context(cert_path: str, key_path: str) -> ssl.SSLContext:
-    """Create a server-side TLS context from cert and key files (Bundle 4.1)."""
-    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(cert_path, key_path)
-    return ctx
-
 
 def _format_age(seconds: int) -> str:
     if seconds < 60:

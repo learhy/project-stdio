@@ -246,7 +246,8 @@ class TestTcpTlsListener:
              patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
              patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
              patch("studio.orchestrator.main.asyncio.start_server") as mock_tcp_server, \
-             patch("studio.orchestrator.main._create_tls_context") as mock_tls, \
+             patch("studio.orchestrator.main.tls_helpers.generate_ca") as mock_gen_ca, \
+             patch("studio.orchestrator.main.tls_helpers.create_server_tls_context") as mock_create_ctx, \
              patch("studio.orchestrator.main.os.chmod"), \
              patch("studio.orchestrator.main.os.path.exists", return_value=False), \
              patch("studio.orchestrator.main.os.unlink"):
@@ -275,11 +276,12 @@ class TestTcpTlsListener:
             mock_tcp_server.return_value = mock_tcp
 
             mock_tls_ctx = MagicMock()
-            mock_tls.return_value = mock_tls_ctx
+            mock_create_ctx.return_value = mock_tls_ctx
 
             await app.start()
 
-            mock_tls.assert_called_once()
+            mock_gen_ca.assert_called_once()
+            mock_create_ctx.assert_called_once()
             mock_tcp_server.assert_called_once_with(
                 app._handle_connection,
                 host="0.0.0.0",
@@ -293,24 +295,42 @@ class TestTcpTlsListener:
 
             await app.stop()
 
-    def test_create_tls_context(self, tmp_path):
-        from studio.orchestrator.main import _create_tls_context
+    def test_create_server_tls_context(self, tmp_path):
+        from studio.orchestrator.tls import create_server_tls_context, generate_ca
         import ssl as ssl_mod
 
-        cert_path = tmp_path / "server.crt"
-        key_path = tmp_path / "server.key"
+        # Generate CA
+        ca_cert_path = tmp_path / "ca.crt"
+        ca_key_path = tmp_path / "ca.key"
+        generate_ca(str(ca_cert_path), str(ca_key_path))
 
-        # Generate a real key/cert pair for the test
+        # Generate server cert signed by CA
         import subprocess
+        server_key_path = tmp_path / "server.key"
+        server_csr_path = tmp_path / "server.csr"
+        server_cert_path = tmp_path / "server.crt"
+
         subprocess.run([
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key_path),
-            "-out", str(cert_path), "-days", "1", "-nodes",
+            "openssl", "genrsa", "-out", str(server_key_path), "2048",
+        ], check=True, capture_output=True)
+        subprocess.run([
+            "openssl", "req", "-new", "-key", str(server_key_path),
+            "-out", str(server_csr_path),
             "-subj", "/CN=test-orchestrator",
         ], check=True, capture_output=True)
+        subprocess.run([
+            "openssl", "x509", "-req", "-in", str(server_csr_path),
+            "-CA", str(ca_cert_path), "-CAkey", str(ca_key_path),
+            "-CAcreateserial", "-out", str(server_cert_path),
+            "-days", "1", "-sha256",
+        ], check=True, capture_output=True)
 
-        ctx = _create_tls_context(str(cert_path), str(key_path))
+        ctx = create_server_tls_context(
+            str(ca_cert_path), str(server_cert_path), str(server_key_path)
+        )
         assert isinstance(ctx, ssl_mod.SSLContext)
         assert ctx.minimum_version == ssl_mod.TLSVersion.TLSv1_2
+        assert ctx.verify_mode == ssl_mod.CERT_REQUIRED
 
 
 class TestCliHandlers:

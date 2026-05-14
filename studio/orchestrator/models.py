@@ -698,11 +698,13 @@ class OpsSettings(BaseModel):
 
 
 class RemoteWorkersSettings(BaseModel):
-    """TCP/TLS listener for remote worker connections (Bundle 4.1)."""
+    """TCP/TLS listener for remote worker connections with mutual TLS (Bundle 4.1)."""
     enabled: bool = False
     listen_addr: str = "0.0.0.0:7811"
-    tls_cert_path: str = "/etc/studio/tls/server.crt"
-    tls_key_path: str = "/etc/studio/tls/server.key"
+    tls_ca_cert_path: str = "/etc/studio/tls/ca.crt"
+    tls_ca_key_path: str = "/etc/studio/tls/ca.key"
+    tls_server_cert_path: str = "/etc/studio/tls/server.crt"
+    tls_server_key_path: str = "/etc/studio/tls/server.key"
 
 
 class Settings(BaseModel):
