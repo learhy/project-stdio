@@ -23,7 +23,16 @@ from .display import (
 
 async def _send_rpc(socket_path: str, method: str, params: dict[str, Any] | None = None) -> dict:
     """Send a JSON-RPC request over the Unix socket and return the result."""
-    reader, writer = await asyncio.open_unix_connection(socket_path)
+    try:
+        reader, writer = await asyncio.open_unix_connection(socket_path)
+    except (FileNotFoundError, ConnectionRefusedError):
+        return {
+            "error": {
+                "code": -1,
+                "message": f"Orchestrator not running (no socket at {socket_path}). "
+                           f"Start it first: STUDIO_TEST_MODE=1 uv run python -m studio.orchestrator.main &",
+            }
+        }
 
     msg = {
         "jsonrpc": "2.0",
@@ -45,7 +54,7 @@ async def _send_rpc(socket_path: str, method: str, params: dict[str, Any] | None
 
 
 def _get_socket_path() -> str:
-    return os.environ.get("STUDIO_SOCKET_PATH", "/run/studio/orchestrator.sock")
+    return os.environ.get("STUDIO_SOCKET_PATH", "/tmp/studio.sock")
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────

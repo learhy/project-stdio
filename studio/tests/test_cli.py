@@ -19,7 +19,7 @@ from studio.orchestrator.cli import (
 
 class TestGetSocketPath:
     def test_default(self):
-        assert _get_socket_path() == "/run/studio/orchestrator.sock"
+        assert _get_socket_path() == "/tmp/studio.sock"
 
     @patch.dict("os.environ", {"STUDIO_SOCKET_PATH": "/custom/path.sock"})
     def test_from_env(self):
