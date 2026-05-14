@@ -374,6 +374,123 @@ All three surfaces write to the same state machine and are not differentially tr
 - **GitHub Issues**: `/approve`, `/reject <reason>`, `/modify <instructions>` comments — async, structured, permanent record
 - **MCP**: Claude Desktop tool interface — human must click to confirm each action
 
+## Getting Started with GitHub
+
+Studio integrates with GitHub Issues as an approval surface, allowing PMs and reviewers to approve, reject, or request modifications to bundles directly from issue comments. This section covers setting up the integration end-to-end.
+
+### 1. Create a GitHub App
+
+The orchestrator authenticates to GitHub as a GitHub App using JWT-based auth.
+
+1. Go to **Settings > Developer settings > GitHub Apps** in your organization or user account.
+2. Click **New GitHub App** and configure:
+   - **Name**: `studio-orchestrator` (or your preferred name)
+   - **Homepage URL**: your repo URL
+   - **Webhook URL**: `https://<your-domain>/github/webhook` (the orchestrator's HTTP server handles this)
+   - **Webhook secret**: generate a random string (e.g., `openssl rand -hex 32`)
+3. Under **Permissions**, set:
+   - **Issues**: Read & Write
+   - **Metadata**: Read-only (mandatory)
+4. Under **Subscribe to events**, check **Issues** and **Issue comments**.
+5. Click **Create GitHub App**.
+6. After creation, generate a **private key** and download the `.pem` file.
+7. Note the **App ID** from the app's settings page.
+8. Go to **Install App** and install it on your target repo or organization. Note the **Installation ID** from the installation URL (`.../installations/<id>`).
+
+### 2. Configure Studio
+
+Add your GitHub App credentials to `settings.json`:
+
+```json
+{
+  "github": {
+    "enabled": true,
+    "app_id": "123456",
+    "installation_id": "987654321",
+    "private_key_path": "/etc/studio/github-app.pem",
+    "webhook_secret": "your-webhook-secret",
+    "owner": "your-org",
+    "repo": "your-repo"
+  }
+}
+```
+
+Or use environment variables:
+
+```bash
+export STUDIO_GITHUB_ENABLED=true
+export STUDIO_GITHUB_APP_ID=123456
+export STUDIO_GITHUB_INSTALLATION_ID=987654321
+export STUDIO_GITHUB_PRIVATE_KEY_PATH=/etc/studio/github-app.pem
+export STUDIO_GITHUB_WEBHOOK_SECRET=your-webhook-secret
+export STUDIO_GITHUB_OWNER=your-org
+export STUDIO_GITHUB_REPO=your-repo
+```
+
+### 3. Expose the webhook endpoint
+
+The orchestrator runs an HTTP server on `orchestrator.http_port` (default `7810`) that exposes:
+
+- `GET /health` — liveness check
+- `POST /github/webhook` — HMAC-SHA256 validated webhook receiver
+
+In production, place a reverse proxy (nginx, Caddy) in front of the orchestrator to handle TLS termination. Example nginx config:
+
+```nginx
+location /github/webhook {
+    proxy_pass http://127.0.0.1:7810;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+}
+```
+
+### 4. Create issues to submit bundles
+
+Create a GitHub issue describing the change you want. The orchestrator polls for new issues (every `poll_interval_seconds`, default 60s), converts them into bundle submissions, and posts a comment with the bundle ID and review deck when ready.
+
+Issue title and body become the bundle's idea description. The orchestrator spawns a bundler worker that produces a proposal + DAG, then the bundle enters `IN_REVIEW`.
+
+### 5. Approve, reject, or modify from comments
+
+Once a bundle is in review, post issue comments with slash commands:
+
+| Comment | Effect |
+|---------|--------|
+| `/approve` | Approve the bundle and start execution |
+| `/reject <reason>` | Reject the bundle with an explanation |
+| `/modify <instructions>` | Send the bundle back for revision with specific guidance |
+
+The orchestrator detects these commands via issue comment polling and transitions the bundle through the state machine. All actions are recorded as issue comments for a permanent audit trail.
+
+Example workflow:
+
+```
+PM opens issue: "Add rate limiting to the API gateway"
+  → orchestrator detects issue, creates bundle, posts review deck comment
+
+Reviewer comments: "/approve"
+  → bundle transitions APPROVED → IN_PROGRESS
+  → worker executes, posts progress updates as issue comments
+
+QA worker completes verification:
+  → final outcome posted as issue comment, issue auto-closed
+```
+
+### 6. Verify the integration
+
+Use the CLI to confirm GitHub connectivity and issue ingestion:
+
+```bash
+# Run in test mode first with GitHub polling enabled
+STUDIO_TEST_MODE=1 \
+  STUDIO_ORCH_DB_PATH=/tmp/studio.db \
+  STUDIO_SOCKET_PATH=/tmp/studio.sock \
+  uv run python -m studio.orchestrator.main &
+
+# Check health — github_enabled should show true
+STUDIO_SOCKET_PATH=/tmp/studio.sock uv run studio health
+```
+
 ## Operational runbook
 
 ### Starting the orchestrator
