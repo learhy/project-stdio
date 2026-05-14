@@ -372,6 +372,32 @@ async def cmd_fleet_remove(name: str) -> int:
     return 0
 
 
+async def cmd_k8s_status() -> int:
+    """Show active Kubernetes Jobs for workers (Bundle 4.3)."""
+    resp = await _send_rpc(_get_socket_path(), "studio.k8s_status", {})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    jobs = data.get("jobs", [])
+    namespace = data.get("namespace", "studio-workers")
+
+    if not jobs:
+        print(f"No active studio worker Jobs in namespace '{namespace}'.")
+        return 0
+
+    print(f"Active studio worker Jobs in '{namespace}':")
+    print(f"{'Job Name':<36} {'Bundle ID':<28} {'Active':<8} {'Succeeded':<11} {'Failed':<8} {'Age':<8}")
+    print("-" * 100)
+    for j in jobs:
+        age = f"{j.get('age', 0)}s" if j.get('age', 0) < 3600 else f"{j.get('age', 0) // 60}m"
+        print(f"{j['name']:<36} {j.get('bundle_id', ''):<28} "
+              f"{j.get('active', 0):<8} {j.get('succeeded', 0):<11} "
+              f"{j.get('failed', 0):<8} {age:<8}")
+    return 0
+
+
 async def cmd_calibration_report() -> int:
     """Print calibration report from memory/calibration/."""
     resp = await _send_rpc(_get_socket_path(), "studio.calibration_report", {})
@@ -446,6 +472,9 @@ def main() -> None:
     # fleet-status (Bundle 4.2)
     sub.add_parser("fleet-status", help="Show remote fleet host status")
 
+    # k8s-status (Bundle 4.3)
+    sub.add_parser("k8s-status", help="Show active Kubernetes Jobs for workers")
+
     # fleet-add (Bundle 4.2)
     p_fadd = sub.add_parser("fleet-add", help="Add a host to the remote fleet")
     p_fadd.add_argument("name", help="Host name")
@@ -495,6 +524,8 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_calibration_report())
         elif args.command == "fleet-status":
             exit_code = loop.run_until_complete(cmd_fleet_status())
+        elif args.command == "k8s-status":
+            exit_code = loop.run_until_complete(cmd_k8s_status())
         elif args.command == "fleet-add":
             exit_code = loop.run_until_complete(cmd_fleet_add(args.name, args.addr, args))
         elif args.command == "fleet-remove":

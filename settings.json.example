@@ -55,6 +55,17 @@
     ],
     "selection_policy": "least_loaded"
   },
+  "k8s_runner": {
+    "enabled": false,
+    "kubeconfig_path": null,
+    "namespace": "studio-workers",
+    "orchestrator_tcp_addr": "orchestrator.internal:7811",
+    "image_pull_policy": "IfNotPresent",
+    "worktree_mode": "init_container",
+    "default_storage_class": null,
+    "worker_image": "studio-worker:latest",
+    "proxy_image": "studio-proxy:latest"
+  },
   "artifacts": {
     "inline_threshold_bytes": 4096,
     "global_storage_cap_bytes": 50000000000,

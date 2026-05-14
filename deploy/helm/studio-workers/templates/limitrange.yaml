@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: studio-worker-limits
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: studio-workers
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: {{ .Values.limitRange.defaultCpu }}
+        memory: {{ .Values.limitRange.defaultMemory }}
+      defaultRequest:
+        cpu: "500m"
+        memory: "512Mi"
+      max:
+        cpu: {{ .Values.limitRange.maxCpu }}
+        memory: {{ .Values.limitRange.maxMemory }}

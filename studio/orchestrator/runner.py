@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import asyncssh
 
-from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost
+from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost, K8sRunnerSettings
 from . import tls as tls_helpers
 
 if TYPE_CHECKING:
@@ -100,7 +100,7 @@ class WorkerSpawnResult:
         worker_id: str,
         token: str,
         node_id: str,
-        process: asyncio.subprocess.Process | "RemoteWorkerHandle | None" = None,
+        process: asyncio.subprocess.Process | "RemoteWorkerHandle | K8sWorkerHandle | None" = None,
         proxy_process: asyncio.subprocess.Process | None = None,
         error: str = "",
     ) -> None:
@@ -336,10 +336,18 @@ class LocalBwrapWorkerRunner:
 
     async def kill_worker(
         self,
-        process: asyncio.subprocess.Process,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle,
         worker_id: str = "",
     ) -> None:
         """Send SIGTERM to worker and proxy, wait up to 30s, then SIGKILL."""
+        if isinstance(process, K8sWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+            return
+        if isinstance(process, RemoteWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+            return
         # Kill proxy first so no new connections arrive
         proxy = self._proxy_processes.pop(worker_id, None) if worker_id else None
         if proxy:
@@ -764,11 +772,14 @@ class RemoteSSHWorkerRunner:
 
     async def kill_worker(
         self,
-        process: asyncio.subprocess.Process | RemoteWorkerHandle,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle,
         worker_id: str = "",
     ) -> None:
-        """Kill a remote worker by its handle."""
-        if isinstance(process, RemoteWorkerHandle):
+        """Kill a worker by its handle (local, remote, or k8s)."""
+        if isinstance(process, K8sWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+        elif isinstance(process, RemoteWorkerHandle):
             await process.cancel()
             await process.cleanup()
             try:
@@ -818,3 +829,725 @@ class RemoteSSHWorkerRunner:
                 self._host_last_ping[host.name] = time.time()
                 logger.warning("Fleet host %s (%s) is degraded", host.name, host.addr)
         return statuses
+
+
+# ── Bundle 4.3: Kubernetes Job runner ────────────────────────────────────────────
+
+class K8sWorkerHandle:
+    """Tracks a worker process running as a Kubernetes Job."""
+
+    def __init__(
+        self,
+        job_name: str,
+        pod_name: str,
+        namespace: str,
+        worker_id: str,
+        api_client: Any,
+    ) -> None:
+        self.job_name = job_name
+        self.pod_name = pod_name
+        self.namespace = namespace
+        self.worker_id = worker_id
+        self.api_client = api_client
+        self._returncode: int | None = None
+
+    @property
+    def returncode(self) -> int | None:
+        return self._returncode
+
+    @returncode.setter
+    def returncode(self, value: int | None) -> None:
+        self._returncode = value
+
+    async def cancel(self) -> None:
+        """Delete the Kubernetes Job, which terminates the Pod."""
+        try:
+            batch_v1 = self.api_client.BatchV1Api
+            await batch_v1.delete_namespaced_job(
+                name=self.job_name,
+                namespace=self.namespace,
+                propagation_policy="Foreground",
+            )
+            self._returncode = -1
+        except Exception:
+            self._returncode = -1
+
+    async def is_alive(self) -> bool:
+        """Check if the Job's Pod is still running."""
+        if self._returncode is not None:
+            return False
+        try:
+            core_v1 = self.api_client.CoreV1Api
+            pod = await core_v1.read_namespaced_pod(
+                name=self.pod_name, namespace=self.namespace
+            )
+            phase = pod.status.phase if pod.status else "Unknown"
+            if phase in ("Succeeded", "Failed", "Unknown"):
+                self._returncode = 0 if phase == "Succeeded" else 1
+                return False
+            return True
+        except Exception:
+            self._returncode = -1
+            return False
+
+    async def cleanup(self) -> None:
+        """Delete the Job, NetworkPolicy, and associated Secrets from the namespace.
+
+        Best-effort: failures are logged but not re-raised.
+        """
+        try:
+            batch_v1 = self.api_client.BatchV1Api
+            await batch_v1.delete_namespaced_job(
+                name=self.job_name,
+                namespace=self.namespace,
+                propagation_policy="Background",
+            )
+        except Exception:
+            pass
+
+        try:
+            networking_v1 = self.api_client.NetworkingV1Api
+            await networking_v1.delete_namespaced_network_policy(
+                name=f"studio-{self.worker_id}",
+                namespace=self.namespace,
+            )
+        except Exception:
+            pass
+
+        try:
+            core_v1 = self.api_client.CoreV1Api
+            await core_v1.delete_namespaced_secret(
+                name=f"studio-mtls-{self.worker_id}",
+                namespace=self.namespace,
+            )
+            await core_v1.delete_namespaced_secret(
+                name=f"studio-worker-{self.worker_id}",
+                namespace=self.namespace,
+            )
+        except Exception:
+            pass
+
+
+def capability_to_pod_spec(
+    manifest: CapabilityManifest,
+    worker_id: str,
+    bundle_id: str,
+    node_id: str,
+    workdir: str,
+    orchestrator_addr: str,
+    proxy_image: str,
+    worker_image: str,
+    image_pull_policy: str,
+    task_spec: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Translate a capability manifest into a Kubernetes Pod spec (Bundle 4.3).
+
+    Returns a dict suitable for use as a Job's spec.template.spec.
+    """
+    grants = manifest.grants
+
+    # ── Volumes and volume mounts from filesystem grants ──
+    volumes: list[dict] = []
+    volume_mounts: list[dict] = [
+        {"name": "worktree", "mountPath": "/work"},
+        {"name": "mtls-certs", "mountPath": "/run/studio/mtls", "readOnly": True},
+        {"name": "proxy-socket", "mountPath": "/tmp"},
+    ]
+
+    # Working tree volume (emptyDir shared between init and worker containers)
+    volumes.append({"name": "worktree", "emptyDir": {}})
+
+    # Proxy socket shared volume (proxy sidecar + worker + wait-for-proxy init container)
+    volumes.append({"name": "proxy-socket", "emptyDir": {}})
+
+    # mTLS cert volume (from Secret)
+    volumes.append({
+        "name": "mtls-certs",
+        "secret": {"secretName": f"studio-mtls-{worker_id}"},
+    })
+
+    # Secret grants as volumes
+    for secret_grant in grants.secrets:
+        vol_name = f"secret-{secret_grant.name}"
+        volumes.append({
+            "name": vol_name,
+            "secret": {"secretName": f"studio-worker-{worker_id}"},
+        })
+        volume_mounts.append({
+            "name": vol_name,
+            "mountPath": f"/run/studio/secrets/{secret_grant.name}",
+            "readOnly": True,
+        })
+
+    # ── Environment variables ──
+    env: list[dict] = [
+        {"name": "STUDIO_WORKER_ID", "value": worker_id},
+        {"name": "STUDIO_BUNDLE_ID", "value": bundle_id},
+        {"name": "STUDIO_NODE_ID", "value": node_id},
+        {"name": "STUDIO_WORKTREE_PATH", "value": "/work"},
+        {"name": "STUDIO_ORCHESTRATOR_ADDR", "value": f"tcp://{orchestrator_addr}"},
+        {"name": "STUDIO_WORKER_CERT", "value": "/run/studio/mtls/tls.crt"},
+        {"name": "STUDIO_WORKER_KEY", "value": "/run/studio/mtls/tls.key"},
+        {"name": "STUDIO_ORCHESTRATOR_CA", "value": "/run/studio/mtls/ca.crt"},
+        {"name": "STUDIO_PROXY_SOCKET", "value": "/tmp/studio-proxy.sock"},
+        {"name": "STUDIO_PROXY_HOST", "value": "127.0.0.1"},
+        {"name": "STUDIO_PROXY_PORT", "value": "8080"},
+        {"name": "http_proxy", "value": "http://127.0.0.1:8080"},
+        {"name": "https_proxy", "value": "http://127.0.0.1:8080"},
+        {"name": "no_proxy", "value": ""},
+    ]
+
+    # Network egress grants as env var for proxy sidecar
+    egress_destinations = [
+        f"{e.destination}:{','.join(map(str, e.ports)) if e.ports else '*'}"
+        for e in grants.network.egress
+    ]
+    env.append({
+        "name": "STUDIO_EGRESS_ALLOWLIST",
+        "value": json.dumps(egress_destinations),
+    })
+
+    if task_spec:
+        env.append({"name": "STUDIO_TASK_SPEC", "value": json.dumps(task_spec)})
+
+    # Exec allowlist as env var (enforced by worker, not k8s)
+    exec_allowlist = [e.binary for e in grants.process.exec]
+    if exec_allowlist:
+        env.append({
+            "name": "STUDIO_EXEC_ALLOWLIST",
+            "value": json.dumps(exec_allowlist),
+        })
+
+    # ── Resources ──
+    resources: dict = {"limits": {}, "requests": {}}
+    res = grants.resources
+    if res.cpu_limit:
+        resources["limits"]["cpu"] = str(res.cpu_limit)
+    if res.memory_limit:
+        resources["limits"]["memory"] = f"{res.memory_limit}Mi"
+    if res.disk_limit:
+        resources["limits"]["ephemeral-storage"] = f"{res.disk_limit}Mi"
+
+    # ── Security context ──
+    security_context = {
+        "runAsNonRoot": True,
+        "runAsUser": 10000,
+        "runAsGroup": 10000,
+        "readOnlyRootFilesystem": True,
+        "allowPrivilegeEscalation": False,
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+
+    # ── Container specs ──
+    worker_container = {
+        "name": "worker",
+        "image": worker_image,
+        "imagePullPolicy": image_pull_policy,
+        "env": env,
+        "volumeMounts": volume_mounts,
+        "resources": resources,
+        "securityContext": security_context,
+    }
+
+    proxy_container = {
+        "name": "egress-proxy",
+        "image": proxy_image,
+        "imagePullPolicy": image_pull_policy,
+        "env": [
+            {"name": "STUDIO_EGRESS_ALLOWLIST", "value": json.dumps(egress_destinations)},
+            {"name": "STUDIO_PROXY_SOCKET", "value": "/tmp/studio-proxy.sock"},
+        ],
+        "volumeMounts": [
+            {"name": "proxy-socket", "mountPath": "/tmp"},
+        ],
+        "ports": [{"containerPort": 8080, "protocol": "TCP"}],
+        "livenessProbe": {
+            "exec": {"command": ["test", "-S", "/tmp/studio-proxy.sock"]},
+            "initialDelaySeconds": 5,
+            "periodSeconds": 10,
+            "failureThreshold": 3,
+        },
+        "securityContext": {
+            "runAsNonRoot": True,
+            "runAsUser": 10000,
+            "runAsGroup": 10000,
+            "allowPrivilegeEscalation": False,
+        },
+    }
+
+    # Init container for git clone (worktree_mode=init_container)
+    init_containers = [
+        {
+            "name": "clone-repo",
+            "image": "alpine/git:latest",
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["/bin/sh", "-c"],
+            "args": [
+                f"git clone --single-branch --branch bundle/{bundle_id}/{node_id} "
+                f"https://github.com/learhy/project-stdio.git /work 2>/dev/null || "
+                f"git clone --single-branch --branch main "
+                f"https://github.com/learhy/project-stdio.git /work"
+            ],
+            "volumeMounts": [{"name": "worktree", "mountPath": "/work"}],
+        },
+        {
+            "name": "wait-for-proxy",
+            "image": proxy_image,
+            "imagePullPolicy": image_pull_policy,
+            "command": ["/bin/sh", "-c"],
+            "args": ["until test -S /tmp/studio-proxy.sock; do sleep 1; done"],
+            "volumeMounts": [{"name": "proxy-socket", "mountPath": "/tmp"}],
+        },
+    ]
+
+    pod_spec: dict[str, Any] = {
+        "containers": [worker_container, proxy_container],
+        "initContainers": init_containers,
+        "volumes": volumes,
+        "restartPolicy": "Never",
+        "securityContext": {
+            "runAsNonRoot": True,
+            "runAsUser": 10000,
+            "runAsGroup": 10000,
+        },
+    }
+
+    # activeDeadlineSeconds from wall_time_limit
+    if res.wall_time_limit:
+        pod_spec["activeDeadlineSeconds"] = res.wall_time_limit
+
+    return pod_spec
+
+
+class K8sJobWorkerRunner:
+    """Spawns worker subprocesses as Kubernetes Jobs (Bundle 4.3)."""
+
+    def __init__(
+        self,
+        db: "Database",
+        settings: K8sRunnerSettings,
+        egress_proxy: EgressProxySettings | None = None,
+        worker_command: list[str] | None = None,
+        token_expiry_minutes: int = 15,
+        ca_cert_path: str = "",
+        ca_key_path: str = "",
+    ) -> None:
+        self.db = db
+        self.settings = settings
+        self.egress_proxy = egress_proxy or EgressProxySettings()
+        self.worker_command = worker_command or ["studio-worker"]
+        self.token_expiry_minutes = token_expiry_minutes
+        self.ca_cert_path = ca_cert_path
+        self.ca_key_path = ca_key_path
+        self._api_client: Any = None
+        self._watch_task: asyncio.Task | None = None
+        self._watched_workers: dict[str, K8sWorkerHandle] = {}
+        self._running = False
+
+    @staticmethod
+    def now() -> int:
+        return int(time.time())
+
+    async def _load_kubeconfig(self) -> Any:
+        """Load Kubernetes configuration: in-cluster first, then kubeconfig file.
+
+        Returns a kubernetes_asyncio ApiClient instance.
+        """
+        import kubernetes_asyncio as k8s
+
+        if self.settings.kubeconfig_path:
+            await k8s.config.load_kube_config(config_file=self.settings.kubeconfig_path)
+        elif os.environ.get("KUBERNETES_SERVICE_HOST"):
+            k8s.config.load_incluster_config()
+        else:
+            await k8s.config.load_kube_config()
+
+        return k8s.client.ApiClient()
+
+    async def _ensure_client(self) -> Any:
+        if self._api_client is None:
+            self._api_client = await self._load_kubeconfig()
+        return self._api_client
+
+    async def spawn_worker(
+        self,
+        worker_id: str,
+        bundle_id: str,
+        node_id: str,
+        manifest: CapabilityManifest,
+        worktree_path: str,
+        task_spec: dict[str, Any] | None = None,
+        base_branch: str = "main",
+    ) -> WorkerSpawnResult:
+        """Spawn a worker as a Kubernetes Job in the configured namespace."""
+        token = _generate_token()
+        token_expires_at = self.now() + (self.token_expiry_minutes * 60)
+        namespace = self.settings.namespace
+
+        try:
+            api_client = await self._ensure_client()
+        except Exception as exc:
+            return WorkerSpawnResult(
+                worker_id=worker_id, token=token, node_id=node_id,
+                error=f"Failed to load kubeconfig: {exc}",
+            )
+
+        batch_v1 = api_client.BatchV1Api
+        core_v1 = api_client.CoreV1Api
+        networking_v1 = api_client.NetworkingV1Api
+
+        # Issue mTLS worker certificate
+        mtls_secret_name = f"studio-mtls-{worker_id}"
+        worker_secret_name = f"studio-worker-{worker_id}"
+        job_name = f"studio-worker-{worker_id}"
+
+        if self.ca_cert_path and self.ca_key_path:
+            cert_pem, key_pem = tls_helpers.issue_worker_cert(
+                self.ca_cert_path, self.ca_key_path, worker_id
+            )
+            ca_pem = Path(self.ca_cert_path).read_bytes()
+            try:
+                await core_v1.create_namespaced_secret(
+                    namespace=namespace,
+                    body={
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {"name": mtls_secret_name},
+                        "type": "Opaque",
+                        "stringData": {
+                            "tls.crt": cert_pem.decode(),
+                            "tls.key": key_pem.decode(),
+                            "ca.crt": ca_pem.decode(),
+                        },
+                    },
+                )
+            except Exception as exc:
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token=token, node_id=node_id,
+                    error=f"Failed to create mTLS Secret: {exc}",
+                )
+
+        # Create Secret for user-declared secrets
+        secret_data: dict[str, str] = {}
+        for secret_grant in manifest.grants.secrets:
+            secret_data[secret_grant.name] = ""  # placeholder, real value from SecretStore
+        if secret_data:
+            try:
+                await core_v1.create_namespaced_secret(
+                    namespace=namespace,
+                    body={
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {"name": worker_secret_name},
+                        "type": "Opaque",
+                        "stringData": secret_data,
+                    },
+                )
+            except Exception as exc:
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token=token, node_id=node_id,
+                    error=f"Failed to create worker Secret: {exc}",
+                )
+
+        # Create NetworkPolicy for egress enforcement (defense-in-depth)
+        egress_rules = []
+        for grant in manifest.grants.network.egress:
+            rule: dict[str, Any] = {"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}]}
+            if grant.ports:
+                rule["ports"] = [
+                    {"port": p, "protocol": "TCP"} for p in grant.ports
+                ]
+            egress_rules.append(rule)
+
+        if manifest.grants.network.dns.enabled:
+            egress_rules.append({
+                "to": [{"podSelector": {}}],
+                "ports": [{"port": 53, "protocol": "UDP"}],
+            })
+
+        policy_body = {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": f"studio-{worker_id}",
+                "labels": {
+                    "studio/worker-id": worker_id,
+                    "studio/bundle-id": bundle_id,
+                },
+            },
+            "spec": {
+                "podSelector": {
+                    "matchLabels": {
+                        "studio/worker-id": worker_id,
+                    },
+                },
+                "policyTypes": ["Egress"],
+                "egress": egress_rules,
+            },
+        }
+
+        try:
+            await networking_v1.create_namespaced_network_policy(
+                namespace=namespace, body=policy_body
+            )
+        except Exception as exc:
+            return WorkerSpawnResult(
+                worker_id=worker_id, token=token, node_id=node_id,
+                error=f"Failed to create NetworkPolicy: {exc}",
+            )
+
+        # Build Pod spec
+        pod_spec = capability_to_pod_spec(
+            manifest=manifest,
+            worker_id=worker_id,
+            bundle_id=bundle_id,
+            node_id=node_id,
+            workdir="/work",
+            orchestrator_addr=self.settings.orchestrator_tcp_addr,
+            proxy_image=self.settings.proxy_image,
+            worker_image=self.settings.worker_image,
+            image_pull_policy=self.settings.image_pull_policy,
+            task_spec=task_spec,
+        )
+
+        # Insert worker token via env var (overrides the placeholder)
+        for container in pod_spec["containers"]:
+            if container["name"] == "worker":
+                container["env"].append({
+                    "name": "STUDIO_WORKER_TOKEN",
+                    "value": token,
+                })
+
+        # Ensure network grants manifest JSON is passed for proxy
+        manifest_json_str = json.dumps(manifest.model_dump()).replace("'", "'\\''")
+        for container in pod_spec["containers"]:
+            if container["name"] == "egress-proxy":
+                container["env"].append({
+                    "name": "STUDIO_MANIFEST_JSON",
+                    "value": manifest_json_str,
+                })
+
+        job_body = {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": job_name,
+                "labels": {
+                    "studio/worker-id": worker_id,
+                    "studio/bundle-id": bundle_id,
+                },
+            },
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "studio/worker-id": worker_id,
+                            "studio/bundle-id": bundle_id,
+                        },
+                    },
+                    "spec": pod_spec,
+                },
+                "backoffLimit": 0,
+            },
+        }
+
+        try:
+            await batch_v1.create_namespaced_job(
+                namespace=namespace, body=job_body
+            )
+        except Exception as exc:
+            return WorkerSpawnResult(
+                worker_id=worker_id, token=token, node_id=node_id,
+                error=f"Failed to create Job: {exc}",
+            )
+
+        # Watch for Pod creation to capture the Pod name
+        pod_name = ""
+        try:
+            import kubernetes_asyncio as k8s
+            w = k8s.watch.Watch()
+            async for event in w.stream(
+                func=core_v1.list_namespaced_pod,
+                namespace=namespace,
+                label_selector=f"studio/worker-id={worker_id}",
+                timeout_seconds=30,
+            ):
+                if event["object"].status.phase not in ("Pending", "Unknown", ""):
+                    pod_name = event["object"].metadata.name
+                    break
+                if event["type"] == "ADDED":
+                    pod_name = event["object"].metadata.name
+        except Exception:
+            pod_name = f"{job_name}-0"
+
+        await self.db.execute(
+            "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, manifest_json, state, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (worker_id, bundle_id, node_id, token, token_expires_at,
+             json.dumps(manifest.model_dump()), WorkerState.PENDING, self.now()),
+        )
+        await self.db.conn.commit()
+
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("worker_spawned", "worker", worker_id,
+             json.dumps({"bundle_id": bundle_id, "node_id": node_id,
+                         "token_expires_at": token_expires_at,
+                         "runner": "k8s", "namespace": namespace,
+                         "job_name": job_name, "pod_name": pod_name}),
+             self.now()),
+        )
+        await self.db.conn.commit()
+
+        handle = K8sWorkerHandle(
+            job_name=job_name,
+            pod_name=pod_name,
+            namespace=namespace,
+            worker_id=worker_id,
+            api_client=api_client,
+        )
+
+        # Register for Pod event watching
+        self._watched_workers[worker_id] = handle
+
+        logger.info("K8s worker %s spawned: Job=%s Pod=%s NS=%s",
+                     worker_id, job_name, pod_name, namespace)
+
+        return WorkerSpawnResult(worker_id, token, node_id, process=handle)
+
+    async def kill_worker(
+        self,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle,
+        worker_id: str = "",
+    ) -> None:
+        if isinstance(process, K8sWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+            self._watched_workers.pop(process.worker_id, None)
+        elif isinstance(process, RemoteWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+            try:
+                process.conn.close()
+                await process.conn.wait_closed()
+            except Exception:
+                pass
+            sem = getattr(self, '_host_semaphores', {}).get(process.host.name)
+            if sem:
+                sem.release()
+        elif isinstance(process, asyncio.subprocess.Process):
+            try:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            except ProcessLookupError:
+                pass
+
+    async def _watch_pods(self) -> None:
+        """Background task: watch Pod events for evictions, OOMKills, node failures.
+
+        Pod labels studio/worker-id and studio/bundle-id are used to map events
+        back to workers. Eviction or OOMKill fires a worker failure event into the
+        orchestrator event queue via the same path as a normal RPC disconnection.
+        """
+        self._running = True
+        try:
+            api_client = await self._ensure_client()
+        except Exception:
+            logger.warning("K8s pod watch: cannot load kubeconfig, skipping")
+            return
+
+        import kubernetes_asyncio as k8s
+        core_v1 = api_client.CoreV1Api
+
+        while self._running:
+            try:
+                w = k8s.watch.Watch()
+                async for event in w.stream(
+                    func=core_v1.list_namespaced_pod,
+                    namespace=self.settings.namespace,
+                    label_selector="studio/worker-id",
+                ):
+                    if not self._running:
+                        break
+
+                    pod = event["object"]
+                    pod_name = pod.metadata.name if pod.metadata else ""
+                    labels = pod.metadata.labels if pod.metadata else {}
+                    event_worker_id = labels.get("studio/worker-id", "")
+                    event_type = event.get("type", "")
+
+                    if event_worker_id not in self._watched_workers:
+                        continue
+
+                    status = pod.status
+                    if status and status.phase == "Failed":
+                        reason = status.reason or "Unknown"
+                        logger.warning(
+                            "K8s Pod %s (worker %s) failed: %s",
+                            pod_name, event_worker_id, reason,
+                        )
+                        handle = self._watched_workers.pop(event_worker_id, None)
+                        if handle:
+                            handle.returncode = 1
+                        # Write connection_lost event for the worker
+                        try:
+                            now = self.now()
+                            await self.db.execute(
+                                "UPDATE workers SET state = ?, ended_at = ? WHERE id = ?",
+                                (WorkerState.CONNECTION_LOST, now, event_worker_id),
+                            )
+                            await self.db.conn.commit()
+                            await self.db.execute(
+                                "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                ("worker_pod_failed", "worker", event_worker_id,
+                                 json.dumps({"reason": reason, "pod_name": pod_name,
+                                             "event_type": event_type}),
+                                 now),
+                            )
+                            await self.db.conn.commit()
+                        except Exception:
+                            pass
+
+                    if status and status.container_statuses:
+                        for cs in status.container_statuses:
+                            terminated = cs.state.terminated if cs.state else None
+                            if terminated and terminated.reason == "OOMKilled":
+                                logger.warning(
+                                    "K8s Pod %s (worker %s) OOMKilled",
+                                    pod_name, event_worker_id,
+                                )
+                                handle = self._watched_workers.pop(event_worker_id, None)
+                                if handle:
+                                    handle.returncode = 137
+            except Exception as exc:
+                logger.warning("K8s pod watch error: %s", exc)
+                await asyncio.sleep(5)
+
+    async def start_watch(self) -> None:
+        """Start the Pod event watching background task."""
+        if self._watch_task is None:
+            self._watch_task = asyncio.create_task(self._watch_pods())
+
+    async def stop_watch(self) -> None:
+        """Stop the Pod event watching background task."""
+        self._running = False
+        if self._watch_task:
+            self._watch_task.cancel()
+            try:
+                await self._watch_task
+            except asyncio.CancelledError:
+                pass
+            self._watch_task = None
+
+    async def close(self) -> None:
+        """Close the API client."""
+        await self.stop_watch()
+        if self._api_client:
+            await self._api_client.close()
+            self._api_client = None

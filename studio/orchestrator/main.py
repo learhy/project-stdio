@@ -42,7 +42,7 @@ from .rpc import (
     CAPABILITY_DENIED,
     INTERNAL_ERROR,
 )
-from .runner import LocalBwrapWorkerRunner, RemoteSSHWorkerRunner
+from .runner import LocalBwrapWorkerRunner, RemoteSSHWorkerRunner, K8sJobWorkerRunner
 from . import tls as tls_helpers
 from .executor import DagExecutor
 from .scheduler import Scheduler
@@ -85,6 +85,7 @@ class Orchestrator:
         self.ops: OpsTooling | None = None
         self._ops_task: asyncio.Task | None = None
         self._fleet_health_task: asyncio.Task | None = None
+        self._k8s_watch_task: asyncio.Task | None = None
         self._secret_store: "SecretStore | None" = None
         self._running = False
 
@@ -427,6 +428,17 @@ class Orchestrator:
                 token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
             )
             logger.info("Test mode: using NoopWorkerRunner")
+        elif self.settings.k8s_runner.enabled:
+            self.runner = K8sJobWorkerRunner(
+                self.db,
+                self.settings.k8s_runner,
+                egress_proxy=self.settings.egress_proxy,
+                token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
+                ca_cert_path=self.settings.remote_workers.tls_ca_cert_path,
+                ca_key_path=self.settings.remote_workers.tls_ca_key_path,
+            )
+            logger.info("K8s runner mode: using K8sJobWorkerRunner (ns=%s)",
+                        self.settings.k8s_runner.namespace)
         elif self.settings.remote_fleet.enabled:
             self.runner = RemoteSSHWorkerRunner(
                 self.db,
@@ -510,6 +522,11 @@ class Orchestrator:
             self._fleet_health_task = asyncio.create_task(self._run_fleet_health_loop(self.runner))
             logger.info("Fleet health monitoring started (%d hosts)", len(self.settings.remote_fleet.hosts))
 
+        # 9.8. K8s Pod event watching (Bundle 4.3)
+        if self.settings.k8s_runner.enabled and isinstance(self.runner, K8sJobWorkerRunner):
+            await self.runner.start_watch()
+            logger.info("K8s Pod event watching started (ns=%s)", self.settings.k8s_runner.namespace)
+
         # 10. Bind Unix socket (always — workers + CLI + MCP)
         socket_path = cfg.socket_path
         os.makedirs(os.path.dirname(socket_path), exist_ok=True)
@@ -550,6 +567,15 @@ class Orchestrator:
             )
             await self.db.conn.commit()
 
+        # Record k8s runner enabled state (Bundle 4.3)
+        if self.settings.k8s_runner.enabled:
+            await self.db.execute(
+                "INSERT OR REPLACE INTO settings_metadata (key, value, updated_at) "
+                "VALUES (?, ?, ?)",
+                ("k8s_runner_enabled", "1", int(time.time())),
+            )
+            await self.db.conn.commit()
+
         self._running = True
 
     async def stop(self) -> None:
@@ -577,6 +603,16 @@ class Orchestrator:
                 await self._fleet_health_task
             except asyncio.CancelledError:
                 pass
+
+        if self._k8s_watch_task:
+            self._k8s_watch_task.cancel()
+            try:
+                await self._k8s_watch_task
+            except asyncio.CancelledError:
+                pass
+
+        if isinstance(self.runner, K8sJobWorkerRunner):
+            await self.runner.close()
 
         if self._http_server:
             self._http_server.should_exit = True
@@ -1755,6 +1791,34 @@ async def _cli_fleet_remove(app: Orchestrator, params: dict) -> dict:
     return {"removed": True, "name": name}
 
 
+async def _cli_k8s_status(app: Orchestrator, params: dict) -> dict:
+    """Show active Kubernetes Jobs in studio-workers namespace (Bundle 4.3)."""
+    if not isinstance(app.runner, K8sJobWorkerRunner):
+        return {"error": "K8s runner is not enabled. Set k8s_runner.enabled=true in settings.json."}
+    try:
+        api_client = await app.runner._ensure_client()
+        batch_v1 = api_client.BatchV1Api
+        jobs = await batch_v1.list_namespaced_job(
+            namespace=app.settings.k8s_runner.namespace,
+            label_selector="studio/worker-id",
+        )
+        job_list = []
+        for job in jobs.items:
+            job_list.append({
+                "name": job.metadata.name,
+                "namespace": job.metadata.namespace,
+                "bundle_id": job.metadata.labels.get("studio/bundle-id", ""),
+                "worker_id": job.metadata.labels.get("studio/worker-id", ""),
+                "active": job.status.active or 0,
+                "succeeded": job.status.succeeded or 0,
+                "failed": job.status.failed or 0,
+                "age": app.sm.now() - int(job.metadata.creation_timestamp.timestamp()) if job.metadata.creation_timestamp else 0,
+            })
+        return {"jobs": job_list, "namespace": app.settings.k8s_runner.namespace}
+    except Exception as exc:
+        return {"error": f"Failed to list k8s Jobs: {exc}"}
+
+
 def _persist_fleet_settings(settings: Settings) -> None:
     """Write current fleet settings back to settings.json."""
     import json as _json
@@ -1800,6 +1864,7 @@ _CLI_HANDLERS = {
     "studio.fleet_status": _cli_fleet_status,
     "studio.fleet_add": _cli_fleet_add,
     "studio.fleet_remove": _cli_fleet_remove,
+    "studio.k8s_status": _cli_k8s_status,
 }
 
 

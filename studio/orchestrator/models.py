@@ -726,6 +726,19 @@ class RemoteFleetSettings(BaseModel):
     selection_policy: str = "least_loaded"
 
 
+class K8sRunnerSettings(BaseModel):
+    """Kubernetes Job worker runner configuration (Bundle 4.3)."""
+    enabled: bool = False
+    kubeconfig_path: str | None = None
+    namespace: str = "studio-workers"
+    orchestrator_tcp_addr: str = "orchestrator.internal:7811"
+    image_pull_policy: str = "IfNotPresent"
+    worktree_mode: str = "init_container"
+    default_storage_class: str | None = None
+    worker_image: str = "studio-worker:latest"
+    proxy_image: str = "studio-proxy:latest"
+
+
 class Settings(BaseModel):
     kernel: KernelSettings = Field(default_factory=KernelSettings)
     egress_proxy: EgressProxySettings = Field(default_factory=EgressProxySettings)
@@ -734,6 +747,7 @@ class Settings(BaseModel):
     orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)
     remote_workers: RemoteWorkersSettings = Field(default_factory=RemoteWorkersSettings)
     remote_fleet: RemoteFleetSettings = Field(default_factory=RemoteFleetSettings)
+    k8s_runner: K8sRunnerSettings = Field(default_factory=K8sRunnerSettings)
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)
