@@ -39,6 +39,22 @@
     "tls_server_cert_path": "/etc/studio/tls/server.crt",
     "tls_server_key_path": "/etc/studio/tls/server.key"
   },
+  "remote_fleet": {
+    "enabled": false,
+    "hosts": [
+      {
+        "name": "worker-1",
+        "addr": "worker-1.internal",
+        "ssh_user": "studio",
+        "ssh_key_path": "/etc/studio/ssh/worker-1.key",
+        "capabilities": ["python", "node", "go"],
+        "max_concurrent_workers": 4,
+        "arch": "x86_64",
+        "worktree_mode": "clone"
+      }
+    ],
+    "selection_policy": "least_loaded"
+  },
   "artifacts": {
     "inline_threshold_bytes": 4096,
     "global_storage_cap_bytes": 50000000000,

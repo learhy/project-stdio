@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from typing import Any
 
 from .display import (
@@ -308,6 +309,69 @@ async def cmd_status() -> int:
     return 0
 
 
+async def cmd_fleet_status() -> int:
+    """Show remote fleet host status (Bundle 4.2)."""
+    resp = await _send_rpc(_get_socket_path(), "studio.fleet_status", {})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    hosts = resp.get("result", {}).get("hosts", [])
+    if not hosts:
+        print("No fleet hosts configured. Use 'studio fleet-add <name> <addr>' to add one.")
+        return 0
+
+    print(f"{'Name':<16} {'Address':<22} {'Status':<10} {'Workers':<10} {'Last Ping':<12}")
+    print("-" * 72)
+    for h in hosts:
+        last_ping = ""
+        if h.get("last_ping"):
+            ago = int(time.time() - h["last_ping"])
+            last_ping = f"{ago}s ago"
+        print(f"{h['name']:<16} {h['addr']:<22} {h['status']:<10} "
+              f"{h.get('active_workers', 0)}/{h['max_workers']:<6} {last_ping:<12}")
+    return 0
+
+
+async def cmd_fleet_add(name: str, addr: str, args) -> int:
+    """Add a host to the fleet registry (Bundle 4.2)."""
+    params = {
+        "name": name,
+        "addr": addr,
+        "ssh_user": getattr(args, "ssh_user", "studio"),
+        "ssh_key_path": getattr(args, "ssh_key", ""),
+        "capabilities": getattr(args, "capabilities", []),
+        "max_concurrent_workers": getattr(args, "max_workers", 4),
+    }
+    resp = await _send_rpc(_get_socket_path(), "studio.fleet_add", params)
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        result = resp.get("error", {})
+        if "message" in result:
+            print(f"Error: {result['message']}", file=sys.stderr)
+        else:
+            print(f"Error: {resp['error']}", file=sys.stderr)
+        return 1
+
+    print(f"Host '{name}' ({addr}) added to fleet.")
+    return 0
+
+
+async def cmd_fleet_remove(name: str) -> int:
+    """Remove a host from the fleet registry (Bundle 4.2)."""
+    resp = await _send_rpc(_get_socket_path(), "studio.fleet_remove", {"name": name})
+    if "error" in resp:
+        result = resp.get("error", {})
+        if isinstance(result, dict) and "message" in result:
+            print(f"Error: {result['message']}", file=sys.stderr)
+        else:
+            print(f"Error: {resp['error']}", file=sys.stderr)
+        return 1
+
+    print(f"Host '{name}' removed from fleet.")
+    return 0
+
+
 async def cmd_calibration_report() -> int:
     """Print calibration report from memory/calibration/."""
     resp = await _send_rpc(_get_socket_path(), "studio.calibration_report", {})
@@ -379,6 +443,22 @@ def main() -> None:
     # calibration-report
     sub.add_parser("calibration-report", help="Print estimated-vs-actual scoring outcomes")
 
+    # fleet-status (Bundle 4.2)
+    sub.add_parser("fleet-status", help="Show remote fleet host status")
+
+    # fleet-add (Bundle 4.2)
+    p_fadd = sub.add_parser("fleet-add", help="Add a host to the remote fleet")
+    p_fadd.add_argument("name", help="Host name")
+    p_fadd.add_argument("addr", help="Host address (hostname or IP)")
+    p_fadd.add_argument("--ssh-user", default="studio", help="SSH username (default: studio)")
+    p_fadd.add_argument("--ssh-key", default="", help="Path to SSH private key")
+    p_fadd.add_argument("--capabilities", nargs="*", default=[], help="Worker capabilities (e.g. python node)")
+    p_fadd.add_argument("--max-workers", type=int, default=4, help="Max concurrent workers (default: 4)")
+
+    # fleet-remove (Bundle 4.2)
+    p_fremove = sub.add_parser("fleet-remove", help="Remove a host from the remote fleet")
+    p_fremove.add_argument("name", help="Host name to remove")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -413,6 +493,12 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_rotate_secret(args.name))
         elif args.command == "calibration-report":
             exit_code = loop.run_until_complete(cmd_calibration_report())
+        elif args.command == "fleet-status":
+            exit_code = loop.run_until_complete(cmd_fleet_status())
+        elif args.command == "fleet-add":
+            exit_code = loop.run_until_complete(cmd_fleet_add(args.name, args.addr, args))
+        elif args.command == "fleet-remove":
+            exit_code = loop.run_until_complete(cmd_fleet_remove(args.name))
         else:
             print(f"Unknown command: {args.command}", file=sys.stderr)
             exit_code = 1

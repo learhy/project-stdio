@@ -42,7 +42,7 @@ from .rpc import (
     CAPABILITY_DENIED,
     INTERNAL_ERROR,
 )
-from .runner import LocalBwrapWorkerRunner
+from .runner import LocalBwrapWorkerRunner, RemoteSSHWorkerRunner
 from . import tls as tls_helpers
 from .executor import DagExecutor
 from .scheduler import Scheduler
@@ -84,6 +84,7 @@ class Orchestrator:
         self._bundle_last_polled: dict[str, datetime] = {}
         self.ops: OpsTooling | None = None
         self._ops_task: asyncio.Task | None = None
+        self._fleet_health_task: asyncio.Task | None = None
         self._secret_store: "SecretStore | None" = None
         self._running = False
 
@@ -426,6 +427,17 @@ class Orchestrator:
                 token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
             )
             logger.info("Test mode: using NoopWorkerRunner")
+        elif self.settings.remote_fleet.enabled:
+            self.runner = RemoteSSHWorkerRunner(
+                self.db,
+                self.settings.remote_fleet,
+                egress_proxy=self.settings.egress_proxy,
+                token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
+                ca_cert_path=self.settings.remote_workers.tls_ca_cert_path,
+                ca_key_path=self.settings.remote_workers.tls_ca_key_path,
+            )
+            logger.info("Remote fleet mode: using RemoteSSHWorkerRunner with %d hosts",
+                        len(self.settings.remote_fleet.hosts))
         else:
             self.runner = LocalBwrapWorkerRunner(
                 self.db,
@@ -493,6 +505,11 @@ class Orchestrator:
                      self.settings.ops.stall_threshold_hours,
                      self.settings.ops.recall_window_hours)
 
+        # 9.7. Fleet health monitoring (Bundle 4.2)
+        if self.settings.remote_fleet.enabled and isinstance(self.runner, RemoteSSHWorkerRunner):
+            self._fleet_health_task = asyncio.create_task(self._run_fleet_health_loop(self.runner))
+            logger.info("Fleet health monitoring started (%d hosts)", len(self.settings.remote_fleet.hosts))
+
         # 10. Bind Unix socket (always — workers + CLI + MCP)
         socket_path = cfg.socket_path
         os.makedirs(os.path.dirname(socket_path), exist_ok=True)
@@ -551,6 +568,13 @@ class Orchestrator:
             self._ops_task.cancel()
             try:
                 await self._ops_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._fleet_health_task:
+            self._fleet_health_task.cancel()
+            try:
+                await self._fleet_health_task
             except asyncio.CancelledError:
                 pass
 
@@ -671,6 +695,15 @@ class Orchestrator:
                 await self.ops.check_acting_soon()
             except Exception as exc:
                 logger.warning("Ops loop error: %s", exc)
+            await asyncio.sleep(60)
+
+    async def _run_fleet_health_loop(self, runner: "RemoteSSHWorkerRunner") -> None:
+        """Ping fleet hosts every 60s, mark unhealthy ones as degraded (Bundle 4.2)."""
+        while self._running:
+            try:
+                await runner.ping_hosts()
+            except Exception as exc:
+                logger.warning("Fleet health loop error: %s", exc)
             await asyncio.sleep(60)
 
     async def _poll_once(self) -> None:
@@ -1637,6 +1670,119 @@ async def _cli_rotate_secret(app: Orchestrator, params: dict) -> dict:
     }
 
 
+async def _cli_fleet_status(app: Orchestrator, params: dict) -> dict:
+    """Show status of all fleet hosts (Bundle 4.2)."""
+    if not isinstance(app.runner, RemoteSSHWorkerRunner):
+        return {"error": "Remote fleet is not enabled. Set remote_fleet.enabled=true in settings.json."}
+    statuses = await app.runner.ping_hosts()
+    hosts_detail = []
+    for host in app.settings.remote_fleet.hosts:
+        sem = app.runner._host_semaphores.get(host.name)
+        capacity_used = host.max_concurrent_workers
+        if sem:
+            # Approximate active count from semaphore
+            capacity_used = host.max_concurrent_workers - (sem._value if hasattr(sem, '_value') else 0)
+        hosts_detail.append({
+            "name": host.name,
+            "addr": host.addr,
+            "status": statuses.get(host.name, "unknown"),
+            "active_workers": capacity_used,
+            "max_workers": host.max_concurrent_workers,
+            "last_ping": app.runner._host_last_ping.get(host.name, 0),
+        })
+    return {"hosts": hosts_detail}
+
+
+async def _cli_fleet_add(app: Orchestrator, params: dict) -> dict:
+    """Add a host to the fleet registry (Bundle 4.2)."""
+    name = params.get("name", "")
+    addr = params.get("addr", "")
+    if not name or not addr:
+        return {"error": "name and addr are required"}
+
+    from .models import FleetHost
+    new_host = FleetHost(
+        name=name, addr=addr,
+        ssh_user=params.get("ssh_user", "studio"),
+        ssh_key_path=params.get("ssh_key_path", ""),
+        capabilities=params.get("capabilities", []),
+        max_concurrent_workers=params.get("max_concurrent_workers", 4),
+        arch=params.get("arch", "x86_64"),
+        worktree_mode=params.get("worktree_mode", "clone"),
+    )
+
+    # Check for duplicate name
+    for h in app.settings.remote_fleet.hosts:
+        if h.name == name:
+            return {"error": f"Host '{name}' already exists. Use fleet-remove first."}
+
+    app.settings.remote_fleet.hosts.append(new_host)
+
+    # Add semaphore and health tracking if runner is active
+    if isinstance(app.runner, RemoteSSHWorkerRunner):
+        app.runner._host_semaphores[name] = asyncio.Semaphore(new_host.max_concurrent_workers)
+        app.runner._host_health[name] = True
+
+    # Persist to settings.json
+    _persist_fleet_settings(app.settings)
+
+    return {"added": True, "name": name, "addr": addr}
+
+
+async def _cli_fleet_remove(app: Orchestrator, params: dict) -> dict:
+    """Remove a host from the fleet registry (Bundle 4.2)."""
+    name = params.get("name", "")
+    if not name:
+        return {"error": "name is required"}
+
+    # Remove from settings
+    before = len(app.settings.remote_fleet.hosts)
+    app.settings.remote_fleet.hosts = [
+        h for h in app.settings.remote_fleet.hosts if h.name != name
+    ]
+    if len(app.settings.remote_fleet.hosts) == before:
+        return {"error": f"Host '{name}' not found in fleet registry."}
+
+    # Remove from runner tracking
+    if isinstance(app.runner, RemoteSSHWorkerRunner):
+        app.runner._host_semaphores.pop(name, None)
+        app.runner._host_health.pop(name, None)
+        app.runner._host_last_ping.pop(name, None)
+
+    # Persist to settings.json
+    _persist_fleet_settings(app.settings)
+
+    return {"removed": True, "name": name}
+
+
+def _persist_fleet_settings(settings: Settings) -> None:
+    """Write current fleet settings back to settings.json."""
+    import json as _json
+    config_path = os.environ.get(
+        "STUDIO_CONFIG_PATH",
+        os.path.join(os.path.dirname(settings.orchestrator.db_path), "settings.json"),
+    )
+    # Find the actual config file
+    if not os.path.exists(config_path):
+        config_path = "/etc/studio/settings.json"
+    if not os.path.exists(config_path):
+        logger.warning("Cannot persist fleet settings: settings.json not found at %s", config_path)
+        return
+
+    try:
+        with open(config_path) as f:
+            data = _json.load(f)
+    except Exception:
+        data = {}
+
+    data.setdefault("remote_fleet", {})
+    data["remote_fleet"]["hosts"] = [h.model_dump() for h in settings.remote_fleet.hosts]
+
+    with open(config_path, "w") as f:
+        _json.dump(data, f, indent=2)
+    logger.info("Fleet settings persisted to %s", config_path)
+
+
 _CLI_HANDLERS = {
     "studio.submit": _cli_submit,
     "studio.approve": _cli_approve,
@@ -1651,6 +1797,9 @@ _CLI_HANDLERS = {
     "studio.health": _cli_health,
     "studio.audit": _cli_audit,
     "studio.rotate_secret": _cli_rotate_secret,
+    "studio.fleet_status": _cli_fleet_status,
+    "studio.fleet_add": _cli_fleet_add,
+    "studio.fleet_remove": _cli_fleet_remove,
 }
 
 

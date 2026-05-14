@@ -707,6 +707,25 @@ class RemoteWorkersSettings(BaseModel):
     tls_server_key_path: str = "/etc/studio/tls/server.key"
 
 
+class FleetHost(BaseModel):
+    """A single host in the remote worker fleet (Bundle 4.2)."""
+    name: str
+    addr: str
+    ssh_user: str = "studio"
+    ssh_key_path: str = ""
+    capabilities: list[str] = Field(default_factory=list)
+    max_concurrent_workers: int = 4
+    arch: str = "x86_64"
+    worktree_mode: str = "clone"
+
+
+class RemoteFleetSettings(BaseModel):
+    """Fleet registry for RemoteSSHWorkerRunner (Bundle 4.2)."""
+    enabled: bool = False
+    hosts: list[FleetHost] = Field(default_factory=list)
+    selection_policy: str = "least_loaded"
+
+
 class Settings(BaseModel):
     kernel: KernelSettings = Field(default_factory=KernelSettings)
     egress_proxy: EgressProxySettings = Field(default_factory=EgressProxySettings)
@@ -714,6 +733,7 @@ class Settings(BaseModel):
     ollama_cloud: OllamaCloudSettings = Field(default_factory=OllamaCloudSettings)
     orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)
     remote_workers: RemoteWorkersSettings = Field(default_factory=RemoteWorkersSettings)
+    remote_fleet: RemoteFleetSettings = Field(default_factory=RemoteFleetSettings)
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)
