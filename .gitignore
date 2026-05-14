@@ -19,3 +19,8 @@ htmlcov/
 *.db
 *.db-wal
 *.db-shm
+
+# Settings (contains local secrets)
+settings.json
+.claude/settings.json
+.claude/settings.local.json
