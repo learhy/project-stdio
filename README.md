@@ -42,6 +42,10 @@ Worker subprocesses (bubblewrap containers)
 uv venv
 uv pip install -e ".[dev]"
 
+# The studio CLI is now available:
+#   uv run studio <command>          (no activation needed)
+#   source .venv/bin/activate && studio <command>  (activate first)
+
 # Run tests
 uv run python -m pytest studio/tests/ -v
 
@@ -82,6 +86,8 @@ STUDIO_SOCKET_PATH=/tmp/studio.sock \
 ```
 
 ## CLI command reference
+
+All commands are invoked as `uv run studio <command>` (or `studio <command>` after activating the venv).
 
 ### Bundle management
 
