@@ -24,7 +24,7 @@
     "grace_window_minutes": 5
   },
   "orchestrator": {
-    "socket_path": "/tmp/studio.sock",
+    "socket_path": "/run/studio/orchestrator.sock",
     "db_path": "/var/lib/studio/state.db",
     "socket_permissions": "0660",
     "socket_owner": "studio:studio",
@@ -99,5 +99,5 @@
     "acting_soon_hours": 12,
     "worker_token_expiry_minutes": 15
   },
-  "secrets_config": []
+  "secrets_config": [{"name": "ollama_api_key", "env_var": "OLLAMA_API_KEY", "purpose": "llm_api"}]
 }
