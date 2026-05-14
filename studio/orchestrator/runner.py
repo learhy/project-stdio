@@ -647,7 +647,26 @@ class RemoteSSHWorkerRunner:
                 f"echo $! > {workdir}/proxy.pid",
                 check=False,
             )
-            await asyncio.sleep(0.5)
+            # Poll until the proxy socket appears (up to 5 seconds)
+            for _ in range(50):
+                result = await conn.run(
+                    f"test -S {proxy_socket} && echo ok || echo no",
+                    check=False,
+                )
+                if result.stdout.strip() == "ok":
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                conn.close()
+                await conn.wait_closed()
+                sem.release()
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token=token, node_id=node_id,
+                    error=(
+                        f"Egress proxy failed to bind socket {proxy_socket} on {host.name} after 5s. "
+                        f"Check {workdir}/proxy.log for errors."
+                    ),
+                )
 
             bwrap_args = capability_to_bwrap_args(
                 manifest, remote_workdir, socket_path="", proxy_socket=proxy_socket

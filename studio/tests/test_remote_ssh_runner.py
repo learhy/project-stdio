@@ -256,6 +256,7 @@ class TestRemoteSSHWorkerRunner:
             MagicMock(exit_status=0),  # echo task-spec
             MagicMock(exit_status=0),  # echo manifest
             MagicMock(exit_status=0),  # nohup proxy
+            MagicMock(exit_status=0, stdout="ok\n"),   # test -S proxy socket (poll)
             MagicMock(exit_status=0, stdout="54321\n"),  # bwrap worker (captures PID)
         ])
 
@@ -268,6 +269,67 @@ class TestRemoteSSHWorkerRunner:
             assert isinstance(result.process, RemoteWorkerHandle)
             assert result.process.remote_pid == 54321
             assert result.worker_id == "w1"
+
+    @pytest.mark.asyncio
+    async def test_proxy_socket_poll_timeout(self, runner):
+        mock_conn = MagicMock()
+        mock_conn.close = MagicMock()
+        mock_conn.wait_closed = AsyncMock()
+        # preflight + setup calls all succeed, then proxy launch, then poll fails 50 times
+        setup_calls = [
+            MagicMock(exit_status=0),  # bwrap found
+            MagicMock(exit_status=0),  # studio-worker found
+            MagicMock(exit_status=0),  # studio-proxy found
+            MagicMock(exit_status=0),  # mkdir
+            MagicMock(exit_status=0),  # git clone
+            MagicMock(exit_status=0),  # echo task-spec
+            MagicMock(exit_status=0),  # echo manifest
+            MagicMock(exit_status=0),  # nohup proxy
+        ]
+        # 50 poll iterations all return "no"
+        poll_calls = [MagicMock(exit_status=0, stdout="no\n")] * 50
+        mock_conn.run = AsyncMock(side_effect=setup_calls + poll_calls)
+
+        with patch("asyncssh.connect", AsyncMock(return_value=mock_conn)), \
+             patch("asyncio.sleep", AsyncMock()):
+            result = await runner.spawn_worker(
+                "w1", "b1", "n1", make_manifest(), "/tmp/work",
+            )
+            assert "Egress proxy failed to bind socket" in result.error
+            assert "test-host" in result.error
+            assert "proxy.log" in result.error
+            mock_conn.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_proxy_socket_poll_success(self, runner):
+        mock_conn = MagicMock()
+        mock_conn.close = MagicMock()
+        mock_conn.wait_closed = AsyncMock()
+        # poll returns "no" twice, then "ok" on the third attempt
+        setup_calls = [
+            MagicMock(exit_status=0),  # bwrap found
+            MagicMock(exit_status=0),  # studio-worker found
+            MagicMock(exit_status=0),  # studio-proxy found
+            MagicMock(exit_status=0),  # mkdir
+            MagicMock(exit_status=0),  # git clone
+            MagicMock(exit_status=0),  # echo task-spec
+            MagicMock(exit_status=0),  # echo manifest
+            MagicMock(exit_status=0),  # nohup proxy
+            MagicMock(exit_status=0, stdout="no\n"),   # poll 1
+            MagicMock(exit_status=0, stdout="no\n"),   # poll 2
+            MagicMock(exit_status=0, stdout="ok\n"),   # poll 3 -- success
+            MagicMock(exit_status=0, stdout="54321\n"),  # bwrap worker PID
+        ]
+        mock_conn.run = AsyncMock(side_effect=setup_calls)
+
+        with patch("asyncssh.connect", AsyncMock(return_value=mock_conn)), \
+             patch("asyncio.sleep", AsyncMock()):
+            result = await runner.spawn_worker(
+                "w1", "b1", "n1", make_manifest(), "/tmp/work",
+            )
+            assert result.error == ""
+            assert isinstance(result.process, RemoteWorkerHandle)
+            assert result.process.remote_pid == 54321
 
     @pytest.mark.asyncio
     async def test_kill_worker_handles_remote_handle(self, runner):
