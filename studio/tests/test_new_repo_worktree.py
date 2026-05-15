@@ -128,7 +128,7 @@ class TestSpawnWorkerNewRepo:
                 target="new-repo",
             )
 
-        runner._init_new_repo.assert_called_once_with("/tmp/test-worktree")
+        runner._init_new_repo.assert_called_once_with("/tmp/test-worktree", "bundle-1", "node-1")
         runner._create_worktree.assert_not_called()
 
     @pytest.mark.asyncio

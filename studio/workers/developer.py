@@ -243,6 +243,11 @@ class DeveloperWorker:
                         "message": line[:500],
                     })
 
+            # Also write to stderr so orchestrator captures it via pipe draining
+            print(f"[developer] opencode exit={returncode} stdout_lines={len(stdout_lines)} stderr_bytes={len(stderr_data)}", file=sys.stderr, flush=True)
+            for i, line in enumerate(stdout_lines):
+                print(f"[developer] stdout[{i}]: {line[:300]}", file=sys.stderr, flush=True)
+
             if returncode == 0:
                 # Run pre-merge gates
                 gate_result = await self._run_gates(gates)

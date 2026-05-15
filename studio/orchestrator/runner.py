@@ -337,7 +337,7 @@ class LocalBwrapWorkerRunner:
         if not os.environ.get("STUDIO_TEST_MODE") == "1":
             try:
                 if target == "new-repo":
-                    await self._init_new_repo(worktree_path)
+                    await self._init_new_repo(worktree_path, bundle_id, node_id)
                 else:
                     await self._create_worktree(worktree_path, worker_branch, base_branch)
             except Exception as exc:
@@ -497,8 +497,14 @@ class LocalBwrapWorkerRunner:
             )
             await proc.wait()
 
-    async def _init_new_repo(self, path: str) -> None:
-        """Create an empty git repository with an initial empty commit."""
+    async def _init_new_repo(self, path: str, bundle_id: str = "", node_id: str = "") -> None:
+        """Create an empty git repository with a unique initial empty commit.
+
+        The commit message includes the bundle and node ID so that every
+        worktree gets a unique SHA.  OpenCode keys its session cache by
+        git commit SHA; duplicate SHAs cause it to reuse stale state and
+        skip file creation.
+        """
         import os as _os
         _os.makedirs(path, exist_ok=True)
 
@@ -522,8 +528,9 @@ class LocalBwrapWorkerRunner:
             await proc.wait()
 
         # Create initial empty commit so the repo has a branch to push
+        commit_msg = f"Initial commit ({bundle_id}/{node_id})"
         proc = await asyncio.create_subprocess_exec(
-            "git", "-C", path, "commit", "--allow-empty", "-m", "Initial commit",
+            "git", "-C", path, "commit", "--allow-empty", "-m", commit_msg,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
