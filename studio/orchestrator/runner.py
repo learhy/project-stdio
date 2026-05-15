@@ -277,6 +277,24 @@ class LocalBwrapWorkerRunner:
         token_expires_at = self.now() + (self.token_expiry_minutes * 60)
         proxy_socket = f"{self.egress_proxy.socket_dir}/proxy-{worker_id}.sock" if self.egress_proxy.enabled else ""
 
+        # Clean up terminal-state worker rows for the same bundle_id + node_id
+        existing = await self.db.fetch_one(
+            "SELECT id, state FROM workers WHERE bundle_id = ? AND node_id = ?",
+            (bundle_id, node_id),
+        )
+        if existing:
+            terminal_states = (WorkerState.COMPLETE, WorkerState.FAILED, WorkerState.KILLED, WorkerState.CONNECTION_LOST)
+            if existing["state"] in terminal_states:
+                await self.db.execute(
+                    "DELETE FROM workers WHERE id = ?", (existing["id"],)
+                )
+                await self.db.conn.commit()
+            else:
+                raise RuntimeError(
+                    f"Worker {existing['id']} for bundle={bundle_id} node={node_id} "
+                    f"is already in state {existing['state']} — cannot re-spawn"
+                )
+
         # Insert worker row
         await self.db.execute(
             "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, manifest_json, state, created_at) "

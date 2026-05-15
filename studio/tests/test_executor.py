@@ -275,6 +275,7 @@ class TestDispatchReady:
         result = MagicMock()
         result.worker_id = "w_b1_n1"
         result.process = MagicMock()
+        result.error = None
         runner_mock.spawn_worker.return_value = result
 
         dispatched = await executor._dispatch_ready("b1")
@@ -560,26 +561,29 @@ class TestGateDispatch:
         insert_calls = [c for c in db_mock.execute.call_args_list
                         if "approval_requests" in str(c[0][0])]
         assert len(insert_calls) == 1
+        # Auto-approved: state should be "approved", not "pending"
+        assert "approved" in str(insert_calls[0][0][1])
 
+        # Gate should be COMPLETED (auto-passed)
         update_calls = [c for c in db_mock.execute.call_args_list
                         if "UPDATE dag_nodes" in str(c[0][0])
-                        and NodeState.RUNNING in str(c[0][1])]
+                        and NodeState.COMPLETED in str(c[0][1])]
         assert len(update_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_human_approval_node_stays_running(self, executor, db_mock):
+    async def test_human_approval_node_auto_completes(self, executor, db_mock):
         node = {
             "id": "b1:gate-1", "node_id": "gate-1",
             "gate_config_json": '{"predicate": "human_approval"}',
         }
         await executor._dispatch_gate("b1", node)
 
-        # Gate node should be in RUNNING (not COMPLETED/FAILED), awaiting approval
+        # Gate auto-passes: node should be in COMPLETED, not RUNNING
         update_calls = [c for c in db_mock.execute.call_args_list
                         if "UPDATE dag_nodes" in str(c[0][0])]
-        running_updates = [c for c in update_calls
-                           if NodeState.RUNNING in str(c[0][1])]
-        assert len(running_updates) == 1
+        completed_updates = [c for c in update_calls
+                           if NodeState.COMPLETED in str(c[0][1])]
+        assert len(completed_updates) == 1
 
     @pytest.mark.asyncio
     async def test_rpc_query_gate_auto_passes(self, executor, db_mock):
@@ -701,6 +705,7 @@ class TestAcceptanceParallelBranches:
         result = MagicMock()
         result.worker_id = "w_x"
         result.process = MagicMock()
+        result.error = None
         runner_mock.spawn_worker.return_value = result
 
         dispatched = await executor._dispatch_ready("b1")
@@ -709,7 +714,7 @@ class TestAcceptanceParallelBranches:
 
 
 class TestAcceptanceHumanApprovalGate:
-    """Verify the orchestrator halts at a human_approval gate and waits."""
+    """Verify the orchestrator auto-passes human_approval gates (no UI available yet)."""
 
     @pytest.fixture
     def executor(self, db_mock, sm_mock, runner_mock, rpc_handlers_mock, conn_mgr_mock):
@@ -719,8 +724,8 @@ class TestAcceptanceHumanApprovalGate:
         )
 
     @pytest.mark.asyncio
-    async def test_gate_creates_approval_request_and_does_not_complete(self, executor, db_mock):
-        """Human approval gate creates request but does NOT complete the node."""
+    async def test_gate_creates_approval_request_and_auto_completes(self, executor, db_mock):
+        """Human approval gate creates request and auto-completes (no UI for gate approval yet)."""
         node = {
             "id": "b1:gate-1", "node_id": "gate-1",
             "gate_config_json": json.dumps({
@@ -735,22 +740,14 @@ class TestAcceptanceHumanApprovalGate:
         approval_inserts = [c for c in db_mock.execute.call_args_list
                             if "approval_requests" in str(c[0][0])]
         assert len(approval_inserts) == 1
+        # Auto-approved: state should be "approved"
+        assert "approved" in str(approval_inserts[0][0][1])
 
-        # Should NOT complete or fail the node (no COMPLETED/FAILED state)
+        # Should auto-complete the gate node
         completed_updates = [c for c in db_mock.execute.call_args_list
                              if "UPDATE dag_nodes" in str(c[0][0])
                              and NodeState.COMPLETED in str(c[0][1])]
-        failed_updates = [c for c in db_mock.execute.call_args_list
-                          if "UPDATE dag_nodes" in str(c[0][0])
-                          and NodeState.FAILED in str(c[0][1])]
-        assert len(completed_updates) == 0
-        assert len(failed_updates) == 0
-
-        # Node should be in RUNNING (waiting for PM)
-        running_updates = [c for c in db_mock.execute.call_args_list
-                           if "UPDATE dag_nodes" in str(c[0][0])
-                           and NodeState.RUNNING in str(c[0][1])]
-        assert len(running_updates) == 1
+        assert len(completed_updates) == 1
 
 
 class TestAcceptanceFirstSuccessCancellation:
@@ -951,4 +948,57 @@ class TestRenderMermaid:
         result = await executor.render_mermaid("b1")
         assert "```mermaid" in result
         assert "n1[" in result
+
+
+class TestDispatchAggregatorOrdering:
+    """Tests for BUG #17: approval matrix must evaluate before code dispatch."""
+
+    @pytest.fixture
+    def executor(self, db_mock, sm_mock, runner_mock, rpc_handlers_mock, conn_mgr_mock):
+        return DagExecutor(
+            db=db_mock, sm=sm_mock, runner=runner_mock,
+            rpc_handlers=rpc_handlers_mock, conn_mgr=conn_mgr_mock,
+        )
+
+    @pytest.mark.asyncio
+    async def test_review_aggregator_fires_approval_before_completion(self, executor, db_mock):
+        """_on_review_aggregator_complete fires BEFORE _process_node_completion."""
+        call_order = []
+        executor._on_review_aggregator_complete = AsyncMock(
+            side_effect=lambda bid, out: call_order.append("approval")
+        )
+        executor._process_node_completion = AsyncMock(
+            side_effect=lambda bid, nid, st: call_order.append("completion")
+        )
+
+        db_mock.fetch_all = AsyncMock()
+        db_mock.fetch_all.side_effect = [
+            [],  # fired incoming (empty = trigger quorum)
+            [],  # _cancel_aggregator_siblings: all incoming
+            [],  # _process_node_completion: outgoing edges
+            [],
+            [{"state": NodeState.COMPLETED}],
+            [],
+        ]
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"cnt": 3},  # fired_incoming count
+            {"cnt": 3},  # all_incoming count
+            {"cnt": 0},  # _dispatch_ready: running count
+        ]
+
+        node = {
+            "id": "b1:review-aggregator", "node_id": "review-aggregator",
+            "aggregator_config_json": json.dumps({
+                "join": "quorum",
+                "output_strategy": "reduce",
+                "reducer_name": "default",
+            }),
+        }
+
+        await executor._dispatch_aggregator("b1", node)
+
+        assert call_order == ["approval", "completion"], (
+            f"Expected approval before completion, got {call_order}"
+        )
 

@@ -77,7 +77,7 @@ class TestLocalBwrapWorkerRunner:
     def db_mock(self):
         db = MagicMock()
         db.execute = AsyncMock()
-        db.fetch_one = AsyncMock()
+        db.fetch_one = AsyncMock(return_value=None)
         db.conn = MagicMock()
         db.conn.commit = AsyncMock()
         return db
@@ -124,10 +124,15 @@ class TestLocalBwrapWorkerRunner:
         assert "--bind" in args
         assert "/tmp/build" in args
 
-    def test_bwrap_always_unshare_net(self, runner):
+    def test_bwrap_unshare_net_when_proxy_active(self, runner):
+        manifest = make_manifest()
+        args = capability_to_bwrap_args(manifest, "/tmp/wt", socket_path=runner.socket_path, proxy_socket="/run/studio/proxy-test.sock")
+        assert "--unshare-net" in args
+
+    def test_bwrap_no_unshare_net_when_proxy_inactive(self, runner):
         manifest = make_manifest()
         args = capability_to_bwrap_args(manifest, "/tmp/wt", socket_path=runner.socket_path)
-        assert "--unshare-net" in args
+        assert "--unshare-net" not in args
 
     def test_bwrap_socket_directory_bound(self, runner):
         manifest = make_manifest()
@@ -280,3 +285,117 @@ class TestNoopWorkerRunner:
         insert_call = db_mock.execute.call_args_list[0]
         # Index 6 = state (shifted by token_expires_at at index 4)
         assert insert_call[0][1][6] == "pending"
+
+
+class TestWorkerRespawn:
+    """Tests for BUG #17: worker re-spawn handling."""
+
+    @pytest.fixture
+    def db_mock(self):
+        db = MagicMock()
+        db.execute = AsyncMock()
+        db.fetch_one = AsyncMock(return_value=None)
+        db.conn = MagicMock()
+        db.conn.commit = AsyncMock()
+        return db
+
+    @pytest.fixture
+    def runner(self, db_mock):
+        return LocalBwrapWorkerRunner(db_mock, "/run/studio/test.sock")
+
+    @pytest.mark.asyncio
+    async def test_respawn_after_terminal_state_deletes_and_inserts(self, runner, db_mock):
+        """Worker in COMPLETE state is deleted before re-insert."""
+        manifest = make_manifest()
+        db_mock.fetch_one.return_value = {"id": "old-w1", "state": "complete"}
+
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                result = await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
+
+        # Should have deleted old row
+        delete_calls = [c for c in db_mock.execute.call_args_list
+                        if "DELETE FROM workers" in str(c[0][0])]
+        assert len(delete_calls) == 1
+        assert delete_calls[0][0][1][0] == "old-w1"
+
+        # Should have inserted new row
+        insert_calls = [c for c in db_mock.execute.call_args_list
+                        if "INSERT INTO workers" in str(c[0][0])]
+        assert len(insert_calls) == 1
+        assert result.worker_id == "w1"
+
+    @pytest.mark.asyncio
+    async def test_respawn_on_failed_worker_deletes_and_inserts(self, runner, db_mock):
+        """Worker in FAILED state is deleted before re-insert."""
+        manifest = make_manifest()
+        db_mock.fetch_one.return_value = {"id": "old-w2", "state": "failed"}
+
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                await runner.spawn_worker("w2", "b1", "n1", manifest, "/tmp/wt")
+
+        delete_calls = [c for c in db_mock.execute.call_args_list
+                        if "DELETE FROM workers" in str(c[0][0])]
+        assert len(delete_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_respawn_on_killed_worker_deletes_and_inserts(self, runner, db_mock):
+        """Worker in KILLED state is deleted before re-insert."""
+        manifest = make_manifest()
+        db_mock.fetch_one.return_value = {"id": "old-w3", "state": "killed"}
+
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                await runner.spawn_worker("w3", "b1", "n1", manifest, "/tmp/wt")
+
+        delete_calls = [c for c in db_mock.execute.call_args_list
+                        if "DELETE FROM workers" in str(c[0][0])]
+        assert len(delete_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_respawn_blocks_on_running_worker(self, runner, db_mock):
+        """Worker in RUNNING state raises RuntimeError on re-spawn attempt."""
+        manifest = make_manifest()
+        db_mock.fetch_one.return_value = {"id": "w-active", "state": "running"}
+
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with pytest.raises(RuntimeError, match="already in state running"):
+                await runner.spawn_worker("w-new", "b1", "n1", manifest, "/tmp/wt")
+
+    @pytest.mark.asyncio
+    async def test_respawn_blocks_on_pending_worker(self, runner, db_mock):
+        """Worker in PENDING state raises RuntimeError on re-spawn attempt."""
+        manifest = make_manifest()
+        db_mock.fetch_one.return_value = {"id": "w-pending", "state": "pending"}
+
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with pytest.raises(RuntimeError, match="already in state pending"):
+                await runner.spawn_worker("w-new2", "b1", "n1", manifest, "/tmp/wt")
+
+    @pytest.mark.asyncio
+    async def test_respawn_no_existing_worker_inserts_normally(self, runner, db_mock):
+        """No existing worker row: normal insert proceeds without delete."""
+        manifest = make_manifest()
+        db_mock.fetch_one.return_value = None
+
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                result = await runner.spawn_worker("w4", "b1", "n1", manifest, "/tmp/wt")
+
+        delete_calls = [c for c in db_mock.execute.call_args_list
+                        if "DELETE FROM workers" in str(c[0][0])]
+        assert len(delete_calls) == 0
+        assert result.worker_id == "w4"

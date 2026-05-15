@@ -166,7 +166,7 @@ class DeveloperWorker:
 
     async def _execute_task(self) -> dict:
         objective = self.task_spec.get("objective", self.task_spec.get("idea", "execute task"))
-        model = self.task_spec.get("model", "kimi-k2.6:cloud")
+        model = self.task_spec.get("model", "deepseek/deepseek-v4-pro")
         gates: list[str] = self.task_spec.get("gates", [])
 
         # Set up git identity in worktree
@@ -181,7 +181,7 @@ class DeveloperWorker:
         })
 
         # Build opencode command
-        cmd = [_OPencode_BIN, "run", "--headless", "--model", model, objective]
+        cmd = [_OPencode_BIN, "run", "--model", model, "--print-logs", objective]
         self._log(f"Running: {' '.join(cmd[:4])} ...")
 
         try:
@@ -256,12 +256,22 @@ class DeveloperWorker:
                         "tests_failed": 1,
                     }
 
-                await self._commit_worktree(objective, failed=False)
+                committed = await self._commit_worktree(objective, failed=False)
+                if not committed:
+                    return {
+                        "outcome": "failure",
+                        "node_state": "failed",
+                        "summary": "No output produced — worker completed but generated zero code changes",
+                        "errors": ["no_output_produced"],
+                        "tests_run": len(gates),
+                        "tests_passed": len(gates),
+                    }
                 return {
                     "outcome": "success",
                     "summary": f"Task completed: {objective[:200]}",
                     "tests_run": len(gates),
                     "tests_passed": len(gates),
+                    "files_changed": len(await self._get_files_changed()),
                 }
             else:
                 await self._commit_worktree(objective, failed=True)
@@ -409,10 +419,10 @@ class DeveloperWorker:
         except Exception:
             pass
 
-    async def _commit_worktree(self, objective: str, failed: bool = False) -> None:
-        """Commit changes in the worktree."""
+    async def _commit_worktree(self, objective: str, failed: bool = False) -> bool:
+        """Commit changes in the worktree. Returns True if changes were committed."""
         if not _WORKTREE_PATH:
-            return
+            return False
         try:
             # Stage all changes
             proc = await asyncio.create_subprocess_exec(
@@ -432,7 +442,7 @@ class DeveloperWorker:
             )
             rc = await proc.wait()
             if rc == 0:
-                return  # Nothing to commit
+                return False  # Nothing to commit
 
             if failed:
                 msg = f"WIP: {objective[:200]} (stuck/failed)"
@@ -447,8 +457,10 @@ class DeveloperWorker:
             )
             await proc.wait()
             self._log(f"Committed: {msg[:100]}")
+            return True
         except Exception as exc:
             self._log(f"Commit error: {exc}")
+            return False
 
     async def _get_files_changed(self) -> list[str]:
         """Return list of files changed in the worktree vs base branch."""

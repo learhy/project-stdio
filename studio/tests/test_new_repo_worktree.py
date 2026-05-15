@@ -27,7 +27,7 @@ def _make_async_db():
     """Build a mock database whose async methods are AsyncMock."""
     db = MagicMock()
     db.execute = AsyncMock()
-    db.fetch_one = AsyncMock()
+    db.fetch_one = AsyncMock(return_value=None)
     db.fetch_all = AsyncMock(return_value=[])
     db.conn = MagicMock()
     db.conn.commit = AsyncMock()

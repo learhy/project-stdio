@@ -1,4 +1,5 @@
 """Tests for Bundle 2.6: Developer Worker (real implementation)."""
+import importlib
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -232,7 +233,159 @@ class TestCommitWorktree:
     async def test_no_worktree_does_nothing(self):
         w = DeveloperWorker()
         with patch.dict("os.environ", {"STUDIO_WORKTREE_PATH": ""}):
-            await w._commit_worktree("Test", failed=False)
+            result = await w._commit_worktree("Test", failed=False)
+            assert result is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_no_changes(self):
+        """BUG #20: _commit_worktree returns False when git diff --cached is clean."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {"STUDIO_WORKTREE_PATH": "/tmp/test-wt"}):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            with patch("asyncio.create_subprocess_exec") as mock_exec:
+                # First call: git add -A
+                mock_add = AsyncMock()
+                mock_add.wait = AsyncMock(return_value=0)
+                # Second call: git diff --cached --quiet (returns 0 = clean)
+                mock_diff = AsyncMock()
+                mock_diff.wait = AsyncMock(return_value=0)
+
+                mock_exec.side_effect = [mock_add, mock_diff]
+
+                result = await w._commit_worktree("My objective", failed=False)
+                assert result is False
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_changes_committed(self):
+        """_commit_worktree returns True when changes are staged and committed."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {"STUDIO_WORKTREE_PATH": "/tmp/test-wt"}):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            with patch("asyncio.create_subprocess_exec") as mock_exec:
+                mock_add = AsyncMock()
+                mock_add.wait = AsyncMock(return_value=0)
+                # git diff --cached --quiet returns 1 = dirty
+                mock_diff = AsyncMock()
+                mock_diff.wait = AsyncMock(return_value=1)
+                # git commit
+                mock_commit = AsyncMock()
+                mock_commit.wait = AsyncMock(return_value=0)
+
+                mock_exec.side_effect = [mock_add, mock_diff, mock_commit]
+
+                result = await w._commit_worktree("Built the API", failed=False)
+                assert result is True
+
+
+class TestNoOutputDetection:
+    """Tests for BUG #20: worker reports success with zero code changes."""
+
+    @pytest.mark.asyncio
+    async def test_opencode_success_no_commits_reports_failure(self):
+        """When opencode succeeds but _commit_worktree returns False, outcome is failure."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {"objective": "Build API?", "model": "test-model"}
+            w.rpc.notify = AsyncMock()
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch("asyncio.create_subprocess_exec") as mock_exec:
+                    mock_proc = AsyncMock()
+                    mock_proc.wait = AsyncMock(return_value=0)
+                    mock_proc.stdout = AsyncMock()
+                    mock_proc.stderr = AsyncMock()
+                    mock_exec.return_value = mock_proc
+
+                    with patch.object(w, "_stream_and_detect_stuck") as mock_stream:
+                        mock_stream.return_value = (["Done"], b"", False)
+                        with patch.object(w, "_commit_worktree") as mock_commit:
+                            mock_commit.return_value = False  # No changes
+                            with patch.object(w, "_run_gates") as mock_gates:
+                                mock_gates.return_value = {"passed": True, "failed_gate": "", "output": ""}
+
+                                result = await w._execute_task()
+
+        assert result["outcome"] == "failure"
+        assert "no_output_produced" in result["errors"]
+        assert "zero code changes" in result["summary"]
+
+    @pytest.mark.asyncio
+    async def test_opencode_success_with_commits_reports_success(self):
+        """When opencode succeeds and _commit_worktree returns True, outcome is success."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {"objective": "Build API?", "model": "test-model"}
+            w.rpc.notify = AsyncMock()
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch("asyncio.create_subprocess_exec") as mock_exec:
+                    mock_proc = AsyncMock()
+                    mock_proc.wait = AsyncMock(return_value=0)
+                    mock_proc.stdout = AsyncMock()
+                    mock_proc.stderr = AsyncMock()
+                    mock_exec.return_value = mock_proc
+
+                    with patch.object(w, "_stream_and_detect_stuck") as mock_stream:
+                        mock_stream.return_value = (["Done"], b"", False)
+                        with patch.object(w, "_commit_worktree") as mock_commit:
+                            mock_commit.return_value = True  # Changes committed
+                            with patch.object(w, "_get_files_changed") as mock_files:
+                                mock_files.return_value = ["main.py", "test_main.py"]
+                                with patch.object(w, "_run_gates") as mock_gates:
+                                    mock_gates.return_value = {"passed": True, "failed_gate": "", "output": ""}
+
+                                    result = await w._execute_task()
+
+        assert result["outcome"] == "success"
+        assert result["files_changed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_opencode_nonzero_exit_reports_failure(self):
+        """When opencode exits non-zero, outcome is failure regardless of commits."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {"objective": "Bad task?", "model": "test-model"}
+            w.rpc.notify = AsyncMock()
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch("asyncio.create_subprocess_exec") as mock_exec:
+                    mock_proc = AsyncMock()
+                    mock_proc.wait = AsyncMock(return_value=1)  # Non-zero exit
+                    mock_proc.stdout = AsyncMock()
+                    mock_proc.stderr = AsyncMock()
+                    mock_exec.return_value = mock_proc
+
+                    with patch.object(w, "_stream_and_detect_stuck") as mock_stream:
+                        mock_stream.return_value = (["Error"], b"", False)
+                        with patch.object(w, "_commit_worktree") as mock_commit:
+                            mock_commit.return_value = False
+
+                            result = await w._execute_task()
+
+        assert result["outcome"] == "failure"
+        assert "exit_code=1" in str(result["errors"])
 
 
 class TestHumanInput:

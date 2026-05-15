@@ -876,11 +876,14 @@ class DagExecutor:
             await self._cancel_aggregator_siblings(bundle_id, node, incoming)
 
         await self.db.conn.commit()
-        await self._process_node_completion(bundle_id, node["node_id"], NodeState.COMPLETED)
 
-        # Fire review aggregator callback for approval matrix evaluation
+        # Fire review aggregator callback for approval matrix evaluation BEFORE
+        # processing node completion, so approval gates run before downstream
+        # code workers are dispatched.
         if node["node_id"] == "review-aggregator" and self._on_review_aggregator_complete:
             await self._on_review_aggregator_complete(bundle_id, output or {})
+
+        await self._process_node_completion(bundle_id, node["node_id"], NodeState.COMPLETED)
 
     def _apply_aggregator_output(
         self,
