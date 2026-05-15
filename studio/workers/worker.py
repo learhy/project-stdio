@@ -124,17 +124,68 @@ class Worker:
         phase = "starting"
         while self._running:
             try:
-                resp = await self.rpc.call("worker.heartbeat", {
+                await self.rpc.notify("worker.heartbeat", {
                     "phase": phase,
                     "progress": "",
                     "current_step": None,
                     "estimated_completion_seconds": None,
                 })
-                if "result" in resp:
-                    phase = "writing-code"
+                phase = "writing-code"
             except Exception:
                 pass
+
+            # Check for incoming messages from orchestrator
+            try:
+                msg = await self.rpc.receive(timeout=0.1)
+                if msg and msg.get("method") == "worker.inject_context":
+                    await self._handle_inject_context(msg)
+            except Exception:
+                pass
+
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
+
+    # ── Inject context handler (Bundle 5.1) ───────────────────────────────
+
+    async def _handle_inject_context(self, msg: dict) -> None:
+        """Handle an inject_context message from the orchestrator."""
+        params = msg.get("params", {})
+        injection_id = params.get("injection_id", "")
+        context_type = params.get("type", "feedback")
+        content = params.get("content", "")
+        action = params.get("action")
+        action_path = params.get("action_path")
+
+        self._log(f"Received inject_context: {context_type} (injection_id={injection_id})")
+
+        worker_response = "acknowledged"
+
+        # Handle embedded queries
+        if action == "describe_progress":
+            worker_response = json.dumps({
+                "current_activity": "executing task",
+                "completed_steps": [],
+                "planned_steps": [],
+                "blockers": [],
+                "confidence": "medium",
+                "recent_tool_calls": [],
+            })
+        elif action == "show_artifact" and action_path:
+            worker_response = json.dumps({
+                "path": action_path,
+                "content": "",
+                "size_bytes": 0,
+                "error": "not yet implemented",
+            })
+
+        # Acknowledge via worker.respond_to_query
+        try:
+            await self.rpc.call("worker.respond_to_query", {
+                "injection_id": injection_id,
+                "query_type": action or "describe_progress",
+                "response": {"worker_response": worker_response},
+            })
+        except Exception:
+            pass
 
     # ── Task execution ─────────────────────────────────────────────────────
 

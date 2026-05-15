@@ -22,6 +22,7 @@ from studio.orchestrator.rpc import (
     METHOD_NOT_IMPLEMENTED,
     CAPABILITY_DENIED,
     _STUB_METHODS,
+    _INFRASTRUCTURE_METHODS,
 )
 from studio.orchestrator.models import WorkerState, NodeState
 
@@ -576,7 +577,7 @@ class TestCreateRpcSystem:
         assert dispatcher is not None
         assert handlers is not None
         assert conn_mgr is not None
-        assert len(dispatcher._handlers) == 24
+        assert len(dispatcher._handlers) == 27
 
     def test_register_all_methods(self, db_mock, tmp_path):
         sp = str(tmp_path / "test.sock")
@@ -585,16 +586,143 @@ class TestCreateRpcSystem:
             "worker.heartbeat", "worker.log", "worker.progress_report",
             "worker.final_report", "worker.query_status", "cap.check",
             "worker.pause", "worker.resume", "worker.cancel",
-            "worker.inject_context", "cap.request",
+            "cap.request",
             "artifact.publish", "artifact.fetch", "artifact.list",
             "secrets.fetch", "worker.request_human_input",
             "worker.poll_human_input",
+            "worker.ask_question", "worker.report_checkpoint",
+            "worker.respond_to_query", "worker.inject_context",
             "mcp.approve_bundle", "mcp.reject_bundle",
             "mcp.request_modification", "mcp.escalate_bundle",
             "mcp.pause_bundle", "mcp.resume_bundle",
             "mcp.kill_worker",
         }
         assert set(dispatcher._handlers.keys()) == expected
+
+
+# ── Bundle 5.1: Bidirectional introspection ────────────────────────────────────
+
+class TestBundleFiveOne:
+    @pytest.mark.asyncio
+    async def test_inject_context_not_in_stub_methods(self):
+        """inject_context is now a real handler, not a stub."""
+        assert "worker.inject_context" not in _STUB_METHODS
+
+    @pytest.mark.asyncio
+    async def test_infrastructure_methods_bypass_capability(self, dispatcher, db_mock):
+        """Infrastructure methods (ask_question, report_checkpoint, respond_to_query)
+        should bypass capability checks."""
+        binding = WorkerBinding(
+            "w1", "b1", "n1",
+            rpc_methods=["worker.heartbeat"],  # only heartbeat, NOT ask_question
+            reader=None, writer=None,
+        )
+        mock_handler = AsyncMock(return_value={"status": "received", "question_id": "q1"})
+        dispatcher.register("worker.ask_question", mock_handler)
+        raw = json.dumps({
+            "jsonrpc": "2.0", "method": "worker.ask_question",
+            "params": {"question_id": "q1", "question": "test?"}, "id": 1,
+        }).encode()
+        resp = await dispatcher.dispatch(binding, raw)
+        body = json.loads(resp.decode())
+        # Should succeed — infrastructure methods bypass capability check
+        assert "error" not in body
+        assert body["result"]["status"] == "received"
+
+    @pytest.mark.asyncio
+    async def test_ask_question_stored_and_routed(self, handlers, db_mock, binding):
+        """handle_ask_question stores question and increments counter."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"questions_asked": 5},  # after increment
+            {"proposal_json": "{}"},  # bundle proposal for LLM
+        ]
+
+        result = await handlers.handle_ask_question(binding, {
+            "question_id": "q1", "question": "How do I proceed?",
+            "context": "working on auth module", "blocking": True, "urgency": "high",
+        }, 1)
+
+        assert result["status"] == "received"
+        assert result["question_id"] == "q1"
+
+        # Verify increment was called
+        inc_calls = [c for c in db_mock.execute.call_args_list
+                     if "questions_asked = questions_asked + 1" in str(c[0][0])]
+        assert len(inc_calls) == 1
+
+        # Verify insert was called
+        insert_calls = [c for c in db_mock.execute.call_args_list
+                        if "INSERT INTO worker_questions" in str(c[0][0])]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_ask_question_rate_limit_bypasses_llm(self, handlers, db_mock, binding):
+        """After rate limit exceeded, questions escalate without LLM."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"questions_asked": 12},  # over the limit
+        ]
+
+        result = await handlers.handle_ask_question(binding, {
+            "question_id": "q11", "question": "What now?",
+        }, 1)
+
+        assert result["status"] == "received"
+
+        # Verify escalated status was set (not answered)
+        escalated_calls = [c for c in db_mock.execute.call_args_list
+                           if "UPDATE worker_questions SET status" in str(c[0][0])
+                           and "escalated" in str(c[0][1])]
+        assert len(escalated_calls) == 1
+
+        # Verify rate limit audit entry
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "question_rate_limited" in str(c[0][1])]
+        assert len(audit_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_report_checkpoint_stored(self, handlers, db_mock, binding):
+        """handle_report_checkpoint stores checkpoint in DB."""
+        result = await handlers.handle_report_checkpoint(binding, {
+            "checkpoint_id": "cp1", "phase_completed": "implementation",
+            "phase_starting": "testing", "summary": "Done implementing",
+            "concerns": ["unsure about test coverage"],
+            "estimated_remaining": {"loc": 100, "seconds": 600},
+        }, 1)
+
+        assert result["accepted"] is True
+        assert result["checkpoint_id"] == "cp1"
+
+        insert_calls = [c for c in db_mock.execute.call_args_list
+                        if "INSERT INTO worker_checkpoints" in str(c[0][0])]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_respond_to_query_resolves_pending_call(self, handlers, db_mock, binding):
+        """handle_respond_to_query returns accepted for a query response."""
+        result = await handlers.handle_respond_to_query(binding, {
+            "injection_id": "inj-123", "query_type": "describe_progress",
+            "response": {"current_activity": "writing code"},
+        }, 1)
+
+        assert result["accepted"] is True
+        assert result["injection_id"] == "inj-123"
+
+    @pytest.mark.asyncio
+    async def test_handle_inject_context_acks(self, handlers, db_mock, binding):
+        """handle_inject_context logs acknowledgement."""
+        result = await handlers.handle_inject_context(binding, {
+            "injection_id": "inj-456", "acknowledged": True,
+            "worker_response": "got it",
+        }, 1)
+
+        assert result["accepted"] is True
+        assert result["injection_id"] == "inj-456"
+
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "inject_context_ack" in str(c[0][1])]
+        assert len(audit_calls) == 1
 
 
 # ── Edge cases ────────────────────────────────────────────────────────────────

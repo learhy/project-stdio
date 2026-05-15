@@ -265,8 +265,6 @@ class TestWorker:
             w.rpc = mock_rpc
             w._running = True
 
-            mock_rpc.call.return_value = {"result": {"accepted": True, "phase": "writing-code"}}
-
             # Run for a couple of beats then stop
             async def stop_after_delay():
                 await asyncio.sleep(0.05)
@@ -277,8 +275,8 @@ class TestWorker:
                 stopper = asyncio.create_task(stop_after_delay())
                 await asyncio.gather(task, stopper)
 
-            assert mock_rpc.call.call_count >= 1
-            heartbeat_calls = [c for c in mock_rpc.call.call_args_list
+            assert mock_rpc.notify.call_count >= 1
+            heartbeat_calls = [c for c in mock_rpc.notify.call_args_list
                               if c[0][0] == "worker.heartbeat"]
             assert len(heartbeat_calls) >= 1
 

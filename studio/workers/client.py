@@ -118,3 +118,19 @@ class RpcClient:
         }
         self.writer.write((json.dumps(msg) + "\n").encode())
         await self.writer.drain()
+
+    async def receive(self, timeout: float = 0.1) -> dict | None:
+        """Non-blocking read of an incoming message from the orchestrator.
+
+        Returns the parsed JSON message dict, or None if no message is available
+        within the timeout or if the connection is closed.
+        """
+        if self.reader is None:
+            return None
+        try:
+            line = await asyncio.wait_for(self.reader.readline(), timeout=timeout)
+            if not line:
+                return None
+            return json.loads(line.decode("utf-8"))
+        except (asyncio.TimeoutError, Exception):
+            return None

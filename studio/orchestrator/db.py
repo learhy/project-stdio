@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 class DatabaseVersionError(RuntimeError):
@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS workers (
   last_heartbeat INTEGER,
   ended_at INTEGER,
   exit_reason TEXT,
-  runner_type TEXT
+  runner_type TEXT,
+  questions_asked INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS capabilities (
@@ -228,6 +229,32 @@ CREATE TABLE IF NOT EXISTS artifact_refs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifact_refs_descriptor ON artifact_refs(bundle_id, descriptor_json);
+
+CREATE TABLE IF NOT EXISTS worker_questions (
+  question_id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id),
+  bundle_id TEXT NOT NULL REFERENCES bundles(id),
+  question TEXT NOT NULL,
+  context TEXT NOT NULL DEFAULT '',
+  blocking INTEGER NOT NULL DEFAULT 0,
+  urgency TEXT NOT NULL DEFAULT 'medium',
+  status TEXT NOT NULL DEFAULT 'pending',
+  answer TEXT,
+  asked_at INTEGER NOT NULL,
+  answered_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS worker_checkpoints (
+  checkpoint_id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id),
+  bundle_id TEXT NOT NULL REFERENCES bundles(id),
+  phase_completed TEXT NOT NULL DEFAULT '',
+  phase_starting TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  concerns_json TEXT NOT NULL DEFAULT '[]',
+  estimated_remaining_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
 """
 
 
@@ -376,6 +403,43 @@ async def _migrate_v11(conn: aiosqlite.Connection) -> None:
         "INSERT OR IGNORE INTO settings_metadata (key, value, updated_at) VALUES (?, ?, ?)",
         ("docker_runner_enabled", "0", 0),
     )
+
+
+@migration(12)
+async def _migrate_v12(conn: aiosqlite.Connection) -> None:
+    """Add worker_questions, worker_checkpoints tables and questions_asked counter (Bundle 5.1)."""
+    cursor = await conn.execute("PRAGMA table_info('workers')")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "questions_asked" not in columns:
+        await conn.execute(
+            "ALTER TABLE workers ADD COLUMN questions_asked INTEGER NOT NULL DEFAULT 0"
+        )
+    await conn.executescript("""
+        CREATE TABLE IF NOT EXISTS worker_questions (
+          question_id TEXT PRIMARY KEY,
+          worker_id TEXT NOT NULL REFERENCES workers(id),
+          bundle_id TEXT NOT NULL REFERENCES bundles(id),
+          question TEXT NOT NULL,
+          context TEXT NOT NULL DEFAULT '',
+          blocking INTEGER NOT NULL DEFAULT 0,
+          urgency TEXT NOT NULL DEFAULT 'medium',
+          status TEXT NOT NULL DEFAULT 'pending',
+          answer TEXT,
+          asked_at INTEGER NOT NULL,
+          answered_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS worker_checkpoints (
+          checkpoint_id TEXT PRIMARY KEY,
+          worker_id TEXT NOT NULL REFERENCES workers(id),
+          bundle_id TEXT NOT NULL REFERENCES bundles(id),
+          phase_completed TEXT NOT NULL DEFAULT '',
+          phase_starting TEXT NOT NULL DEFAULT '',
+          summary TEXT NOT NULL DEFAULT '',
+          concerns_json TEXT NOT NULL DEFAULT '[]',
+          estimated_remaining_json TEXT NOT NULL DEFAULT '{}',
+          created_at INTEGER NOT NULL
+        );
+    """)
 
 
 class Database:
