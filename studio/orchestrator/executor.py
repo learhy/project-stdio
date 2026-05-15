@@ -663,6 +663,17 @@ class DagExecutor:
                 proposal = json.loads(bundle_row["proposal_json"] or "{}")
                 bundler = proposal.get("proposal", {})
                 target = bundler.get("target", "existing-repo")
+                # Enrich developer worker task spec with full bundle context so
+                # opencode has enough detail to produce correct output even when
+                # the bundler writes abbreviated node objectives.
+                if worker_type == "developer":
+                    bundle_input = proposal.get("bundle_input", {})
+                    if bundle_input.get("idea"):
+                        normalized["bundle_idea"] = bundle_input["idea"]
+                    if bundler.get("requirements_summary"):
+                        normalized["bundle_requirements"] = bundler["requirements_summary"]
+                    if bundler.get("implementation_plan"):
+                        normalized["bundle_plan"] = bundler["implementation_plan"]
         except Exception:
             pass
 

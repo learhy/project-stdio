@@ -173,7 +173,28 @@ class DeveloperWorker:
         self._log(f"Worktree: {_WORKTREE_PATH}, base branch: {_BASE_BRANCH}")
         self._setup_git_identity()
 
-        self._log(f"Task objective: {objective[:200]}")
+        # Build a rich prompt so opencode has full context, not just the terse objective.
+        # The bundler often puts critical details (endpoint paths, payloads, etc.) in
+        # the description field rather than the objective.
+        prompt_parts = [objective]
+        description = self.task_spec.get("description", "")
+        if description:
+            prompt_parts.append(f"\nDetails: {description}")
+        deps = self.task_spec.get("dependencies", [])
+        if deps:
+            prompt_parts.append(f"\nDependencies: {', '.join(deps)}")
+        language = self.task_spec.get("language", "")
+        if language:
+            prompt_parts.append(f"\nUse {language}.")
+        bundle_idea = self.task_spec.get("bundle_idea", "")
+        if bundle_idea:
+            prompt_parts.append(f"\nFull specification from the original request:\n{bundle_idea}")
+        bundle_requirements = self.task_spec.get("bundle_requirements", "")
+        if bundle_requirements and bundle_requirements != bundle_idea:
+            prompt_parts.append(f"\nRequirements: {bundle_requirements}")
+        full_prompt = "\n".join(prompt_parts)
+
+        self._log(f"Task objective: {full_prompt[:200]}")
         await self.rpc.notify("worker.progress_report", {
             "stage": "starting",
             "percent": 0,
@@ -181,7 +202,7 @@ class DeveloperWorker:
         })
 
         # Build opencode command
-        cmd = [_OPencode_BIN, "run", "--model", model, "--print-logs", objective]
+        cmd = [_OPencode_BIN, "run", "--model", model, "--print-logs", full_prompt]
         self._log(f"Running: {' '.join(cmd[:4])} ...")
 
         try:
