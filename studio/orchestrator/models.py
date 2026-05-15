@@ -215,6 +215,7 @@ class TaskSpec(BaseModel):
     success_criteria: list[dict[str, Any]] = Field(default_factory=list)
     retry_policy: dict[str, Any] = Field(default_factory=lambda: {"max_attempts": 1, "backoff": "immediate"})
     capability_manifest: dict[str, Any] | None = None
+    runner_preference: Literal["local", "remote_ssh", "k8s", "any"] = "any"
 
 
 class DAGNode(BaseModel):
@@ -739,6 +740,12 @@ class K8sRunnerSettings(BaseModel):
     proxy_image: str = "studio-proxy:latest"
 
 
+class RunnerSelectorSettings(BaseModel):
+    """Runner selection policy configuration (Bundle 4.4)."""
+    allow_unenforced_grants: bool = False
+    default_preference: Literal["local", "remote_ssh", "k8s", "any"] = "any"
+
+
 class Settings(BaseModel):
     kernel: KernelSettings = Field(default_factory=KernelSettings)
     egress_proxy: EgressProxySettings = Field(default_factory=EgressProxySettings)
@@ -748,6 +755,7 @@ class Settings(BaseModel):
     remote_workers: RemoteWorkersSettings = Field(default_factory=RemoteWorkersSettings)
     remote_fleet: RemoteFleetSettings = Field(default_factory=RemoteFleetSettings)
     k8s_runner: K8sRunnerSettings = Field(default_factory=K8sRunnerSettings)
+    runner_selector: RunnerSelectorSettings = Field(default_factory=RunnerSelectorSettings)
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)

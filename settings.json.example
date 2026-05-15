@@ -66,6 +66,10 @@
     "worker_image": "studio-worker:latest",
     "proxy_image": "studio-proxy:latest"
   },
+  "runner_selector": {
+    "allow_unenforced_grants": false,
+    "default_preference": "any"
+  },
   "artifacts": {
     "inline_threshold_bytes": 4096,
     "global_storage_cap_bytes": 50000000000,

@@ -41,6 +41,9 @@ class TestOrchestratorLifecycle:
         with patch("studio.orchestrator.main.create_database") as mock_create_db, \
              patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
              patch("studio.orchestrator.main.LocalBwrapWorkerRunner") as mock_runner_cls, \
+             patch("studio.orchestrator.main.RemoteSSHWorkerRunner") as mock_ssh_cls, \
+             patch("studio.orchestrator.main.K8sJobWorkerRunner") as mock_k8s_cls, \
+             patch("studio.orchestrator.main.RunnerSelector") as mock_selector_cls, \
              patch("studio.orchestrator.main.DagExecutor") as mock_exec_cls, \
              patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
              patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
@@ -51,7 +54,10 @@ class TestOrchestratorLifecycle:
             mock_db = MagicMock()
             mock_db.fetch_all = AsyncMock()
             mock_db.fetch_one = AsyncMock()
+            mock_db.execute = AsyncMock()
             mock_db.close = AsyncMock()
+            mock_db.conn = MagicMock()
+            mock_db.conn.commit = AsyncMock()
             mock_create_db.return_value = mock_db
 
             mock_dispatcher = MagicMock()
@@ -61,6 +67,10 @@ class TestOrchestratorLifecycle:
 
             mock_runner = MagicMock()
             mock_runner_cls.return_value = mock_runner
+
+            mock_selector = MagicMock()
+            mock_selector.runner_names = ["local"]
+            mock_selector_cls.return_value = mock_selector
 
             mock_exec = MagicMock()
             mock_exec._running_workers = {}
@@ -106,6 +116,9 @@ class TestOrchestratorLifecycle:
         with patch("studio.orchestrator.main.create_database") as mock_create_db, \
              patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
              patch("studio.orchestrator.main.LocalBwrapWorkerRunner"), \
+             patch("studio.orchestrator.main.RemoteSSHWorkerRunner"), \
+             patch("studio.orchestrator.main.K8sJobWorkerRunner"), \
+             patch("studio.orchestrator.main.RunnerSelector") as mock_selector_cls, \
              patch("studio.orchestrator.main.DagExecutor"), \
              patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
              patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
@@ -116,8 +129,15 @@ class TestOrchestratorLifecycle:
             mock_db = MagicMock()
             mock_db.fetch_all = AsyncMock()
             mock_db.fetch_one = AsyncMock()
+            mock_db.execute = AsyncMock()
             mock_db.close = AsyncMock()
+            mock_db.conn = MagicMock()
+            mock_db.conn.commit = AsyncMock()
             mock_create_db.return_value = mock_db
+
+            mock_selector = MagicMock()
+            mock_selector.runner_names = ["local"]
+            mock_selector_cls.return_value = mock_selector
 
             mock_create_rpc.return_value = (MagicMock(), MagicMock(), MagicMock())
             mock_sched_cls.return_value = MagicMock(start=AsyncMock(), stop=AsyncMock())
@@ -146,6 +166,9 @@ class TestOrchestratorLifecycle:
         with patch("studio.orchestrator.main.create_database") as mock_create_db, \
              patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
              patch("studio.orchestrator.main.LocalBwrapWorkerRunner"), \
+             patch("studio.orchestrator.main.RemoteSSHWorkerRunner"), \
+             patch("studio.orchestrator.main.K8sJobWorkerRunner"), \
+             patch("studio.orchestrator.main.RunnerSelector") as mock_selector_cls, \
              patch("studio.orchestrator.main.DagExecutor"), \
              patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
              patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
@@ -156,8 +179,15 @@ class TestOrchestratorLifecycle:
             mock_db = MagicMock()
             mock_db.fetch_all = AsyncMock()
             mock_db.fetch_one = AsyncMock()
+            mock_db.execute = AsyncMock()
             mock_db.close = AsyncMock()
+            mock_db.conn = MagicMock()
+            mock_db.conn.commit = AsyncMock()
             mock_create_db.return_value = mock_db
+
+            mock_selector = MagicMock()
+            mock_selector.runner_names = ["local"]
+            mock_selector_cls.return_value = mock_selector
 
             mock_conn_mgr = MagicMock()
             mock_conn_mgr._by_worker_id = {}

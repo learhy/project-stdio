@@ -662,7 +662,7 @@ class TestK8sStatusCli:
     async def test_k8s_status_no_k8s_runner(self):
         from studio.orchestrator.main import _cli_k8s_status
         app = MagicMock()
-        app.runner = MagicMock()  # not a K8sJobWorkerRunner
+        app._k8s_runner = None
         result = await _cli_k8s_status(app, {})
         assert "error" in result
 
@@ -688,8 +688,8 @@ class TestK8sStatusCli:
         app = MagicMock()
         app.settings.k8s_runner = make_k8s_settings()
         app.sm.now.return_value = 1000
-        app.runner = MagicMock(spec=K8sJobWorkerRunner)
-        app.runner._ensure_client = AsyncMock(return_value=mock_api)
+        app._k8s_runner = MagicMock(spec=K8sJobWorkerRunner)
+        app._k8s_runner._ensure_client = AsyncMock(return_value=mock_api)
 
         result = await _cli_k8s_status(app, {})
         assert "jobs" in result

@@ -369,7 +369,7 @@ class TestFleetCliHandlers:
     async def test_fleet_status_no_fleet(self):
         from studio.orchestrator.main import _cli_fleet_status, Orchestrator
         app = MagicMock(spec=Orchestrator)
-        app.runner = MagicMock()  # not a RemoteSSHWorkerRunner
+        app._ssh_runner = None
         result = await _cli_fleet_status(app, {})
         assert "error" in result
 
@@ -379,10 +379,10 @@ class TestFleetCliHandlers:
         app = MagicMock(spec=Orchestrator)
         app.settings = MagicMock()
         app.settings.remote_fleet = make_fleet([make_fleet_host("h1"), make_fleet_host("h2")])
-        app.runner = MagicMock(spec=RemoteSSHWorkerRunner)
-        app.runner.ping_hosts = AsyncMock(return_value={"h1": "healthy", "h2": "healthy"})
-        app.runner._host_semaphores = {"h1": asyncio.Semaphore(4), "h2": asyncio.Semaphore(4)}
-        app.runner._host_last_ping = {"h1": 1000.0, "h2": 1000.0}
+        app._ssh_runner = MagicMock(spec=RemoteSSHWorkerRunner)
+        app._ssh_runner.ping_hosts = AsyncMock(return_value={"h1": "healthy", "h2": "healthy"})
+        app._ssh_runner._host_semaphores = {"h1": asyncio.Semaphore(4), "h2": asyncio.Semaphore(4)}
+        app._ssh_runner._host_last_ping = {"h1": 1000.0, "h2": 1000.0}
 
         result = await _cli_fleet_status(app, {})
         assert "hosts" in result
@@ -394,7 +394,7 @@ class TestFleetCliHandlers:
         app = MagicMock(spec=Orchestrator)
         app.settings = MagicMock()
         app.settings.remote_fleet = make_fleet([])
-        app.runner = MagicMock()  # not a RemoteSSHWorkerRunner
+        app._ssh_runner = None
 
         with patch("studio.orchestrator.main._persist_fleet_settings"):
             result = await _cli_fleet_add(app, {"name": "new-host", "addr": "10.0.0.2"})
@@ -408,7 +408,7 @@ class TestFleetCliHandlers:
         app = MagicMock(spec=Orchestrator)
         app.settings = MagicMock()
         app.settings.remote_fleet = make_fleet([make_fleet_host("h1")])
-        app.runner = MagicMock()
+        app._ssh_runner = None
 
         with patch("studio.orchestrator.main._persist_fleet_settings"):
             result = await _cli_fleet_add(app, {"name": "h1", "addr": "10.0.0.3"})
@@ -421,7 +421,7 @@ class TestFleetCliHandlers:
         app = MagicMock(spec=Orchestrator)
         app.settings = MagicMock()
         app.settings.remote_fleet = make_fleet([make_fleet_host("h1")])
-        app.runner = MagicMock()
+        app._ssh_runner = None
 
         with patch("studio.orchestrator.main._persist_fleet_settings"):
             result = await _cli_fleet_remove(app, {"name": "h1"})
@@ -434,7 +434,7 @@ class TestFleetCliHandlers:
         app = MagicMock(spec=Orchestrator)
         app.settings = MagicMock()
         app.settings.remote_fleet = make_fleet([])
-        app.runner = MagicMock()
+        app._ssh_runner = None
 
         result = await _cli_fleet_remove(app, {"name": "nonexistent"})
         assert "error" in result
