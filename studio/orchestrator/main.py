@@ -1807,7 +1807,17 @@ async def _cli_calibration_report(app: Orchestrator, params: dict) -> dict:
 
 async def _cli_approve(app: Orchestrator, params: dict) -> dict:
     bundle_id = params.get("bundle_id", "")
-    await app.sm.transition_1a_approve(bundle_id, "cli")
+
+    # Use the correct transition based on current state
+    row = await app.db.fetch_one("SELECT state FROM bundles WHERE id = ?", (bundle_id,))
+    if row is None:
+        return {"error": f"Bundle {bundle_id} not found"}
+    current_state = row["state"]
+
+    if current_state == BundleState.IN_REVIEW:
+        await app.sm.transition_4_approve_from_review(bundle_id, "cli")
+    else:
+        await app.sm.transition_1a_approve(bundle_id, "cli")
 
     # Transition 6: start execution
     await app.sm.transition_6_start_execution(bundle_id)
