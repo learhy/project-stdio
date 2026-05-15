@@ -302,6 +302,7 @@ class RpcHandlers:
         progress = params.get("progress", "")
         current_step = params.get("current_step")
         estimated = params.get("estimated_completion_seconds")
+        tokens_used = params.get("tokens_used", 0)
 
         now = self.now()
 
@@ -314,13 +315,13 @@ class RpcHandlers:
 
         if current_state == "pending":
             await self.db.execute(
-                "UPDATE workers SET state = ?, last_heartbeat = ?, current_phase = ? WHERE id = ?",
-                (WorkerState.RUNNING, now, phase, binding.worker_id),
+                "UPDATE workers SET state = ?, last_heartbeat = ?, current_phase = ?, tokens_used = ? WHERE id = ?",
+                (WorkerState.RUNNING, now, phase, tokens_used, binding.worker_id),
             )
         else:
             await self.db.execute(
-                "UPDATE workers SET last_heartbeat = ?, current_phase = ? WHERE id = ?",
-                (now, phase, binding.worker_id),
+                "UPDATE workers SET last_heartbeat = ?, current_phase = ?, tokens_used = ? WHERE id = ?",
+                (now, phase, tokens_used, binding.worker_id),
             )
         await self.db.conn.commit()
 

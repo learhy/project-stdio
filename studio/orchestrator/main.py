@@ -314,7 +314,7 @@ class Orchestrator:
     # ── Bundle complete callback (Bundle 5.3) ───────────────────────────
 
     async def _on_bundle_complete(self, bundle_id: str) -> None:
-        """Post final report to GitHub when a bundle transitions to COMPLETE."""
+        """Post final report and review quality feedback comment to GitHub."""
         if self.github_client is None:
             return
 
@@ -338,6 +338,27 @@ class Orchestrator:
         body = format_final_report_comment(bundle_id, outcome, proposal)
         await self.github_client.post_comment(row["github_issue_number"], body)
         logger.info("Final report posted to GitHub for bundle %s", bundle_id)
+
+        # ── Bundle 5.4: PM review quality feedback ─────────────────────────
+
+        int_row = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM worker_interventions WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        interventions_count = int_row["cnt"] if int_row else 0
+
+        feedback_threshold = self.settings.review.feedback_threshold_interventions
+        if interventions_count >= feedback_threshold:
+            feedback_body = (
+                f"## Review quality feedback\n\n"
+                f"This bundle had {interventions_count} mid-flight interventions. Were they helpful?\n\n"
+                f"- `/review-good` — interventions were appropriate and helpful\n"
+                f"- `/review-noisy` — too many interventions, worker was on track\n"
+                f"- `/review-missed` — important issues weren't caught"
+            )
+            await self.github_client.post_comment(row["github_issue_number"], feedback_body)
+            logger.info("Review quality feedback posted for bundle %s (%d interventions)",
+                        bundle_id, interventions_count)
 
     # ── Checkpoint callback (Bundle 5.2, updated 5.3) ────────────────────
 
@@ -413,6 +434,74 @@ class Orchestrator:
         actual_workers = outcome.get("calibration", {}).get("actual_worker_count", 0)
         actual_tokens = outcome.get("calibration", {}).get("actual_tokens", 0)
 
+        # Aggregate tokens from heartbeat tracking (Bundle 5.4)
+        tokens_row = await self.db.fetch_one(
+            "SELECT SUM(tokens_used) as total_tokens FROM workers WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        heartbeat_tokens = tokens_row["total_tokens"] if tokens_row and tokens_row["total_tokens"] else 0
+        if heartbeat_tokens > 0:
+            actual_tokens = heartbeat_tokens
+
+        # ── Bundle 5.4: review quality dimensions ──────────────────────────
+
+        # Intervention count
+        int_row = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM worker_interventions WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        interventions_count = int_row["cnt"] if int_row else 0
+
+        # Questions stats
+        q_asked_row = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM worker_questions WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        questions_asked = q_asked_row["cnt"] if q_asked_row else 0
+
+        q_llm_row = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM worker_questions "
+            "WHERE bundle_id = ? AND status = ? AND answered_by = ?",
+            (bundle_id, "answered", "llm"),
+        )
+        questions_llm_answered = q_llm_row["cnt"] if q_llm_row else 0
+
+        q_esc_row = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM worker_questions WHERE bundle_id = ? AND status = ?",
+            (bundle_id, "escalated"),
+        )
+        questions_escalated = q_esc_row["cnt"] if q_esc_row else 0
+
+        # Checkpoints count
+        cp_row = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM worker_checkpoints WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        checkpoints_count = cp_row["cnt"] if cp_row else 0
+
+        # Escalation response time (avg seconds from escalated_at to answered_at)
+        resp_row = await self.db.fetch_one(
+            "SELECT AVG(answered_at - escalated_at) as avg_resp FROM worker_questions "
+            "WHERE bundle_id = ? AND status = ? AND escalated_at IS NOT NULL AND answered_at IS NOT NULL",
+            (bundle_id, "answered"),
+        )
+        escalation_response_time_seconds = (
+            int(resp_row["avg_resp"]) if resp_row and resp_row["avg_resp"] is not None else 0
+        )
+
+        # interventions_correct from PM feedback
+        fb_row = await self.db.fetch_one(
+            "SELECT feedback_type FROM review_calibration WHERE bundle_id = ? ORDER BY created_at DESC LIMIT 1",
+            (bundle_id,),
+        )
+        if fb_row:
+            if fb_row["feedback_type"] == "good":
+                interventions_correct = interventions_count
+            else:
+                interventions_correct = 0
+        else:
+            interventions_correct = 0
+
         # Compute divergence: >50% on any axis triggers post-mortem flag
         def _pct_divergence(estimated: int, actual: int) -> float | None:
             if estimated == 0:
@@ -442,6 +531,13 @@ class Orchestrator:
             "estimated_tokens": estimated_tokens,
             "actual_tokens": actual_tokens,
             "divergence_threshold_exceeded": diverged,
+            "interventions_count": interventions_count,
+            "interventions_correct": interventions_correct,
+            "questions_asked": questions_asked,
+            "questions_llm_answered": questions_llm_answered,
+            "questions_escalated": questions_escalated,
+            "escalation_response_time_seconds": escalation_response_time_seconds,
+            "checkpoints_count": checkpoints_count,
         }
 
         # Write to memory/calibration/scoring-outcomes.jsonl
@@ -900,8 +996,8 @@ class Orchestrator:
             return
         rows = await self.db.fetch_all(
             "SELECT id, github_issue_number FROM bundles "
-            "WHERE github_issue_number IS NOT NULL AND state IN (?, ?)",
-            (BundleState.IN_REVIEW, BundleState.PAUSED),
+            "WHERE github_issue_number IS NOT NULL AND state IN (?, ?, ?)",
+            (BundleState.IN_REVIEW, BundleState.PAUSED, BundleState.COMPLETE),
         )
         for row in rows:
             bundle_id = row["id"]
@@ -949,6 +1045,12 @@ class Orchestrator:
             worker_id = m.group(1).strip()
             context = m.group(2).strip() if m.group(2) else ""
             await self._handle_resume_command(bundle_id, worker_id, context, actor)
+        elif re.match(r"^/review-good\s*$", body, re.IGNORECASE):
+            await self._handle_review_feedback(bundle_id, "good", actor)
+        elif re.match(r"^/review-noisy\s*$", body, re.IGNORECASE):
+            await self._handle_review_feedback(bundle_id, "noisy", actor)
+        elif re.match(r"^/review-missed\s*$", body, re.IGNORECASE):
+            await self._handle_review_feedback(bundle_id, "missed", actor)
 
     async def _handle_answer_command(self, bundle_id: str, question_id: str,
                                       answer_text: str, actor: str) -> None:
@@ -1016,6 +1118,69 @@ class Orchestrator:
             self.db, self.handlers, self.conn_mgr, self.github_client,
             intervention_id, worker_id, bundle_id, response_text, actor,
         )
+
+    async def _handle_review_feedback(self, bundle_id: str, feedback_type: str,
+                                        actor: str) -> None:
+        """Handle /review-good, /review-noisy, /review-missed (Bundle 5.4)."""
+        now = int(time.time())
+
+        await self.db.execute(
+            "INSERT INTO review_calibration (bundle_id, feedback_type, actor, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (bundle_id, feedback_type, actor, now),
+        )
+        await self.db.conn.commit()
+
+        # Update bundle outcome with interventions_correct per resolution #7
+        row = await self.db.fetch_one(
+            "SELECT outcome_json FROM bundles WHERE id = ?", (bundle_id,)
+        )
+        outcome = {}
+        if row and row["outcome_json"]:
+            try:
+                outcome = json.loads(row["outcome_json"])
+            except json.JSONDecodeError:
+                outcome = {}
+
+        int_row = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM worker_interventions WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        interventions_count = int_row["cnt"] if int_row else 0
+
+        if feedback_type == "good":
+            interventions_correct = interventions_count
+        elif feedback_type == "missed":
+            interventions_correct = 0
+        else:  # noisy
+            interventions_correct = 0
+
+        # Store in outcome for calibration
+        outcome["review_feedback"] = {
+            "feedback_type": feedback_type,
+            "interventions_correct": interventions_correct,
+            "actor": actor,
+            "created_at": now,
+        }
+        await self.db.execute(
+            "UPDATE bundles SET outcome_json = ? WHERE id = ?",
+            (json.dumps(outcome), bundle_id),
+        )
+        await self.db.conn.commit()
+
+        logger.info("Review feedback '%s' recorded for bundle %s by %s",
+                    feedback_type, bundle_id, actor)
+
+        # Post acknowledgement
+        if self.github_client:
+            bundle_row = await self.db.fetch_one(
+                "SELECT github_issue_number FROM bundles WHERE id = ?", (bundle_id,)
+            )
+            if bundle_row and bundle_row["github_issue_number"]:
+                await self.github_client.post_comment(
+                    bundle_row["github_issue_number"],
+                    f"@{actor.split(':',1)[-1]} Thanks for the review quality feedback (`{feedback_type}`).",
+                )
 
     async def _acknowledge_comment(self, bundle_id: str, user: str, command: str) -> None:
         if self.github_client is None:
@@ -1562,10 +1727,47 @@ async def _cli_calibration_report(app: Orchestrator, params: dict) -> dict:
                 "tokens": e.get("actual_tokens"),
             },
         })
+
+    # ── Bundle 5.4: Review quality section ─────────────────────────────────
+
+    total_interventions = sum(e.get("interventions_count", 0) for e in entries)
+    total_bundles_with_interventions = sum(1 for e in entries if e.get("interventions_count", 0) > 0)
+    total_questions = sum(e.get("questions_asked", 0) for e in entries)
+    total_llm_answered = sum(e.get("questions_llm_answered", 0) for e in entries)
+    total_escalated = sum(e.get("questions_escalated", 0) for e in entries)
+    resp_times = [e["escalation_response_time_seconds"] for e in entries
+                  if e.get("escalation_response_time_seconds", 0) > 0]
+
+    # Query review_calibration for feedback stats
+    fb_rows = await app.db.fetch_all(
+        "SELECT feedback_type, COUNT(*) as cnt FROM review_calibration GROUP BY feedback_type"
+    )
+    fb_counts = {r["feedback_type"]: r["cnt"] for r in fb_rows} if fb_rows else {}
+    good_count = fb_counts.get("good", 0)
+    noisy_count = fb_counts.get("noisy", 0)
+    missed_count = fb_counts.get("missed", 0)
+    total_feedback = good_count + noisy_count + missed_count
+
+    review_quality = {
+        "total_interventions": total_interventions,
+        "total_bundles_with_interventions": total_bundles_with_interventions,
+        "intervention_rate": round(total_interventions / total, 2) if total > 0 else 0,
+        "llm_answer_rate": round(total_llm_answered / total_questions * 100) if total_questions > 0 else 0,
+        "avg_escalation_response_minutes": round(sum(resp_times) / len(resp_times) / 60, 1) if resp_times else 0,
+        "total_feedback": total_feedback,
+        "good_count": good_count,
+        "noisy_count": noisy_count,
+        "missed_count": missed_count,
+        "accuracy_rate": round(good_count / total_feedback * 100) if total_feedback > 0 else None,
+        "noisy_rate": round(noisy_count / total_feedback, 2) if total_feedback > 0 else 0,
+        "missed_rate": round(missed_count / total_feedback, 2) if total_feedback > 0 else 0,
+    }
+
     return {
         "total_entries": total,
         "entries_with_divergence": diverged_count,
         "recent": recent,
+        "review_quality": review_quality,
     }
 
 
