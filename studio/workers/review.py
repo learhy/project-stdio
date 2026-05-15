@@ -256,7 +256,12 @@ def _call_llm(system_prompt: str, user_message: str) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-        content = body.get("message", {}).get("content", "")
+        # OpenAI-compatible format: content is at choices[0].message.content
+        # Fall back to native Ollama format: message.content
+        try:
+            content = body["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            content = body.get("message", {}).get("content", "")
         return _extract_json(content)
     except urllib.error.HTTPError as e:
         return {"error": f"HTTP {e.code}: {e.reason}"}

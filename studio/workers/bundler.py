@@ -239,7 +239,7 @@ def _call_llm(system_prompt: str, user_message: str) -> dict:
         "options": {"thinking_mode": "high"},
     }).encode()
 
-    url = f"{_OLLAMA_BASE_URL}/chat"
+    url = f"{_OLLAMA_BASE_URL}/chat/completions"
     req = urllib.request.Request(
         url,
         data=body,
@@ -252,7 +252,12 @@ def _call_llm(system_prompt: str, user_message: str) -> dict:
     except Exception as exc:
         return {"error": str(exc), "fallback": True}
 
-    content = raw.get("message", {}).get("content", "")
+    # OpenAI-compatible format: content is at choices[0].message.content
+    # Fall back to native Ollama format: message.content
+    try:
+        content = raw["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        content = raw.get("message", {}).get("content", "")
     return _extract_json(content)
 
 
