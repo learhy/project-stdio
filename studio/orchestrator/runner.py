@@ -285,6 +285,11 @@ class LocalBwrapWorkerRunner:
         if existing:
             terminal_states = (WorkerState.COMPLETE, WorkerState.FAILED, WorkerState.KILLED, WorkerState.CONNECTION_LOST)
             if existing["state"] in terminal_states:
+                # Unlink dag_nodes first (FK constraint), then delete worker
+                await self.db.execute(
+                    "UPDATE dag_nodes SET worker_id = NULL WHERE worker_id = ?",
+                    (existing["id"],),
+                )
                 await self.db.execute(
                     "DELETE FROM workers WHERE id = ?", (existing["id"],)
                 )
