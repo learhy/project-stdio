@@ -1,0 +1,19 @@
+namespace: studio-workers
+
+serviceAccount:
+  name: studio-worker
+
+rbac:
+  enabled: true
+
+limitRange:
+  defaultCpu: "2"
+  defaultMemory: "2Gi"
+  maxCpu: "8"
+  maxMemory: "16Gi"
+
+networkPolicy:
+  defaultDeny: true
+
+orchestrator:
+  serviceAccountName: ""  # set if orchestrator runs in cluster

@@ -1,0 +1,14 @@
+{{- if .Values.networkPolicy.defaultDeny }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: studio-workers
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress: []  # Deny all: overridden per-worker by K8sJobWorkerRunner
+{{- end }}

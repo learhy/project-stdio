@@ -1,0 +1,25 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: studio-worker-pod-watcher
+  labels:
+    app.kubernetes.io/name: studio-workers
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: studio-worker-pod-watcher-binding
+  labels:
+    app.kubernetes.io/name: studio-workers
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Values.namespace }}
+roleRef:
+  kind: ClusterRole
+  name: studio-worker-pod-watcher
+  apiGroup: rbac.authorization.k8s.io

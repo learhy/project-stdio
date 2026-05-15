@@ -1,0 +1,6 @@
+apiVersion: v2
+name: studio-workers
+description: Helm chart for studio orchestrator worker namespace (Bundle 4.3)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
