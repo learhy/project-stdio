@@ -49,8 +49,6 @@ METHOD_NOT_IMPLEMENTED = -32000
 CAPABILITY_DENIED = -32001
 
 _STUB_METHODS: frozenset[str] = frozenset({
-    "worker.pause",
-    "worker.resume",
     "worker.cancel",
 })
 
@@ -229,6 +227,8 @@ class RpcHandlers:
         self._on_inject_context: Callable[[str, str, str, str, str | None], Awaitable[None]] | None = None
         self._artifact_store: "ArtifactStore | None" = None
         self._secret_store: "SecretStore | None" = None
+        self._conn_mgr: "ConnectionManager | None" = None
+        self._github_client: Any = None
 
     def set_on_final_report(self, cb: Callable[[str, str, str, dict], Awaitable[None]]) -> None:
         """Callback: on_final_report(bundle_id, node_id, worker_id, outcome)."""
@@ -279,6 +279,12 @@ class RpcHandlers:
 
     def set_secret_store(self, store: "SecretStore") -> None:
         self._secret_store = store
+
+    def set_conn_mgr(self, conn_mgr: "ConnectionManager") -> None:
+        self._conn_mgr = conn_mgr
+
+    def set_github_client(self, github_client: Any) -> None:
+        self._github_client = github_client
 
     def set_sm(self, sm: Any) -> None:
         """Set state machine reference for MCP handlers."""
@@ -1064,19 +1070,23 @@ class RpcHandlers:
         max_questions = 10
 
         if questions_asked > max_questions:
-            # Rate limit exceeded — escalate directly
+            # Rate limit exceeded — escalate via shared escalation module
             await self.db.execute(
-                "UPDATE worker_questions SET status = ? WHERE question_id = ?",
-                ("escalated", question_id),
+                "UPDATE worker_questions SET status = ?, escalated_at = ? WHERE question_id = ?",
+                ("escalated", now, question_id),
             )
             await self.db.conn.commit()
-            await self.db.execute(
-                "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("worker.question_rate_limited", "worker", worker_id,
-                 json.dumps({"question_id": question_id, "questions_asked": questions_asked}), now),
-            )
-            await self.db.conn.commit()
+
+            if self._conn_mgr is not None:
+                from .escalation import escalate_to_pm
+                await escalate_to_pm(
+                    self.db, self, self._conn_mgr, self._github_client,
+                    worker_id, bundle_id, "unknown",  # node_id unknown in _route_question context
+                    "question_rate_limited",
+                    f"Worker {worker_id} has asked {questions_asked} questions (limit: {max_questions}): {question}",
+                    "question_escalation",
+                    question_id=question_id,
+                )
             return
 
         # Attempt LLM answer
@@ -1084,8 +1094,9 @@ class RpcHandlers:
 
         if confidence == "high" and answer:
             await self.db.execute(
-                "UPDATE worker_questions SET status = ?, answer = ?, answered_at = ? WHERE question_id = ?",
-                ("answered", answer, now, question_id),
+                "UPDATE worker_questions SET status = ?, answer = ?, answered_at = ?, "
+                "answered_by = ? WHERE question_id = ?",
+                ("answered", answer, now, "llm", question_id),
             )
             await self.db.conn.commit()
 
@@ -1095,19 +1106,23 @@ class RpcHandlers:
                 injection_id = str(ulid.ULID())
                 await self._on_inject_context(worker_id, injection_id, "answer", answer, question_id)
         else:
-            # Low confidence — escalate
+            # Low confidence — escalate via shared escalation module
             await self.db.execute(
-                "UPDATE worker_questions SET status = ? WHERE question_id = ?",
-                ("escalated", question_id),
+                "UPDATE worker_questions SET status = ?, escalated_at = ? WHERE question_id = ?",
+                ("escalated", now, question_id),
             )
             await self.db.conn.commit()
-            await self.db.execute(
-                "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("worker.question_escalated", "worker", worker_id,
-                 json.dumps({"question_id": question_id, "confidence": confidence}), now),
-            )
-            await self.db.conn.commit()
+
+            if self._conn_mgr is not None:
+                from .escalation import escalate_to_pm
+                await escalate_to_pm(
+                    self.db, self, self._conn_mgr, self._github_client,
+                    worker_id, bundle_id, "unknown",
+                    "low_llm_confidence",
+                    f"Low confidence answer for question: {question}",
+                    "question_escalation",
+                    question_id=question_id,
+                )
 
     async def _call_question_llm(self, bundle_id: str, question: str, context: str) -> tuple[str | None, str]:
         """Basic one-shot LLM call for question answering. Stub implementation for Bundle 5.1."""
@@ -1215,6 +1230,52 @@ class RpcHandlers:
         # The pending call is resolved by ConnectionManager via _pending_calls
         return {"accepted": True, "injection_id": injection_id}
 
+    # ── worker.pause (Bundle 5.3 — promoted from stub) ──────────────────
+
+    async def handle_pause(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        """Handle pause acknowledgement from worker, or initiate pause."""
+        reason = params.get("reason", "")
+        now = self.now()
+
+        await self.db.execute(
+            "UPDATE workers SET state = ?, current_phase = ? WHERE id = ?",
+            ("paused", "paused", binding.worker_id),
+        )
+        await self.db.conn.commit()
+
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("worker.paused", "worker", binding.worker_id,
+             json.dumps({"reason": reason}), now),
+        )
+        await self.db.conn.commit()
+
+        return {"paused": True, "worker_id": binding.worker_id}
+
+    # ── worker.resume (Bundle 5.3 — promoted from stub) ──────────────────
+
+    async def handle_resume(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        """Handle resume acknowledgement from worker, or initiate resume."""
+        context = params.get("context", "")
+        now = self.now()
+
+        await self.db.execute(
+            "UPDATE workers SET state = ?, current_phase = ? WHERE id = ?",
+            ("running", "resumed", binding.worker_id),
+        )
+        await self.db.conn.commit()
+
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("worker.resumed", "worker", binding.worker_id,
+             json.dumps({"context": context[:500]}), now),
+        )
+        await self.db.conn.commit()
+
+        return {"resumed": True, "worker_id": binding.worker_id}
+
     # ── worker.inject_context (Bundle 5.1 — promoted from stub) ───────────
 
     async def handle_inject_context(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
@@ -1234,6 +1295,34 @@ class RpcHandlers:
         await self.db.conn.commit()
 
         return {"accepted": True, "injection_id": injection_id}
+
+    # ── mcp.list_escalations (Bundle 5.3) ──────────────────────────────────
+
+    async def handle_mcp_list_escalations(self, binding: SystemBinding, params: dict, req_id: Any) -> dict:
+        """List all pending PM escalations across all bundles."""
+        rows = await self.db.fetch_all(
+            "SELECT wi.*, w.bundle_id as w_bundle_id, w.node_id "
+            "FROM worker_interventions wi "
+            "JOIN workers w ON wi.worker_id = w.id "
+            "WHERE wi.status = ? "
+            "ORDER BY wi.created_at DESC",
+            ("pending",),
+        )
+        escalations = []
+        for r in rows:
+            rd = dict(r)
+            escalations.append({
+                "intervention_id": rd["intervention_id"],
+                "worker_id": rd["worker_id"],
+                "bundle_id": rd["w_bundle_id"],
+                "node_id": rd.get("node_id", ""),
+                "type": rd["type"],
+                "content": rd["content"][:500],
+                "triggered_by": rd["triggered_by"],
+                "status": rd["status"],
+                "created_at": rd["created_at"],
+            })
+        return {"escalations": escalations, "count": len(escalations)}
 
 
 class ConnectionManager:
@@ -1542,9 +1631,10 @@ def create_rpc_system(
     dispatcher.register("worker.report_checkpoint", handlers.handle_report_checkpoint)
     dispatcher.register("worker.respond_to_query", handlers.handle_respond_to_query)
     dispatcher.register("worker.inject_context", handlers.handle_inject_context)
-    # Stub methods also registered so dispatcher finds them (but they return -32000)
-    dispatcher.register("worker.pause", _make_stub_handler("worker.pause"))
-    dispatcher.register("worker.resume", _make_stub_handler("worker.resume"))
+    # Bundle 5.3: pause and resume promoted from stubs to real handlers
+    dispatcher.register("worker.pause", handlers.handle_pause)
+    dispatcher.register("worker.resume", handlers.handle_resume)
+    # Stub methods still registered so dispatcher finds them (returns -32000)
     dispatcher.register("worker.cancel", _make_stub_handler("worker.cancel"))
     # mcp.* handlers (system surface, called by MCP server process)
     dispatcher.register("mcp.approve_bundle", handlers.handle_mcp_approve_bundle)
@@ -1554,6 +1644,7 @@ def create_rpc_system(
     dispatcher.register("mcp.pause_bundle", handlers.handle_mcp_pause_bundle)
     dispatcher.register("mcp.resume_bundle", handlers.handle_mcp_resume_bundle)
     dispatcher.register("mcp.kill_worker", handlers.handle_mcp_kill_worker)
+    dispatcher.register("mcp.list_escalations", handlers.handle_mcp_list_escalations)
 
     connection_manager = ConnectionManager(socket_path, dispatcher, handlers, db)
     return dispatcher, handlers, connection_manager

@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 class DatabaseVersionError(RuntimeError):
@@ -256,6 +256,19 @@ CREATE TABLE IF NOT EXISTS worker_checkpoints (
   estimated_remaining_json TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS worker_interventions (
+  intervention_id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id),
+  bundle_id TEXT NOT NULL REFERENCES bundles(id),
+  type TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  triggered_by TEXT NOT NULL,
+  trigger_reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_acknowledged INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
 """
 
 
@@ -452,6 +465,35 @@ async def _migrate_v13(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE workers ADD COLUMN last_reviewed_at INTEGER"
         )
+
+
+@migration(14)
+async def _migrate_v14(conn: aiosqlite.Connection) -> None:
+    """Add worker_interventions table, escalated_at + answered_by to worker_questions (Bundle 5.3)."""
+    cursor = await conn.execute("PRAGMA table_info('worker_questions')")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "escalated_at" not in columns:
+        await conn.execute(
+            "ALTER TABLE worker_questions ADD COLUMN escalated_at INTEGER"
+        )
+    if "answered_by" not in columns:
+        await conn.execute(
+            "ALTER TABLE worker_questions ADD COLUMN answered_by TEXT"
+        )
+    await conn.executescript("""
+        CREATE TABLE IF NOT EXISTS worker_interventions (
+          intervention_id TEXT PRIMARY KEY,
+          worker_id TEXT NOT NULL REFERENCES workers(id),
+          bundle_id TEXT NOT NULL REFERENCES bundles(id),
+          type TEXT NOT NULL,
+          content TEXT NOT NULL DEFAULT '',
+          triggered_by TEXT NOT NULL,
+          trigger_reason TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'pending',
+          worker_acknowledged INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL
+        );
+    """)
 
 
 class Database:

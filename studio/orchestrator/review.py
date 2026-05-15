@@ -30,11 +30,13 @@ class ReviewScheduler:
         review_settings: "ReviewSettings",
         handlers: "RpcHandlers",
         conn_mgr: "ConnectionManager",
+        github_client: Any = None,
     ) -> None:
         self.db = db
         self.settings = review_settings
         self.handlers = handlers
         self.conn_mgr = conn_mgr
+        self.github_client = github_client
         self._running = False
         self._task: asyncio.Task | None = None
 
@@ -357,11 +359,11 @@ class ReviewScheduler:
                 pass
 
         elif action_type == "escalate":
-            await self.db.execute(
-                "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("review.escalated_to_human", "worker", worker_id,
-                 json.dumps({"reason": action.get("escalation_reason", ""),
-                            "verdict": verdict, "bundle_id": bundle_id}), now),
+            from .escalation import escalate_to_pm
+            await escalate_to_pm(
+                self.db, self.handlers, self.conn_mgr, self.github_client,
+                worker_id, bundle_id, node_id,
+                trigger_reason,
+                action.get("escalation_reason", verdict.get("rationale", "")),
+                "review_escalation",
             )
-            await self.db.conn.commit()

@@ -311,15 +311,75 @@ class Orchestrator:
         except ValueError:
             logger.warning("Cannot send inject_context: worker %s not connected", worker_id)
 
-    # ── Checkpoint callback (Bundle 5.2) ─────────────────────────────────
+    # ── Bundle complete callback (Bundle 5.3) ───────────────────────────
+
+    async def _on_bundle_complete(self, bundle_id: str) -> None:
+        """Post final report to GitHub when a bundle transitions to COMPLETE."""
+        if self.github_client is None:
+            return
+
+        row = await self.db.fetch_one(
+            "SELECT github_issue_number, proposal_json, outcome_json FROM bundles WHERE id = ?",
+            (bundle_id,),
+        )
+        if row is None or row["github_issue_number"] is None:
+            return
+
+        try:
+            outcome = json.loads(row["outcome_json"] or "{}")
+        except json.JSONDecodeError:
+            outcome = {}
+        try:
+            proposal = json.loads(row["proposal_json"] or "{}")
+        except json.JSONDecodeError:
+            proposal = {}
+
+        from .escalation import format_final_report_comment
+        body = format_final_report_comment(bundle_id, outcome, proposal)
+        await self.github_client.post_comment(row["github_issue_number"], body)
+        logger.info("Final report posted to GitHub for bundle %s", bundle_id)
+
+    # ── Checkpoint callback (Bundle 5.2, updated 5.3) ────────────────────
 
     async def _on_worker_checkpoint(self, worker_id: str, bundle_id: str,
                                     node_id: str, checkpoint_data: dict) -> None:
-        """Post-checkpoint review trigger: ask ReviewScheduler to evaluate."""
+        """Post-checkpoint: trigger review AND post to GitHub every 3rd or if concerns."""
+        # Trigger review via ReviewScheduler
         if self._review_scheduler is not None:
             await self._review_scheduler.trigger_review(
                 worker_id, bundle_id, node_id, "post_checkpoint",
             )
+
+        # Post to GitHub: every 3rd checkpoint or when concerns non-empty
+        concerns = checkpoint_data.get("concerns", [])
+        if self.github_client is None:
+            return
+
+        # Count checkpoints for this worker to determine "every 3rd"
+        count_row = await self.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM worker_checkpoints WHERE worker_id = ?",
+            (worker_id,),
+        )
+        checkpoint_count = count_row["cnt"] if count_row else 0
+
+        if checkpoint_count % 3 == 0 or concerns:
+            bundle_row = await self.db.fetch_one(
+                "SELECT github_issue_number FROM bundles WHERE id = ?", (bundle_id,)
+            )
+            if bundle_row and bundle_row["github_issue_number"]:
+                from .escalation import format_checkpoint_comment
+                body = format_checkpoint_comment(
+                    worker_id,
+                    checkpoint_data.get("phase_completed", ""),
+                    checkpoint_data.get("phase_starting", ""),
+                    checkpoint_data.get("summary", ""),
+                    concerns,
+                )
+                await self.github_client.post_comment(
+                    bundle_row["github_issue_number"], body,
+                )
+                logger.info("Checkpoint comment posted for worker %s (#%d)",
+                           worker_id, checkpoint_count)
 
     # ── Calibration loop ───────────────────────────────────────────────────
 
@@ -425,6 +485,7 @@ class Orchestrator:
 
         # 2. State machine (kernel mode — Phase 1 approves/rejects directly)
         self.sm = BundleStateMachine(self.db, kernel_mode=True)
+        self.sm.set_on_bundle_complete(self._on_bundle_complete)
 
         # 2.5. GitHub client (non-blocking — failures logged, transitions proceed)
         if self.settings.github.enabled:
@@ -460,6 +521,10 @@ class Orchestrator:
 
         # Wire checkpoint callback for post-checkpoint reviews (Bundle 5.2)
         self.handlers.set_on_checkpoint(self._on_worker_checkpoint)
+
+        # Bundle 5.3: give handlers access to conn_mgr and github_client for escalation
+        self.handlers.set_conn_mgr(self.conn_mgr)
+        self.handlers.set_github_client(self.github_client)
 
         # 3.5. Secret store (hybrid file+env, Bundle 3.4)
         self._secret_store = SecretStore(
@@ -564,6 +629,7 @@ class Orchestrator:
         if self.settings.review.enabled:
             self._review_scheduler = ReviewScheduler(
                 self.db, self.settings.review, self.handlers, self.conn_mgr,
+                github_client=self.github_client,
             )
             await self._review_scheduler.start()
             logger.info("ReviewScheduler started")
@@ -875,6 +941,81 @@ class Orchestrator:
             instructions = m.group(1).strip()
             await self.sm.transition_3_return_to_proposed(bundle_id, instructions)
             await self._acknowledge_comment(bundle_id, user, "modify")
+        elif (m := re.match(r"^/answer:(\S+)\s+(.+)$", body, re.IGNORECASE | re.DOTALL)):
+            question_id = m.group(1).strip()
+            answer_text = m.group(2).strip()
+            await self._handle_answer_command(bundle_id, question_id, answer_text, actor)
+        elif (m := re.match(r"^/resume:(\S+)(?:\s+(.+))?$", body, re.IGNORECASE | re.DOTALL)):
+            worker_id = m.group(1).strip()
+            context = m.group(2).strip() if m.group(2) else ""
+            await self._handle_resume_command(bundle_id, worker_id, context, actor)
+
+    async def _handle_answer_command(self, bundle_id: str, question_id: str,
+                                      answer_text: str, actor: str) -> None:
+        """Handle /answer:<qid> <text> — PM answering an escalated worker question."""
+        q_row = await self.db.fetch_one(
+            "SELECT worker_id, bundle_id FROM worker_questions WHERE question_id = ?",
+            (question_id,),
+        )
+        if q_row is None:
+            logger.warning("Answer for unknown question %s by %s", question_id, actor)
+            return
+
+        worker_id = q_row["worker_id"]
+        now = int(time.time())
+
+        # Update question record
+        await self.db.execute(
+            "UPDATE worker_questions SET status = ?, answer = ?, answered_at = ?, "
+            "answered_by = ? WHERE question_id = ?",
+            ("answered", answer_text, now, actor, question_id),
+        )
+        await self.db.conn.commit()
+
+        # Find pending intervention for this question
+        int_row = await self.db.fetch_one(
+            "SELECT intervention_id FROM worker_interventions "
+            "WHERE worker_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
+            (worker_id, "pending"),
+        )
+        intervention_id = int_row["intervention_id"] if int_row else ""
+
+        # Resolve escalation
+        from .escalation import resolve_escalation
+        await resolve_escalation(
+            self.db, self.handlers, self.conn_mgr, self.github_client,
+            intervention_id, worker_id, bundle_id, answer_text, actor,
+        )
+
+    async def _handle_resume_command(self, bundle_id: str, worker_id: str,
+                                      context: str, actor: str) -> None:
+        """Handle /resume:<wid> [context] — PM resuming a paused worker."""
+        # Find pending intervention
+        int_row = await self.db.fetch_one(
+            "SELECT intervention_id FROM worker_interventions "
+            "WHERE worker_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
+            (worker_id, "pending"),
+        )
+        if int_row is None:
+            logger.warning("Resume for worker %s with no pending intervention by %s", worker_id, actor)
+            return
+
+        intervention_id = int_row["intervention_id"]
+        response_text = context or "resumed by PM"
+
+        # If no context provided, dismiss the intervention
+        if not context:
+            await self.db.execute(
+                "UPDATE worker_interventions SET status = ? WHERE intervention_id = ?",
+                ("dismissed", intervention_id),
+            )
+            await self.db.conn.commit()
+
+        from .escalation import resolve_escalation
+        await resolve_escalation(
+            self.db, self.handlers, self.conn_mgr, self.github_client,
+            intervention_id, worker_id, bundle_id, response_text, actor,
+        )
 
     async def _acknowledge_comment(self, bundle_id: str, user: str, command: str) -> None:
         if self.github_client is None:
@@ -1982,6 +2123,68 @@ async def _cli_review_worker(app: Orchestrator, params: dict) -> dict:
     return {"reviewed": True, "worker_id": worker_id, "verdict": verdict}
 
 
+async def _cli_answer_question(app: Orchestrator, params: dict) -> dict:
+    """Answer a pending worker question (Bundle 5.3)."""
+    question_id = params.get("question_id", "")
+    answer = params.get("answer", "")
+    if not question_id or not answer:
+        return {"error": "question_id and answer are required"}
+
+    q_row = await app.db.fetch_one(
+        "SELECT worker_id, bundle_id FROM worker_questions WHERE question_id = ? AND status = ?",
+        (question_id, "escalated"),
+    )
+    if q_row is None:
+        return {"error": f"Question {question_id} not found or not escalated"}
+
+    await app._handle_answer_command(q_row["bundle_id"], question_id, answer, "cli")
+    return {"answered": True, "question_id": question_id}
+
+
+async def _cli_resume_worker(app: Orchestrator, params: dict) -> dict:
+    """Resume a paused worker (Bundle 5.3)."""
+    worker_id = params.get("worker_id", "")
+    context = params.get("context", "")
+    if not worker_id:
+        return {"error": "worker_id is required"}
+
+    row = await app.db.fetch_one(
+        "SELECT bundle_id FROM workers WHERE id = ? AND state = ?",
+        (worker_id, "paused"),
+    )
+    if row is None:
+        return {"error": f"Worker {worker_id} not found or not paused"}
+
+    await app._handle_resume_command(row["bundle_id"], worker_id, context, "cli")
+    return {"resumed": True, "worker_id": worker_id}
+
+
+async def _cli_pending_escalations(app: Orchestrator, params: dict) -> dict:
+    """List all pending PM escalations (Bundle 5.3)."""
+    rows = await app.db.fetch_all(
+        "SELECT wi.*, w.bundle_id as w_bundle_id, w.node_id "
+        "FROM worker_interventions wi "
+        "JOIN workers w ON wi.worker_id = w.id "
+        "WHERE wi.status = ? "
+        "ORDER BY wi.created_at DESC",
+        ("pending",),
+    )
+    escalations = []
+    for r in rows:
+        rd = dict(r)
+        escalations.append({
+            "intervention_id": rd["intervention_id"],
+            "worker_id": rd["worker_id"],
+            "bundle_id": rd["w_bundle_id"],
+            "node_id": rd.get("node_id", ""),
+            "type": rd["type"],
+            "content": rd["content"][:200],
+            "triggered_by": rd["triggered_by"],
+            "created_at": rd["created_at"],
+        })
+    return {"escalations": escalations, "count": len(escalations)}
+
+
 def _persist_fleet_settings(settings: Settings) -> None:
     """Write current fleet settings back to settings.json."""
     import json as _json
@@ -2031,6 +2234,9 @@ _CLI_HANDLERS = {
     "studio.docker_status": _cli_docker_status,
     "studio.docker_images": _cli_docker_images,
     "studio.review_worker": _cli_review_worker,
+    "studio.answer_question": _cli_answer_question,
+    "studio.resume_worker": _cli_resume_worker,
+    "studio.pending_escalations": _cli_pending_escalations,
 }
 
 
