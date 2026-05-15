@@ -119,6 +119,14 @@ class RpcClient:
         self.writer.write((json.dumps(msg) + "\n").encode())
         await self.writer.drain()
 
+    async def respond(self, req_id: Any, result: dict) -> None:
+        """Send a JSON-RPC response for an incoming request."""
+        if self.writer is None:
+            return
+        response = {"jsonrpc": "2.0", "result": result, "id": req_id}
+        self.writer.write((json.dumps(response) + "\n").encode())
+        await self.writer.drain()
+
     async def receive(self, timeout: float = 0.1) -> dict | None:
         """Non-blocking read of an incoming message from the orchestrator.
 
