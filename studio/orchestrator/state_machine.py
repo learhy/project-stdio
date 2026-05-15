@@ -506,7 +506,8 @@ class BundleStateMachine:
         _check_legal(current, BundleState.APPROVED)
 
         # Cooldown enforcement
-        cooldown_until = row.get("cooldown_until")
+        cooldown_keys = row.keys() if hasattr(row, 'keys') else []
+        cooldown_until = row["cooldown_until"] if "cooldown_until" in cooldown_keys else None
         if cooldown_until is not None:
             now_ts = self.now()
             if now_ts < cooldown_until:
