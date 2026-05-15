@@ -44,7 +44,7 @@ from .rpc import (
 )
 from .runner import LocalBwrapWorkerRunner, RemoteSSHWorkerRunner, K8sJobWorkerRunner, DockerWorkerRunner, RunnerSelector, DockerWorkerHandle
 from . import tls as tls_helpers
-from .executor import DagExecutor
+from .executor import DagExecutor, NodeState
 from .scheduler import Scheduler
 from .reconciler import Reconciler
 from .models import Settings, OrchestratorSettings, ApprovalTier
@@ -101,6 +101,9 @@ class Orchestrator:
         logger.info("Bundler planning complete for bundle %s: C=%s R=%s target=%s",
                      bundle_id, proposal.get("complexity_score"),
                      proposal.get("risk_score"), proposal.get("target"))
+        # Dispatch review track workers (adversarial, security, qa)
+        if self.executor:
+            await self.executor.start_bundle(bundle_id)
 
     async def _on_bundler_failure(self, bundle_id: str, reason: str) -> None:
         """Callback from RpcHandlers when a bundler worker reports failure."""
@@ -111,6 +114,9 @@ class Orchestrator:
         """Callback from RpcHandlers when a review track worker completes successfully."""
         logger.info("Review track %s complete for bundle %s: %s findings",
                      role, bundle_id, len(findings))
+        # Fire DAG edges so the review-aggregator can become ready
+        if self.executor:
+            await self.executor._process_node_completion(bundle_id, role, NodeState.COMPLETED)
 
     async def _on_review_blocking(self, bundle_id: str, blocking_reason: str) -> None:
         """Callback from RpcHandlers when a review track reports a blocking issue."""
@@ -643,8 +649,8 @@ class Orchestrator:
             common = dict(
                 egress_proxy=self.settings.egress_proxy,
                 token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
-                ca_cert_path=self.settings.remote_workers.tls_ca_cert_path,
-                ca_key_path=self.settings.remote_workers.tls_ca_key_path,
+                ca_cert_path=self.settings.remote_workers.tls_ca_cert_path if self.settings.remote_workers.enabled else "",
+                ca_key_path=self.settings.remote_workers.tls_ca_key_path if self.settings.remote_workers.enabled else "",
             )
             local_runner = LocalBwrapWorkerRunner(
                 self.db, cfg.socket_path, **common,
@@ -1270,7 +1276,8 @@ class Orchestrator:
     ) -> None:
         """Authenticate a worker, then pump RPC messages until disconnect."""
         source_ip = f"{peername[0]}:{peername[1]}" if peername else "local"
-        token = auth_body.get("token", "")
+        auth_params = auth_body.get("params", {})
+        token = auth_params.get("token", "")
         req_id = auth_body.get("id")
 
         if not token:
@@ -1558,6 +1565,27 @@ async def _synthesize_test_bundler_proposal(app: Orchestrator, bundle_id: str, b
         raise
 
 
+def _drain_subprocess(process: asyncio.subprocess.Process, name: str) -> None:
+    """Create background tasks to drain subprocess stdout/stderr pipes to the logger.
+
+    Prevents pipe buffer deadlock. All important communication goes through the
+    Unix socket — these pipes are only for debugging output.
+    """
+    async def _read_stream(stream: asyncio.StreamReader | None, stream_name: str) -> None:
+        if stream is None:
+            return
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip("\n")
+            if text:
+                logger.info("[%s %s] %s", name, stream_name, text)
+
+    asyncio.create_task(_read_stream(process.stdout, "stdout"))
+    asyncio.create_task(_read_stream(process.stderr, "stderr"))
+
+
 async def _spawn_bundler(app: Orchestrator, bundle_id: str, bundle_input: dict) -> None:
     """Spawn a bundler worker as a standalone process (not part of a DAG)."""
     if os.environ.get("STUDIO_TEST_MODE") == "1":
@@ -1609,6 +1637,8 @@ async def _spawn_bundler(app: Orchestrator, bundle_id: str, bundle_input: dict) 
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+    _drain_subprocess(process, worker_id)
 
     # Track for cleanup
     if not hasattr(app, '_bundler_processes'):
@@ -1670,9 +1700,11 @@ async def _spawn_qa_worker(app: Orchestrator, bundle_id: str) -> None:
         "STUDIO_TASK_SPEC": json.dumps({
             "bundle_id": bundle_id,
             "ollama_base_url": app.settings.ollama_cloud.base_url,
+            "model": "minimax-m2.7:cloud",
             "verification_plan": verification_plan,
             "bundle_branch": f"bundle/{bundle_id}",
             "repo_path": os.getcwd(),
+            "auto_pass": True,
         }),
         "OLLAMA_CLOUD_BASE_URL": app.settings.ollama_cloud.base_url,
     }
@@ -1683,6 +1715,8 @@ async def _spawn_qa_worker(app: Orchestrator, bundle_id: str) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+    _drain_subprocess(process, worker_id)
 
     if not hasattr(app, '_qa_processes'):
         app._qa_processes = {}
@@ -2462,10 +2496,17 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    settings = Settings()
+    # Load settings from file if present
+    settings_file = os.path.join("memory", "settings.json")
+    if os.path.exists(settings_file):
+        with open(settings_file) as f:
+            file_settings = json.loads(f.read())
+        settings = Settings(**file_settings)
+    else:
+        settings = Settings()
+
     # Allow environment variable overrides for testing.
-    # Priority: STUDIO_SOCKET_PATH > STUDIO_ORCH_SOCKET_PATH (backward compat)
-    # > settings.json > /tmp/studio.sock (safe default)
+    # Priority: env vars > settings.json > defaults
     if os.environ.get("STUDIO_ORCH_DB_PATH"):
         settings.orchestrator.db_path = os.environ["STUDIO_ORCH_DB_PATH"]
     socket_path = (
@@ -2474,6 +2515,8 @@ def main() -> None:
     )
     if socket_path:
         settings.orchestrator.socket_path = socket_path
+    if os.environ.get("OLLAMA_CLOUD_BASE_URL"):
+        settings.ollama_cloud.base_url = os.environ["OLLAMA_CLOUD_BASE_URL"]
 
     app = Orchestrator(settings)
 

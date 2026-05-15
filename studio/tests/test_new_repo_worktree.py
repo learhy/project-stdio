@@ -193,7 +193,7 @@ class TestDispatchWorkerTarget:
 
         db = _make_async_db()
         db.fetch_one = AsyncMock(return_value={
-            "proposal_json": json.dumps({"target": "new-repo", "target_name": "my-api"}),
+            "proposal_json": json.dumps({"proposal": {"target": "new-repo", "target_name": "my-api"}}),
         })
 
         mock_proc = MagicMock()
@@ -294,7 +294,7 @@ class TestPushWorkerChanges:
 
         db = _make_async_db()
         db.fetch_one = AsyncMock(return_value={
-            "proposal_json": json.dumps({"target": "new-repo", "target_name": "pm-sanity-api"}),
+            "proposal_json": json.dumps({"proposal": {"target": "new-repo", "target_name": "pm-sanity-api"}}),
         })
 
         executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock())
@@ -355,7 +355,7 @@ class TestPushWorkerChanges:
 
         db = _make_async_db()
         db.fetch_one = AsyncMock(return_value={
-            "proposal_json": json.dumps({"target": "new-repo", "target_name": "test-repo"}),
+            "proposal_json": json.dumps({"proposal": {"target": "new-repo", "target_name": "test-repo"}}),
         })
 
         executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock())

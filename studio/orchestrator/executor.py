@@ -528,7 +528,8 @@ class DagExecutor:
                 repo_name = ""
                 if bundle_row:
                     proposal = json.loads(bundle_row["proposal_json"] or "{}")
-                    repo_name = proposal.get("target_name", proposal.get("target", ""))
+                    bundler = proposal.get("proposal", {})
+                    repo_name = bundler.get("target_name", bundler.get("target", ""))
 
                 if repo_name and repo_name != "new-repo":
                     _logger.info("Creating GitHub repo %s from worktree %s", repo_name, worktree_path)
@@ -646,7 +647,8 @@ class DagExecutor:
             )
             if bundle_row:
                 proposal = json.loads(bundle_row["proposal_json"] or "{}")
-                target = proposal.get("target", "existing-repo")
+                bundler = proposal.get("proposal", {})
+                target = bundler.get("target", "existing-repo")
         except Exception:
             pass
 
