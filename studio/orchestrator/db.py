@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 class DatabaseVersionError(RuntimeError):
@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS workers (
   exit_reason TEXT,
   runner_type TEXT,
   questions_asked INTEGER NOT NULL DEFAULT 0,
-  last_reviewed_at INTEGER
+  last_reviewed_at INTEGER,
+  tokens_used INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS capabilities (
@@ -267,6 +268,14 @@ CREATE TABLE IF NOT EXISTS worker_interventions (
   trigger_reason TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'pending',
   worker_acknowledged INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_calibration (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bundle_id TEXT NOT NULL REFERENCES bundles(id),
+  feedback_type TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
 """
@@ -491,6 +500,26 @@ async def _migrate_v14(conn: aiosqlite.Connection) -> None:
           trigger_reason TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL DEFAULT 'pending',
           worker_acknowledged INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL
+        );
+    """)
+
+
+@migration(15)
+async def _migrate_v15(conn: aiosqlite.Connection) -> None:
+    """Add tokens_used to workers, review_calibration table (Bundle 5.4)."""
+    cursor = await conn.execute("PRAGMA table_info('workers')")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "tokens_used" not in columns:
+        await conn.execute(
+            "ALTER TABLE workers ADD COLUMN tokens_used INTEGER NOT NULL DEFAULT 0"
+        )
+    await conn.executescript("""
+        CREATE TABLE IF NOT EXISTS review_calibration (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bundle_id TEXT NOT NULL REFERENCES bundles(id),
+          feedback_type TEXT NOT NULL,
+          actor TEXT NOT NULL DEFAULT '',
           created_at INTEGER NOT NULL
         );
     """)

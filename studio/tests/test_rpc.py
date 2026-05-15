@@ -1204,3 +1204,253 @@ class TestBundleFiveThree:
         sp = str(tmp_path / "test.sock")
         dispatcher, _, _ = create_rpc_system(db_mock, sp)
         assert len(dispatcher._handlers) == 28
+
+
+# ── Bundle 5.4: Calibration integration ──────────────────────────────────────
+
+class TestBundleFiveFour:
+    """Tests for tokens tracking, review feedback, and calibration dimensions."""
+
+    @pytest.fixture
+    def orch(self, db_mock):
+        from studio.orchestrator.main import Orchestrator
+        from studio.orchestrator.models import Settings, OrchestratorSettings, ReviewSettings
+
+        settings = Settings(
+            orchestrator=OrchestratorSettings(
+                socket_path="/tmp/test.sock",
+                db_path=":memory:",
+                memory_root="/tmp/test-memory",
+            ),
+            review=ReviewSettings(feedback_threshold_interventions=2),
+        )
+        o = Orchestrator(settings)
+        o.db = db_mock
+        o.sm = MagicMock()
+        o.github_client = MagicMock()
+        o.github_client.post_comment = AsyncMock()
+        o.handlers = MagicMock()
+        o.conn_mgr = MagicMock()
+        o._review_scheduler = None
+        return o
+
+    # ── Heartbeat tokens_used capture ───────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_captures_tokens_used(self, handlers, db_mock, binding):
+        """Heartbeat with tokens_used stores cumulative token count."""
+        db_mock.fetch_one = AsyncMock(return_value={"state": "running"})
+
+        await handlers.handle_heartbeat(binding, {
+            "phase": "coding", "tokens_used": 15000,
+        }, 1)
+
+        # Verify tokens_used was included in the UPDATE
+        update_calls = [c for c in db_mock.execute.call_args_list
+                        if "UPDATE workers SET" in str(c[0][0])
+                        and "tokens_used" in str(c[0][0])]
+        assert len(update_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_defaults_tokens_used_to_zero(self, handlers, db_mock, binding):
+        """Heartbeat without tokens_used defaults to 0."""
+        db_mock.fetch_one = AsyncMock(return_value={"state": "running"})
+
+        await handlers.handle_heartbeat(binding, {"phase": "coding"}, 1)
+
+        update_calls = [c for c in db_mock.execute.call_args_list
+                        if "UPDATE workers SET" in str(c[0][0])]
+        assert len(update_calls) == 1
+
+    # ── Review feedback ─────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_review_good_feedback_stored(self, orch, db_mock):
+        """_handle_review_feedback with 'good': stored, interventions_correct = count."""
+        orch.db.fetch_one.side_effect = [
+            {"outcome_json": '{"status":"shipped"}'},   # 1st: bundle outcome
+            {"cnt": 3},                                 # 2nd: interventions count
+            {"github_issue_number": 42},                # 3rd: github issue for ack
+        ]
+
+        await orch._handle_review_feedback("b1", "good", "github:alice")
+
+        # Verify review_calibration inserted
+        insert_calls = [c for c in db_mock.execute.call_args_list
+                        if "INSERT INTO review_calibration" in str(c[0][0])]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_review_noisy_feedback_stored(self, orch, db_mock):
+        """_handle_review_feedback with 'noisy': interventions_correct = 0."""
+        orch.db.fetch_one.side_effect = [
+            {"outcome_json": '{"status":"shipped"}'},
+            {"cnt": 5},
+            {"github_issue_number": 42},
+        ]
+
+        await orch._handle_review_feedback("b1", "noisy", "github:bob")
+
+        insert_calls = [c for c in db_mock.execute.call_args_list
+                        if "INSERT INTO review_calibration" in str(c[0][0])]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_review_missed_feedback_stored(self, orch, db_mock):
+        """_handle_review_feedback with 'missed': interventions_correct = 0."""
+        orch.db.fetch_one.side_effect = [
+            {"outcome_json": '{"status":"shipped"}'},
+            {"cnt": 1},
+            {"github_issue_number": 42},
+        ]
+
+        await orch._handle_review_feedback("b1", "missed", "github:carol")
+
+        insert_calls = [c for c in db_mock.execute.call_args_list
+                        if "INSERT INTO review_calibration" in str(c[0][0])]
+        assert len(insert_calls) == 1
+
+    # ── Slash command parsing ───────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_process_comment_parses_review_good(self, orch):
+        """_process_comment matches /review-good."""
+        with patch.object(orch, "_handle_review_feedback",
+                          new_callable=AsyncMock) as mock_fb:
+            await orch._process_comment("b1", {
+                "body": "/review-good",
+                "user": {"login": "alice"},
+            })
+        mock_fb.assert_called_once_with("b1", "good", "github:alice")
+
+    @pytest.mark.asyncio
+    async def test_process_comment_parses_review_noisy(self, orch):
+        """_process_comment matches /review-noisy."""
+        with patch.object(orch, "_handle_review_feedback",
+                          new_callable=AsyncMock) as mock_fb:
+            await orch._process_comment("b1", {
+                "body": "/review-noisy",
+                "user": {"login": "bob"},
+            })
+        mock_fb.assert_called_once_with("b1", "noisy", "github:bob")
+
+    @pytest.mark.asyncio
+    async def test_process_comment_parses_review_missed(self, orch):
+        """_process_comment matches /review-missed."""
+        with patch.object(orch, "_handle_review_feedback",
+                          new_callable=AsyncMock) as mock_fb:
+            await orch._process_comment("b1", {
+                "body": "/review-missed",
+                "user": {"login": "carol"},
+            })
+        mock_fb.assert_called_once_with("b1", "missed", "github:carol")
+
+    # ── Calibration report formatter ────────────────────────────────────────
+
+    def test_format_calibration_includes_review_quality(self):
+        """format_calibration includes review quality section when data present."""
+        from studio.orchestrator.display import format_calibration
+
+        data = {
+            "total_entries": 10,
+            "entries_with_divergence": 2,
+            "recent": [],
+            "review_quality": {
+                "intervention_rate": 0.3,
+                "total_interventions": 3,
+                "total_bundles_with_interventions": 2,
+                "llm_answer_rate": 60,
+                "avg_escalation_response_minutes": 4.5,
+                "accuracy_rate": 100,
+                "good_count": 2,
+                "total_feedback": 2,
+                "noisy_rate": 0.0,
+                "missed_rate": 0.0,
+            },
+        }
+        output = format_calibration(data)
+        assert "Review quality:" in output
+        assert "Intervention rate:" in output
+        assert "LLM answer rate:" in output
+        assert "Avg escalation response time:" in output
+        assert "Review accuracy:" in output
+
+    def test_format_calibration_na_when_no_feedback(self):
+        """Review accuracy shows N/A when no feedback yet."""
+        from studio.orchestrator.display import format_calibration
+
+        data = {
+            "total_entries": 5,
+            "entries_with_divergence": 1,
+            "recent": [],
+            "review_quality": {
+                "intervention_rate": 0.2,
+                "total_interventions": 1,
+                "total_bundles_with_interventions": 1,
+                "llm_answer_rate": 50,
+                "avg_escalation_response_minutes": 3.0,
+                "accuracy_rate": None,
+                "good_count": 0,
+                "total_feedback": 0,
+                "noisy_rate": 0.0,
+                "missed_rate": 0.0,
+            },
+        }
+        output = format_calibration(data)
+        assert "N/A (no feedback yet)" in output
+
+    def test_format_calibration_shows_noisy_recommendation(self):
+        """High noisy rate shows recommendation to raise threshold."""
+        from studio.orchestrator.display import format_calibration
+
+        data = {
+            "total_entries": 5,
+            "entries_with_divergence": 1,
+            "recent": [],
+            "review_quality": {
+                "intervention_rate": 0.8,
+                "total_interventions": 4,
+                "total_bundles_with_interventions": 3,
+                "llm_answer_rate": 30,
+                "avg_escalation_response_minutes": 8.0,
+                "accuracy_rate": 25,
+                "good_count": 1,
+                "total_feedback": 4,
+                "noisy_rate": 0.6,
+                "missed_rate": 0.15,
+            },
+        }
+        output = format_calibration(data)
+        assert "Consider raising review.confidence_threshold" in output
+
+    def test_format_calibration_shows_missed_recommendation(self):
+        """High missed rate shows recommendation to lower threshold."""
+        from studio.orchestrator.display import format_calibration
+
+        data = {
+            "total_entries": 5,
+            "entries_with_divergence": 1,
+            "recent": [],
+            "review_quality": {
+                "intervention_rate": 0.4,
+                "total_interventions": 2,
+                "total_bundles_with_interventions": 2,
+                "llm_answer_rate": 40,
+                "avg_escalation_response_minutes": 12.0,
+                "accuracy_rate": 33,
+                "good_count": 1,
+                "total_feedback": 3,
+                "noisy_rate": 0.1,
+                "missed_rate": 0.5,
+            },
+        }
+        output = format_calibration(data)
+        assert "Consider lowering review.confidence_threshold" in output
+
+    # ── Handler count ───────────────────────────────────────────────────────
+
+    def test_handler_count_is_28(self, db_mock, tmp_path):
+        """Bundle 5.4: handler count unchanged at 28."""
+        sp = str(tmp_path / "test.sock")
+        dispatcher, _, _ = create_rpc_system(db_mock, sp)
+        assert len(dispatcher._handlers) == 28

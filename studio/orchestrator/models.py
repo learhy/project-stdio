@@ -706,6 +706,8 @@ class ReviewSettings(BaseModel):
     checkpoint_silence_minutes: int = 15
     min_interval_seconds: int = 120
     model: str | None = None
+    confidence_threshold: float = 0.5
+    feedback_threshold_interventions: int = 2
 
 
 class RemoteWorkersSettings(BaseModel):

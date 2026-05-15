@@ -446,6 +446,35 @@ def format_calibration(data: dict[str, Any]) -> str:
 
             lines.append(f"  {bid}  est: {est_str}  act: {act_str}")
 
+    # ── Bundle 5.4: Review quality ──────────────────────────────────────────
+
+    rq = data.get("review_quality")
+    if rq:
+        lines.append("")
+        lines.append("Review quality:")
+        lines.append(f"  Intervention rate: {rq.get('intervention_rate', 0)}/bundle "
+                     f"({rq.get('total_interventions', 0)} over {rq.get('total_bundles_with_interventions', 0)} bundles)")
+        lines.append(f"  LLM answer rate: {rq.get('llm_answer_rate', 0)}%")
+
+        avg_resp = rq.get("avg_escalation_response_minutes", 0)
+        lines.append(f"  Avg escalation response time: {avg_resp} min")
+
+        acc = rq.get("accuracy_rate")
+        if acc is not None:
+            lines.append(f"  Review accuracy: {acc}% good ({rq.get('good_count', 0)}/{rq.get('total_feedback', 0)} feedback)")
+        else:
+            lines.append("  Review accuracy: N/A (no feedback yet)")
+
+        # Recommendations based on feedback signals (resolution #4)
+        noisy_rate = rq.get("noisy_rate", 0)
+        missed_rate = rq.get("missed_rate", 0)
+        if noisy_rate > 0.5:
+            lines.append("  Consider raising review.confidence_threshold (noisy rate: "
+                         f"{noisy_rate:.0%})")
+        if missed_rate > 0.3:
+            lines.append("  Consider lowering review.confidence_threshold (missed rate: "
+                         f"{missed_rate:.0%})")
+
     return "\n".join(lines)
 
 
