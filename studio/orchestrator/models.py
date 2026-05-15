@@ -215,7 +215,7 @@ class TaskSpec(BaseModel):
     success_criteria: list[dict[str, Any]] = Field(default_factory=list)
     retry_policy: dict[str, Any] = Field(default_factory=lambda: {"max_attempts": 1, "backoff": "immediate"})
     capability_manifest: dict[str, Any] | None = None
-    runner_preference: Literal["local", "remote_ssh", "k8s", "any"] = "any"
+    runner_preference: Literal["local", "remote_ssh", "k8s", "docker", "any"] = "any"
 
 
 class DAGNode(BaseModel):
@@ -740,10 +740,22 @@ class K8sRunnerSettings(BaseModel):
     proxy_image: str = "studio-proxy:latest"
 
 
+class DockerRunnerSettings(BaseModel):
+    """Docker worker runner configuration (Bundle 4.5)."""
+    enabled: bool = False
+    socket_path: str = "/var/run/docker.sock"
+    worker_image: str = "project-stdio-worker:latest"
+    proxy_image: str = "project-stdio-proxy:latest"
+    network_prefix: str = "studio-worker"
+    volume_prefix: str = "studio-worktree"
+    registry: str | None = None
+    pull_policy: str = "if_not_present"
+
+
 class RunnerSelectorSettings(BaseModel):
     """Runner selection policy configuration (Bundle 4.4)."""
     allow_unenforced_grants: bool = False
-    default_preference: Literal["local", "remote_ssh", "k8s", "any"] = "any"
+    default_preference: Literal["local", "remote_ssh", "k8s", "docker", "any"] = "any"
 
 
 class Settings(BaseModel):
@@ -755,6 +767,7 @@ class Settings(BaseModel):
     remote_workers: RemoteWorkersSettings = Field(default_factory=RemoteWorkersSettings)
     remote_fleet: RemoteFleetSettings = Field(default_factory=RemoteFleetSettings)
     k8s_runner: K8sRunnerSettings = Field(default_factory=K8sRunnerSettings)
+    docker_runner: DockerRunnerSettings = Field(default_factory=DockerRunnerSettings)
     runner_selector: RunnerSelectorSettings = Field(default_factory=RunnerSelectorSettings)
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)

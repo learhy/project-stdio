@@ -42,7 +42,7 @@ from .rpc import (
     CAPABILITY_DENIED,
     INTERNAL_ERROR,
 )
-from .runner import LocalBwrapWorkerRunner, RemoteSSHWorkerRunner, K8sJobWorkerRunner, RunnerSelector
+from .runner import LocalBwrapWorkerRunner, RemoteSSHWorkerRunner, K8sJobWorkerRunner, DockerWorkerRunner, RunnerSelector, DockerWorkerHandle
 from . import tls as tls_helpers
 from .executor import DagExecutor
 from .scheduler import Scheduler
@@ -441,6 +441,7 @@ class Orchestrator:
             )
             ssh_runner: RemoteSSHWorkerRunner | None = None
             k8s_runner: K8sJobWorkerRunner | None = None
+            docker_runner: DockerWorkerRunner | None = None
 
             if self.settings.remote_fleet.enabled:
                 ssh_runner = RemoteSSHWorkerRunner(
@@ -454,6 +455,12 @@ class Orchestrator:
                 )
                 logger.info("K8sJobWorkerRunner enabled (ns=%s)",
                             self.settings.k8s_runner.namespace)
+            if self.settings.docker_runner.enabled:
+                docker_runner = DockerWorkerRunner(
+                    self.db, self.settings.docker_runner, **common,
+                )
+                logger.info("DockerWorkerRunner enabled (image=%s)",
+                            self.settings.docker_runner.worker_image)
 
             self.runner = RunnerSelector(
                 self.db,
@@ -461,12 +468,14 @@ class Orchestrator:
                 local=local_runner,
                 remote_ssh=ssh_runner,
                 k8s=k8s_runner,
+                docker=docker_runner,
             )
             logger.info("RunnerSelector: %s", ", ".join(self.runner.runner_names))
 
             # Store individual runner refs for fleet health / k8s watch / CLI handlers
             self._ssh_runner = ssh_runner
             self._k8s_runner = k8s_runner
+            self._docker_runner = docker_runner
 
         # 5. Executor
         self.executor = DagExecutor(
@@ -591,6 +600,15 @@ class Orchestrator:
             ("runner_selector_enabled", "1", int(time.time())),
         )
         await self.db.conn.commit()
+
+        # Record docker runner enabled state (Bundle 4.5)
+        if self.settings.docker_runner.enabled:
+            await self.db.execute(
+                "INSERT OR REPLACE INTO settings_metadata (key, value, updated_at) "
+                "VALUES (?, ?, ?)",
+                ("docker_runner_enabled", "1", int(time.time())),
+            )
+            await self.db.conn.commit()
 
         self._running = True
 
@@ -1829,6 +1847,59 @@ async def _cli_k8s_status(app: Orchestrator, params: dict) -> dict:
         return {"error": f"Failed to list k8s Jobs: {exc}"}
 
 
+async def _cli_docker_status(app: Orchestrator, params: dict) -> dict:
+    """Show running Docker worker containers and resource usage (Bundle 4.5)."""
+    if app._docker_runner is None:
+        return {"error": "Docker runner is not enabled. Set docker_runner.enabled=true in settings.json."}
+    import json as _json
+    try:
+        client = app._docker_runner._get_client()
+        containers = await asyncio.to_thread(
+            client.containers.list,
+            filters={"label": "studio/runner=docker"},
+        )
+        worker_list = []
+        for c in containers:
+            labels = c.labels or {}
+            worker_list.append({
+                "container_id": c.short_id,
+                "name": c.name,
+                "bundle_id": labels.get("studio/bundle-id", ""),
+                "worker_id": labels.get("studio/worker-id", ""),
+                "status": c.status,
+                "image": c.image.tags[0] if c.image.tags else "",
+                "created": c.attrs.get("Created", ""),
+            })
+        return {"containers": worker_list, "count": len(worker_list)}
+    except Exception as exc:
+        return {"error": f"Failed to list Docker containers: {exc}"}
+
+
+async def _cli_docker_images(app: Orchestrator, params: dict) -> dict:
+    """Show worker and proxy Docker images (Bundle 4.5)."""
+    if app._docker_runner is None:
+        return {"error": "Docker runner is not enabled. Set docker_runner.enabled=true in settings.json."}
+    try:
+        client = app._docker_runner._get_client()
+        images = await asyncio.to_thread(
+            client.images.list,
+            name=app.settings.docker_runner.worker_image.split(":")[0],
+        )
+        image_list = []
+        for img in images:
+            tags = img.tags if img.tags else ["<none>"]
+            image_list.append({
+                "id": img.short_id,
+                "tags": tags,
+                "created": img.attrs.get("Created", ""),
+                "size": img.attrs.get("Size", 0),
+            })
+        return {"images": image_list, "expected_worker": app.settings.docker_runner.worker_image,
+                "expected_proxy": app.settings.docker_runner.proxy_image}
+    except Exception as exc:
+        return {"error": f"Failed to list Docker images: {exc}"}
+
+
 def _persist_fleet_settings(settings: Settings) -> None:
     """Write current fleet settings back to settings.json."""
     import json as _json
@@ -1875,6 +1946,8 @@ _CLI_HANDLERS = {
     "studio.fleet_add": _cli_fleet_add,
     "studio.fleet_remove": _cli_fleet_remove,
     "studio.k8s_status": _cli_k8s_status,
+    "studio.docker_status": _cli_docker_status,
+    "studio.docker_images": _cli_docker_images,
 }
 
 

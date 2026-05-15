@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import asyncssh
+import docker as docker_lib
 
-from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost, K8sRunnerSettings, RunnerSelectorSettings
+from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost, K8sRunnerSettings, DockerRunnerSettings, RunnerSelectorSettings
 from . import tls as tls_helpers
 
 if TYPE_CHECKING:
@@ -106,14 +107,78 @@ def capability_to_runner_compatibility(
         "local": {"compatible": True, "unenforced_grants": []},
         "remote_ssh": {"compatible": True, "unenforced_grants": []},
         "k8s": {"compatible": True, "unenforced_grants": []},
+        "docker": {"compatible": True, "unenforced_grants": []},
     }
 
-    # k8s can't enforce exec allowlists — no bwrap in containers
+    # k8s and docker can't enforce exec allowlists — no bwrap in containers
     exec_grants = manifest.grants.process.exec
     if exec_grants:
         compat["k8s"]["unenforced_grants"] = ["exec_allowlist"]
+        compat["docker"]["unenforced_grants"] = ["exec_allowlist"]
 
     return compat
+
+
+def capability_to_docker_args(
+    manifest: CapabilityManifest,
+    worker_id: str,
+    orchestrator_addr: str,
+    token: str,
+    docker_network: str = "",
+    proxy_env: dict[str, str] | None = None,
+) -> list[str]:
+    """Translate a capability manifest into docker run flags (Bundle 4.5).
+
+    Returns a list of docker run arguments for the worker container.
+    Network namespace is shared with the proxy sidecar via --network container:<proxy>.
+    """
+    args: list[str] = []
+
+    # Resource grants
+    resources = manifest.grants.resources
+    if resources.cpu_limit:
+        args.extend(["--cpus", str(resources.cpu_limit)])
+    if resources.memory_limit:
+        args.extend(["--memory", f"{resources.memory_limit}m"])
+    args.extend(["--pids-limit", "256"])
+
+    # Security defaults
+    args.extend(["--read-only"])
+    args.extend(["--tmpfs", "/tmp:rw,noexec,nosuid,size=512M"])
+    args.extend(["--no-new-privileges"])
+    args.extend(["--cap-drop", "ALL"])
+    args.extend(["--user", "10000:10000"])
+
+    # Working directory (shared volume mounted at /work)
+    args.extend(["--workdir", "/work"])
+
+    # Orchestrator connection env vars
+    args.extend(["--env", f"STUDIO_ORCHESTRATOR_ADDR={orchestrator_addr}"])
+    args.extend(["--env", f"STUDIO_WORKER_TOKEN={token}"])
+    args.extend(["--env", f"STUDIO_WORKER_ID={worker_id}"])
+
+    # Pass proxy config as env vars if proxy is running
+    if proxy_env:
+        for key, val in proxy_env.items():
+            args.extend(["--env", f"{key}={val}"])
+
+    # Secrets as env vars
+    for secret in manifest.grants.secrets:
+        args.extend(["--env", f"{secret.name}={secret.purpose}"])
+
+    # DNS
+    dns = manifest.grants.network.dns
+    if dns.enabled and dns.resolvers:
+        for resolver in dns.resolvers:
+            args.extend(["--dns", resolver])
+    elif not dns.enabled:
+        args.extend(["--dns", "0.0.0.0"])
+
+    # Labels for identification
+    args.extend(["--label", f"studio/worker-id={worker_id}"])
+    args.extend(["--label", "studio/runner=docker"])
+
+    return args
 
 
 class WorkerSpawnResult:
@@ -358,10 +423,14 @@ class LocalBwrapWorkerRunner:
 
     async def kill_worker(
         self,
-        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle | DockerWorkerHandle,
         worker_id: str = "",
     ) -> None:
         """Send SIGTERM to worker and proxy, wait up to 30s, then SIGKILL."""
+        if isinstance(process, DockerWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+            return
         if isinstance(process, K8sWorkerHandle):
             await process.cancel()
             await process.cleanup()
@@ -794,11 +863,14 @@ class RemoteSSHWorkerRunner:
 
     async def kill_worker(
         self,
-        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle | DockerWorkerHandle,
         worker_id: str = "",
     ) -> None:
-        """Kill a worker by its handle (local, remote, or k8s)."""
-        if isinstance(process, K8sWorkerHandle):
+        """Kill a worker by its handle (local, remote, k8s, or docker)."""
+        if isinstance(process, DockerWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+        elif isinstance(process, K8sWorkerHandle):
             await process.cancel()
             await process.cleanup()
         elif isinstance(process, RemoteWorkerHandle):
@@ -946,6 +1018,79 @@ class K8sWorkerHandle:
                 name=f"studio-worker-{self.worker_id}",
                 namespace=self.namespace,
             )
+        except Exception:
+            pass
+
+
+class DockerWorkerHandle:
+    """Handle to a Docker worker container and its sidecar resources (Bundle 4.5)."""
+
+    def __init__(
+        self,
+        worker_id: str,
+        worker_container_id: str,
+        proxy_container_id: str,
+        volume_name: str,
+        proxy_volume_name: str,
+        network_name: str,
+        client: docker_lib.DockerClient,
+    ) -> None:
+        self.worker_id = worker_id
+        self.worker_container_id = worker_container_id
+        self.proxy_container_id = proxy_container_id
+        self.volume_name = volume_name
+        self.proxy_volume_name = proxy_volume_name
+        self.network_name = network_name
+        self._client = client
+        self.returncode: int | None = None
+
+    async def cancel(self) -> None:
+        """Stop the worker container, then the proxy container."""
+        try:
+            container = await asyncio.to_thread(
+                self._client.containers.get, self.worker_container_id
+            )
+            container.stop(timeout=10)
+        except Exception:
+            pass
+        try:
+            proxy = await asyncio.to_thread(
+                self._client.containers.get, self.proxy_container_id
+            )
+            proxy.stop(timeout=5)
+        except Exception:
+            pass
+        self.returncode = 137
+
+    async def is_alive(self) -> bool:
+        """Check whether the worker container is still running."""
+        if self.returncode is not None:
+            return False
+        try:
+            container = await asyncio.to_thread(
+                self._client.containers.get, self.worker_container_id
+            )
+            return container.status == "running"
+        except Exception:
+            return False
+
+    async def cleanup(self) -> None:
+        """Remove containers, volumes, and network. Best-effort — logs failures."""
+        for cid in (self.worker_container_id, self.proxy_container_id):
+            try:
+                container = await asyncio.to_thread(self._client.containers.get, cid)
+                container.remove(force=True)
+            except Exception:
+                pass
+        for vname in (self.volume_name, self.proxy_volume_name):
+            try:
+                vol = await asyncio.to_thread(self._client.volumes.get, vname)
+                vol.remove(force=True)
+            except Exception:
+                pass
+        try:
+            net = await asyncio.to_thread(self._client.networks.get, self.network_name)
+            net.remove()
         except Exception:
             pass
 
@@ -1440,10 +1585,13 @@ class K8sJobWorkerRunner:
 
     async def kill_worker(
         self,
-        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle | DockerWorkerHandle,
         worker_id: str = "",
     ) -> None:
-        if isinstance(process, K8sWorkerHandle):
+        if isinstance(process, DockerWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+        elif isinstance(process, K8sWorkerHandle):
             await process.cancel()
             await process.cleanup()
             self._watched_workers.pop(process.worker_id, None)
@@ -1575,6 +1723,277 @@ class K8sJobWorkerRunner:
             self._api_client = None
 
 
+class DockerWorkerRunner:
+    """Spawns worker containers via Docker API with proxy sidecar for egress enforcement (Bundle 4.5).
+
+    Each worker gets its own Docker network (internal), a named volume for the working tree,
+    and a sidecar proxy container. Isolation is enforced at the Docker layer rather than bwrap.
+    """
+
+    def __init__(
+        self,
+        db: "Database",
+        settings: DockerRunnerSettings,
+        egress_proxy: EgressProxySettings | None = None,
+        token_expiry_minutes: int = 15,
+        ca_cert_path: str = "",
+        ca_key_path: str = "",
+    ) -> None:
+        self._db = db
+        self._settings = settings
+        self._egress_proxy = egress_proxy or EgressProxySettings()
+        self._token_expiry_minutes = token_expiry_minutes
+        self._ca_cert_path = ca_cert_path
+        self._ca_key_path = ca_key_path
+        self._client: docker_lib.DockerClient | None = None
+
+    @staticmethod
+    def now() -> int:
+        return int(time.time())
+
+    def _get_client(self) -> docker_lib.DockerClient:
+        if self._client is None:
+            self._client = docker_lib.DockerClient(
+                base_url=f"unix://{self._settings.socket_path}"
+            )
+        return self._client
+
+    async def _ensure_image(self, image: str) -> None:
+        """Pull or verify image availability based on pull_policy."""
+        if self._settings.pull_policy == "always":
+            await asyncio.to_thread(self._get_client().images.pull, image)
+            return
+        try:
+            await asyncio.to_thread(self._get_client().images.get, image)
+        except docker_lib.errors.ImageNotFound:
+            if self._settings.pull_policy == "if_not_present":
+                await asyncio.to_thread(self._get_client().images.pull, image)
+            else:
+                raise
+
+    async def spawn_worker(
+        self,
+        worker_id: str,
+        bundle_id: str,
+        node_id: str,
+        manifest: CapabilityManifest,
+        worktree_path: str,
+        task_spec: dict[str, Any] | None = None,
+        base_branch: str = "main",
+    ) -> WorkerSpawnResult:
+        token = _generate_token()
+        token_expires_at = self.now() + (self._token_expiry_minutes * 60)
+
+        # Insert worker row
+        await self._db.execute(
+            "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, manifest_json, state, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                worker_id, bundle_id, node_id, token, token_expires_at,
+                json.dumps(manifest.model_dump()), WorkerState.PENDING, self.now(),
+            ),
+        )
+        await self._db.conn.commit()
+
+        await self._db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("worker_spawned", "worker", worker_id,
+             json.dumps({"bundle_id": bundle_id, "node_id": node_id, "token_expires_at": token_expires_at}),
+             self.now()),
+        )
+        await self._db.conn.commit()
+
+        client = self._get_client()
+        network_name = f"{self._settings.network_prefix}-{worker_id}"
+        volume_name = f"{self._settings.volume_prefix}-{worker_id}"
+        proxy_volume_name = f"proxy-socket-{worker_id}"
+        proxy_name = f"studio-proxy-{worker_id}"
+        worker_name = f"studio-worker-{worker_id}"
+
+        try:
+            # 1. Ensure images
+            await self._ensure_image(self._settings.worker_image)
+            await self._ensure_image(self._settings.proxy_image)
+
+            # 2. Create per-worker Docker network (internal)
+            await asyncio.to_thread(
+                client.networks.create,
+                name=network_name,
+                driver="bridge",
+                internal=True,
+                labels={"studio/worker-id": worker_id, "studio/bundle-id": bundle_id},
+            )
+
+            # 3. Create named volume for proxy socket (shared between proxy and worker)
+            await asyncio.to_thread(
+                client.volumes.create,
+                name=proxy_volume_name,
+                labels={"studio/worker-id": worker_id},
+            )
+
+            # 4. Start proxy sidecar container
+            orchestrator_addr = f"orchestrator.internal:7811"
+            proxy_container = await asyncio.to_thread(
+                client.containers.run,
+                image=self._settings.proxy_image,
+                name=proxy_name,
+                network=network_name,
+                detach=True,
+                environment={
+                    "PROXY_SOCKET_DIR": "/tmp/studio",
+                    "STUDIO_EGRESS_ALLOWLIST": json.dumps(
+                        [e.model_dump() for e in manifest.grants.network.egress]
+                    ),
+                    "STUDIO_WORKER_ID": worker_id,
+                },
+                mounts=[
+                    docker_lib.types.Mount(
+                        type="volume",
+                        source=proxy_volume_name,
+                        target="/tmp/studio",
+                    ),
+                ],
+                labels={"studio/worker-id": worker_id, "studio/role": "proxy"},
+                remove=False,
+            )
+            proxy_container_id = proxy_container.id
+
+            # 5. Poll for proxy socket before starting worker
+            for _ in range(50):
+                exit_code, _ = await asyncio.to_thread(
+                    lambda: proxy_container.exec_run(
+                        ['test', '-S', f'/tmp/studio/proxy-{worker_id}.sock']
+                    )
+                )
+                if exit_code == 0:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raise RuntimeError(
+                    f'Egress proxy failed to bind socket after 5s for worker {worker_id}'
+                )
+
+            # 6. Create named volume for working tree
+            await asyncio.to_thread(
+                client.volumes.create,
+                name=volume_name,
+                labels={"studio/worker-id": worker_id},
+            )
+
+            # 7. Start worker container (shares proxy's network namespace)
+            worker_container = await asyncio.to_thread(
+                client.containers.run,
+                image=self._settings.worker_image,
+                name=worker_name,
+                network_mode=f"container:{proxy_container_id}",
+                detach=True,
+                command=[],
+                environment={
+                    "STUDIO_ORCHESTRATOR_ADDR": orchestrator_addr,
+                    "STUDIO_WORKER_TOKEN": token,
+                    "STUDIO_WORKER_ID": worker_id,
+                    "STUDIO_PROXY_SOCKET": f"/tmp/studio/proxy-{worker_id}.sock",
+                },
+                mounts=[
+                    docker_lib.types.Mount(
+                        type="volume",
+                        source=volume_name,
+                        target="/work",
+                    ),
+                    docker_lib.types.Mount(
+                        type="volume",
+                        source=proxy_volume_name,
+                        target="/tmp/studio",
+                        read_only=True,
+                    ),
+                ],
+                labels={"studio/worker-id": worker_id, "studio/bundle-id": bundle_id,
+                        "studio/node-id": node_id, "studio/role": "worker"},
+                remove=False,
+            )
+            worker_container_id = worker_container.id
+
+            handle = DockerWorkerHandle(
+                worker_id=worker_id,
+                worker_container_id=worker_container_id,
+                proxy_container_id=proxy_container_id,
+                volume_name=volume_name,
+                proxy_volume_name=proxy_volume_name,
+                network_name=network_name,
+                client=client,
+            )
+
+            return WorkerSpawnResult(
+                worker_id=worker_id,
+                token=token,
+                node_id=node_id,
+                process=handle,
+            )
+        except Exception as exc:
+            logger.error("DockerWorkerRunner.spawn_worker failed: %s", exc)
+            # Best-effort cleanup on failure
+            try:
+                await asyncio.to_thread(lambda: client.containers.get(worker_name).remove(force=True))
+            except Exception:
+                pass
+            try:
+                await asyncio.to_thread(lambda: client.containers.get(proxy_name).remove(force=True))
+            except Exception:
+                pass
+            try:
+                await asyncio.to_thread(lambda: client.networks.get(network_name).remove())
+            except Exception:
+                pass
+            for vname in (volume_name, proxy_volume_name):
+                try:
+                    await asyncio.to_thread(lambda v=vname: client.volumes.get(v).remove(force=True))
+                except Exception:
+                    pass
+            return WorkerSpawnResult(
+                worker_id=worker_id,
+                token=token,
+                node_id=node_id,
+                error=str(exc),
+            )
+
+    async def kill_worker(
+        self,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle | DockerWorkerHandle,
+        worker_id: str = "",
+    ) -> None:
+        if isinstance(process, DockerWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+        elif isinstance(process, K8sWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+        elif isinstance(process, RemoteWorkerHandle):
+            await process.cancel()
+            await process.cleanup()
+            try:
+                process.conn.close()
+                await process.conn.wait_closed()
+            except Exception:
+                pass
+        elif isinstance(process, asyncio.subprocess.Process):
+            try:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=30)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+            except ProcessLookupError:
+                pass
+
+    async def close(self) -> None:
+        """Close the Docker client."""
+        if self._client:
+            await asyncio.to_thread(self._client.close)
+            self._client = None
+
+
 class RunnerSelector:
     """Selects from multiple enabled runners per-task based on preference and capacity (Bundle 4.4).
 
@@ -1589,16 +2008,19 @@ class RunnerSelector:
         local: LocalBwrapWorkerRunner | None = None,
         remote_ssh: RemoteSSHWorkerRunner | None = None,
         k8s: K8sJobWorkerRunner | None = None,
+        docker: DockerWorkerRunner | None = None,
     ) -> None:
         self._db = db
         self._settings = settings
-        self._runners: dict[str, LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner] = {}
+        self._runners: dict[str, LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner | DockerWorkerRunner] = {}
         if local:
             self._runners["local"] = local
         if remote_ssh:
             self._runners["remote_ssh"] = remote_ssh
         if k8s:
             self._runners["k8s"] = k8s
+        if docker:
+            self._runners["docker"] = docker
 
     @staticmethod
     def now() -> int:
@@ -1734,11 +2156,15 @@ class RunnerSelector:
 
     async def kill_worker(
         self,
-        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle | DockerWorkerHandle,
         worker_id: str = "",
     ) -> None:
         """Dispatch kill to the appropriate runner based on handle type."""
-        if isinstance(process, K8sWorkerHandle):
+        if isinstance(process, DockerWorkerHandle):
+            runner = self._runners.get("docker")
+            if runner:
+                await runner.kill_worker(process, worker_id)
+        elif isinstance(process, K8sWorkerHandle):
             runner = self._runners.get("k8s")
             if runner:
                 await runner.kill_worker(process, worker_id)
@@ -1767,7 +2193,7 @@ class RunnerSelector:
         if k8s and hasattr(k8s, "start_watch"):
             await k8s.start_watch()
 
-    def get_runner(self, name: str) -> LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner | None:
+    def get_runner(self, name: str) -> LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner | DockerWorkerRunner | None:
         """Access a specific runner by name (for fleet health, CLI handlers, etc.)."""
         return self._runners.get(name)
 

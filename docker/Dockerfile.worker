@@ -1,12 +1,18 @@
+# Unified worker image for all runners (k8s, Docker, local)
+# k8s/Docker runner: requires Python, git, curl
+# Docker runner: also requires bubblewrap and opencode for certain tasks
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
-    python3.12 python3-pip git curl \
+    python3.12 python3-pip git curl bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.cargo/bin:$PATH"
+
+# Install opencode (Docker runner)
+RUN curl -fsSL https://opencode.ai/install | bash
 
 # Install studio-worker only (not the full orchestrator)
 COPY . /build
