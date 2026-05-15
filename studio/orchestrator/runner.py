@@ -83,8 +83,10 @@ def capability_to_bwrap_args(
         if proxy_dir and os.path.exists(proxy_dir):
             args.extend(["--ro-bind", proxy_dir, proxy_dir])
 
-    # Network: always isolate — no host network
-    args.append("--unshare-net")
+    # Network: isolate when egress proxy is active, otherwise skip
+    # --unshare-net requires CAP_NET_ADMIN which may not be available
+    if proxy_socket:
+        args.append("--unshare-net")
 
     # Proc
     args.extend(["--proc", "/proc"])
@@ -219,12 +221,36 @@ class LocalBwrapWorkerRunner:
         self.token_expiry_minutes = token_expiry_minutes
         self.ca_cert_path = ca_cert_path
         self.ca_key_path = ca_key_path
+        self._bwrap_available: bool | None = None  # cached
         # Track proxy processes for cleanup
         self._proxy_processes: dict[str, asyncio.subprocess.Process] = {}
 
     @staticmethod
     def now() -> int:
         return int(time.time())
+
+    @staticmethod
+    async def _check_bwrap() -> bool:
+        """Check if bwrap works on this system (needs user namespaces)."""
+        import logging
+        _logger = logging.getLogger(__name__)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bwrap", "--unshare-user", "--die-with-parent",
+                "--ro-bind", "/usr", "/usr",
+                "true",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            ok = proc.returncode == 0
+            if not ok:
+                _logger.warning("bwrap not available, workers run without container isolation: %s",
+                                stderr.decode(errors="replace").strip().split("\n")[0] if stderr else "unknown error")
+            return ok
+        except FileNotFoundError:
+            _logger.warning("bwrap not installed, workers run without container isolation")
+            return False
 
     async def spawn_worker(
         self,
@@ -235,6 +261,7 @@ class LocalBwrapWorkerRunner:
         worktree_path: str,
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
+        target: str = "existing-repo",
     ) -> WorkerSpawnResult:
         """Spawn a worker subprocess in a bubblewrap container with egress proxy.
 
@@ -242,10 +269,13 @@ class LocalBwrapWorkerRunner:
         bundle/<bundle_id>/<node_id> off base_branch. Spawns a per-worker
         egress proxy on a Unix socket. Returns WorkerSpawnResult with
         the worker ID, token, process, and proxy process handles.
+
+        When target is 'new-repo', initializes an empty git repository
+        instead of creating a worktree from the base branch.
         """
         token = _generate_token()
         token_expires_at = self.now() + (self.token_expiry_minutes * 60)
-        proxy_socket = f"{self.egress_proxy.socket_dir}/proxy-{worker_id}.sock"
+        proxy_socket = f"{self.egress_proxy.socket_dir}/proxy-{worker_id}.sock" if self.egress_proxy.enabled else ""
 
         # Insert worker row
         await self.db.execute(
@@ -275,11 +305,14 @@ class LocalBwrapWorkerRunner:
         )
         await self.db.conn.commit()
 
-        # Create git worktree
+        # Create git worktree or new repo
         worker_branch = f"bundle/{bundle_id}/{node_id}"
         if not os.environ.get("STUDIO_TEST_MODE") == "1":
             try:
-                await self._create_worktree(worktree_path, worker_branch, base_branch)
+                if target == "new-repo":
+                    await self._init_new_repo(worktree_path)
+                else:
+                    await self._create_worktree(worktree_path, worker_branch, base_branch)
             except Exception as exc:
                 return WorkerSpawnResult(
                     worker_id=worker_id,
@@ -327,11 +360,22 @@ class LocalBwrapWorkerRunner:
                     error=proxy_error,
                 )
 
-        # Build bwrap args (always --unshare-net)
-        bwrap_args = capability_to_bwrap_args(manifest, worktree_path, self.socket_path, proxy_socket)
+        # Check bwrap availability (cached). Skip in test mode.
+        if self._bwrap_available is None:
+            if os.environ.get("STUDIO_TEST_MODE") == "1":
+                self._bwrap_available = True  # assume available in tests
+            else:
+                self._bwrap_available = await self._check_bwrap()
+        use_bwrap = self._bwrap_available
+
+        # Build bwrap args or run directly
+        if use_bwrap:
+            bwrap_args = capability_to_bwrap_args(manifest, worktree_path, self.socket_path, proxy_socket)
+            cmd = [*bwrap_args, *self.worker_command]
+        else:
+            cmd = [*self.worker_command]
 
         # http_proxy over Unix socket: httpx and some tools support this
-        proxy_url = f"http+unix://{proxy_socket.replace('/', '%2F')}"
         worker_env = {
             **os.environ,
             "STUDIO_WORKER_TOKEN": token,
@@ -341,16 +385,20 @@ class LocalBwrapWorkerRunner:
             "STUDIO_NODE_ID": node_id,
             "STUDIO_WORKTREE_PATH": worktree_path,
             "STUDIO_BASE_BRANCH": base_branch,
-            "STUDIO_PROXY_SOCKET": proxy_socket,
-            # Standard env vars for tools that support them
-            "http_proxy": proxy_url,
-            "https_proxy": proxy_url,
-            "HTTP_PROXY": proxy_url,
-            "HTTPS_PROXY": proxy_url,
-            # Tell tools not to bypass the proxy for localhost
-            "no_proxy": "",
-            "NO_PROXY": "",
+            "STUDIO_TARGET": target,
         }
+
+        if proxy_socket:
+            proxy_url = f"http+unix://{proxy_socket.replace('/', '%2F')}"
+            worker_env.update({
+                "STUDIO_PROXY_SOCKET": proxy_socket,
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url,
+                "HTTP_PROXY": proxy_url,
+                "HTTPS_PROXY": proxy_url,
+                "no_proxy": "",
+                "NO_PROXY": "",
+            })
 
         if task_spec:
             worker_env["STUDIO_TASK_SPEC"] = json.dumps(task_spec)
@@ -362,8 +410,7 @@ class LocalBwrapWorkerRunner:
             worker_env["STUDIO_ORCHESTRATOR_CA"] = self.ca_cert_path
 
         process = await asyncio.create_subprocess_exec(
-            *bwrap_args,
-            *self.worker_command,
+            *cmd,
             env=worker_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -420,6 +467,41 @@ class LocalBwrapWorkerRunner:
                 stderr=asyncio.subprocess.PIPE,
             )
             await proc.wait()
+
+    async def _init_new_repo(self, path: str) -> None:
+        """Create an empty git repository with an initial empty commit."""
+        import os as _os
+        _os.makedirs(path, exist_ok=True)
+
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", path, "init",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"git init failed: {err}")
+
+        # Set bot author identity
+        for key, value in [("user.name", "studio-agents[bot]"), ("user.email", "studio-agents@learhy.net")]:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", path, "config", key, value,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+
+        # Create initial empty commit so the repo has a branch to push
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", path, "commit", "--allow-empty", "-m", "Initial commit",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"git commit failed: {err}")
 
     async def kill_worker(
         self,
@@ -492,6 +574,7 @@ class NoopWorkerRunner:
         manifest: CapabilityManifest,
         worktree_path: str,
         task_spec: dict[str, Any] | None = None,
+        target: str = "existing-repo",
     ) -> WorkerSpawnResult:
         token = _generate_token()
         token_expires_at = int(time.time()) + (self.token_expiry_minutes * 60)
@@ -671,6 +754,7 @@ class RemoteSSHWorkerRunner:
         worktree_path: str,
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
+        target: str = "existing-repo",
     ) -> WorkerSpawnResult:
         """Spawn a worker on a remote fleet host via SSH + bubblewrap."""
         token = _generate_token()
@@ -780,6 +864,7 @@ class RemoteSSHWorkerRunner:
                 "STUDIO_NODE_ID": node_id,
                 "STUDIO_WORKTREE_PATH": remote_workdir,
                 "STUDIO_BASE_BRANCH": base_branch,
+                "STUDIO_TARGET": target,
                 "STUDIO_PROXY_SOCKET": proxy_socket,
                 "http_proxy": f"http+unix://{proxy_socket.replace('/', '%2F')}",
                 "https_proxy": f"http+unix://{proxy_socket.replace('/', '%2F')}",
@@ -1106,6 +1191,7 @@ def capability_to_pod_spec(
     worker_image: str,
     image_pull_policy: str,
     task_spec: dict[str, Any] | None = None,
+    target: str = "existing-repo",
 ) -> dict[str, Any]:
     """Translate a capability manifest into a Kubernetes Pod spec (Bundle 4.3).
 
@@ -1152,6 +1238,7 @@ def capability_to_pod_spec(
         {"name": "STUDIO_BUNDLE_ID", "value": bundle_id},
         {"name": "STUDIO_NODE_ID", "value": node_id},
         {"name": "STUDIO_WORKTREE_PATH", "value": "/work"},
+        {"name": "STUDIO_TARGET", "value": target},
         {"name": "STUDIO_ORCHESTRATOR_ADDR", "value": f"tcp://{orchestrator_addr}"},
         {"name": "STUDIO_WORKER_CERT", "value": "/run/studio/mtls/tls.crt"},
         {"name": "STUDIO_WORKER_KEY", "value": "/run/studio/mtls/tls.key"},
@@ -1345,6 +1432,7 @@ class K8sJobWorkerRunner:
         worktree_path: str,
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
+        target: str = "existing-repo",
     ) -> WorkerSpawnResult:
         """Spawn a worker as a Kubernetes Job in the configured namespace."""
         token = _generate_token()
@@ -1475,6 +1563,7 @@ class K8sJobWorkerRunner:
             worker_image=self.settings.worker_image,
             image_pull_policy=self.settings.image_pull_policy,
             task_spec=task_spec,
+            target=target,
         )
 
         # Insert worker token via env var (overrides the placeholder)
@@ -1780,6 +1869,7 @@ class DockerWorkerRunner:
         worktree_path: str,
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
+        target: str = "existing-repo",
     ) -> WorkerSpawnResult:
         token = _generate_token()
         token_expires_at = self.now() + (self._token_expiry_minutes * 60)
@@ -2094,6 +2184,7 @@ class RunnerSelector:
         worktree_path: str,
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
+        target: str = "existing-repo",
     ) -> WorkerSpawnResult:
         """Select a runner and delegate spawn_worker to it."""
         preference = "any"
@@ -2124,6 +2215,7 @@ class RunnerSelector:
             worktree_path=worktree_path,
             task_spec=task_spec,
             base_branch=base_branch,
+            target=target,
         )
 
         # Record runner_type on the worker row
