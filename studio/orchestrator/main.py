@@ -86,6 +86,9 @@ class Orchestrator:
         self._ops_task: asyncio.Task | None = None
         self._fleet_health_task: asyncio.Task | None = None
         self._k8s_watch_task: asyncio.Task | None = None
+        self._ssh_runner: "RemoteSSHWorkerRunner | None" = None
+        self._k8s_runner: "K8sJobWorkerRunner | None" = None
+        self._docker_runner: "DockerWorkerRunner | None" = None
         self._secret_store: "SecretStore | None" = None
         self._running = False
 
@@ -278,6 +281,33 @@ class Orchestrator:
         await self._record_calibration(bundle_id)
         logger.warning("QA verification failed for bundle %s: %s", bundle_id, reason)
 
+    # ── Inject context callback (Bundle 5.1) ────────────────────────────────
+
+    async def _on_inject_context(self, worker_id: str, injection_id: str,
+                                  context_type: str, content: str,
+                                  question_id: str | None) -> None:
+        """Send inject_context to a worker and await acknowledgement."""
+        try:
+            result = await self.conn_mgr.call_worker(
+                worker_id,
+                "worker.inject_context",
+                {
+                    "injection_id": injection_id,
+                    "type": context_type,
+                    "content": content,
+                    "question_id": question_id,
+                },
+                timeout=30.0,
+            )
+            if result is None:
+                logger.warning("inject_context timeout for worker %s (injection_id=%s)",
+                               worker_id, injection_id)
+            else:
+                logger.info("inject_context acknowledged by worker %s (injection_id=%s)",
+                            worker_id, injection_id)
+        except ValueError:
+            logger.warning("Cannot send inject_context: worker %s not connected", worker_id)
+
     # ── Calibration loop ───────────────────────────────────────────────────
 
     async def _record_calibration(self, bundle_id: str) -> None:
@@ -411,6 +441,9 @@ class Orchestrator:
         # Wire post-execution QA callbacks
         self.handlers.set_on_qa_pass(self._on_qa_pass)
         self.handlers.set_on_qa_fail(self._on_qa_fail)
+
+        # Wire inject_context callback (Bundle 5.1)
+        self.handlers.set_on_inject_context(self._on_inject_context)
 
         # 3.5. Secret store (hybrid file+env, Bundle 3.4)
         self._secret_store = SecretStore(

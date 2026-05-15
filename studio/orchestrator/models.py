@@ -856,3 +856,35 @@ class ArtifactListParams(BaseModel):
 
 class SecretsFetchParams(BaseModel):
     name: str
+
+
+class AskQuestionParams(BaseModel):
+    question_id: str
+    question: str
+    context: str = ""
+    blocking: bool = False
+    urgency: Literal["low", "medium", "high"] = "medium"
+
+
+class ReportCheckpointParams(BaseModel):
+    checkpoint_id: str
+    phase_completed: str = ""
+    phase_starting: str = ""
+    summary: str = ""
+    concerns: list[str] = Field(default_factory=list)
+    estimated_remaining: dict[str, int] = Field(default_factory=dict)
+
+
+class RespondToQueryParams(BaseModel):
+    injection_id: str
+    query_type: Literal["describe_progress", "show_artifact"]
+    response: dict[str, Any] = Field(default_factory=dict)
+
+
+class InjectContextParams(BaseModel):
+    injection_id: str
+    type: Literal["answer", "redirect", "feedback", "question_response"]
+    content: str = ""
+    question_id: str | None = None
+    action: Literal["describe_progress", "show_artifact"] | None = None
+    action_path: str | None = None

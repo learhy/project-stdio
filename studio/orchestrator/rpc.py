@@ -28,6 +28,10 @@ from .models import (
     FinalReportParams,
     CapCheckParams,
     CapCheckResult,
+    AskQuestionParams,
+    ReportCheckpointParams,
+    RespondToQueryParams,
+    InjectContextParams,
 )
 
 if TYPE_CHECKING:
@@ -48,7 +52,12 @@ _STUB_METHODS: frozenset[str] = frozenset({
     "worker.pause",
     "worker.resume",
     "worker.cancel",
-    "worker.inject_context",
+})
+
+_INFRASTRUCTURE_METHODS: frozenset[str] = frozenset({
+    "worker.ask_question",
+    "worker.report_checkpoint",
+    "worker.respond_to_query",
 })
 
 
@@ -138,8 +147,8 @@ class RpcDispatcher:
 
         is_notification = req_id is None
 
-        # ── Capability check (skipped for SystemBinding) ──
-        if not isinstance(binding, SystemBinding):
+        # ── Capability check (skipped for SystemBinding and infrastructure methods) ──
+        if not isinstance(binding, SystemBinding) and method not in _INFRASTRUCTURE_METHODS:
             cap_ok, cap_reason = self._check_rpc_method(binding, method)
             if not cap_ok:
                 if is_notification:
@@ -216,6 +225,7 @@ class RpcHandlers:
         self._on_review_blocking: Callable[[str, str], Awaitable[None]] | None = None
         self._on_qa_pass: Callable[[str, dict], Awaitable[None]] | None = None
         self._on_qa_fail: Callable[[str, str, dict], Awaitable[None]] | None = None
+        self._on_inject_context: Callable[[str, str, str, str, str | None], Awaitable[None]] | None = None
         self._artifact_store: "ArtifactStore | None" = None
         self._secret_store: "SecretStore | None" = None
 
@@ -254,6 +264,10 @@ class RpcHandlers:
     def set_on_qa_fail(self, cb: Callable[[str, str, dict], Awaitable[None]]) -> None:
         """Callback: on_qa_fail(bundle_id, reason, verification_report)."""
         self._on_qa_fail = cb
+
+    def set_on_inject_context(self, cb: Callable[[str, str, str, str, str | None], Awaitable[None]]) -> None:
+        """Callback: on_inject_context(worker_id, injection_id, type, content, question_id)."""
+        self._on_inject_context = cb
 
     def set_artifact_store(self, store: "ArtifactStore") -> None:
         self._artifact_store = store
@@ -994,6 +1008,220 @@ class RpcHandlers:
             "expires_at": expires_at,
         }, req_id)
 
+    # ── worker.ask_question (Bundle 5.1) ──────────────────────────────────
+
+    async def handle_ask_question(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        question_id = params.get("question_id", "")
+        question = params.get("question", "")
+        context = params.get("context", "")
+        blocking = params.get("blocking", False)
+        urgency = params.get("urgency", "medium")
+
+        if not question_id or not question:
+            return {"status": "rejected", "reason": "question_id and question are required"}
+
+        now = self.now()
+
+        # Increment questions_asked counter
+        await self.db.execute(
+            "UPDATE workers SET questions_asked = questions_asked + 1 WHERE id = ?",
+            (binding.worker_id,),
+        )
+        await self.db.conn.commit()
+
+        # Fetch updated count
+        row = await self.db.fetch_one(
+            "SELECT questions_asked FROM workers WHERE id = ?", (binding.worker_id,)
+        )
+        questions_asked = row["questions_asked"] if row else 0
+
+        # Insert question record
+        await self.db.execute(
+            "INSERT INTO worker_questions (question_id, worker_id, bundle_id, question, context, "
+            "blocking, urgency, status, asked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (question_id, binding.worker_id, binding.bundle_id, question, context,
+             int(blocking), urgency, "pending", now),
+        )
+        await self.db.conn.commit()
+
+        # Route question (LLM or escalate)
+        await self._route_question(
+            binding.worker_id, binding.bundle_id, question_id, question, context,
+            blocking, questions_asked
+        )
+
+        return {"status": "received", "question_id": question_id}
+
+    async def _route_question(self, worker_id: str, bundle_id: str, question_id: str,
+                               question: str, context: str, blocking: bool,
+                               questions_asked: int) -> None:
+        now = self.now()
+        max_questions = 10
+
+        if questions_asked > max_questions:
+            # Rate limit exceeded — escalate directly
+            await self.db.execute(
+                "UPDATE worker_questions SET status = ? WHERE question_id = ?",
+                ("escalated", question_id),
+            )
+            await self.db.conn.commit()
+            await self.db.execute(
+                "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("worker.question_rate_limited", "worker", worker_id,
+                 json.dumps({"question_id": question_id, "questions_asked": questions_asked}), now),
+            )
+            await self.db.conn.commit()
+            return
+
+        # Attempt LLM answer
+        answer, confidence = await self._call_question_llm(bundle_id, question, context)
+
+        if confidence == "high" and answer:
+            await self.db.execute(
+                "UPDATE worker_questions SET status = ?, answer = ?, answered_at = ? WHERE question_id = ?",
+                ("answered", answer, now, question_id),
+            )
+            await self.db.conn.commit()
+
+            # Deliver answer via inject_context
+            if self._on_inject_context:
+                import ulid
+                injection_id = str(ulid.ULID())
+                await self._on_inject_context(worker_id, injection_id, "answer", answer, question_id)
+        else:
+            # Low confidence — escalate
+            await self.db.execute(
+                "UPDATE worker_questions SET status = ? WHERE question_id = ?",
+                ("escalated", question_id),
+            )
+            await self.db.conn.commit()
+            await self.db.execute(
+                "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("worker.question_escalated", "worker", worker_id,
+                 json.dumps({"question_id": question_id, "confidence": confidence}), now),
+            )
+            await self.db.conn.commit()
+
+    async def _call_question_llm(self, bundle_id: str, question: str, context: str) -> tuple[str | None, str]:
+        """Basic one-shot LLM call for question answering. Stub implementation for Bundle 5.1."""
+        import asyncio
+        try:
+            # Fetch bundle proposal for context
+            bundle_row = await self.db.fetch_one(
+                "SELECT proposal_json FROM bundles WHERE id = ?", (bundle_id,)
+            )
+            proposal = json.loads(bundle_row["proposal_json"]) if bundle_row and bundle_row["proposal_json"] else {}
+
+            # Build a simple prompt and attempt LLM call
+            prompt = (
+                f"You are a helpful coding assistant supervisor. A worker is executing a task and needs guidance.\n\n"
+                f"Task context: {json.dumps(proposal.get('implementation_plan', proposal.get('requirements_summary', '')))}\n\n"
+                f"Worker question: {question}\n\n"
+                f"Additional context from worker: {context}\n\n"
+                f"Provide a concise, helpful answer. If you cannot answer confidently, say 'UNCERTAIN'."
+            )
+
+            # Run in thread to avoid blocking
+            result = await asyncio.to_thread(self._ollama_cloud_call, prompt)
+            if result and "UNCERTAIN" not in result:
+                return (result.strip(), "high")
+            return (result.strip() if result else None, "medium")
+        except Exception:
+            return (None, "low")
+
+    def _ollama_cloud_call(self, prompt: str) -> str | None:
+        """Synchronous HTTP call to Ollama Cloud. Extracted for asyncio.to_thread."""
+        import os
+        import urllib.request
+        api_key = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
+        if not api_key:
+            return None
+        try:
+            req = urllib.request.Request(
+                "https://ollama.com/api/chat",
+                data=json.dumps({
+                    "model": "llama3.2",
+                    "messages": [{"role": "user", "content": prompt}],
+                }).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode())
+                return body.get("message", {}).get("content", "")
+        except Exception:
+            return None
+
+    # ── worker.report_checkpoint (Bundle 5.1) ─────────────────────────────
+
+    async def handle_report_checkpoint(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        checkpoint_id = params.get("checkpoint_id", "")
+        phase_completed = params.get("phase_completed", "")
+        phase_starting = params.get("phase_starting", "")
+        summary = params.get("summary", "")
+        concerns = params.get("concerns", [])
+        estimated_remaining = params.get("estimated_remaining", {})
+
+        if not checkpoint_id:
+            return {"accepted": False, "reason": "checkpoint_id is required"}
+
+        now = self.now()
+        await self.db.execute(
+            "INSERT INTO worker_checkpoints (checkpoint_id, worker_id, bundle_id, phase_completed, "
+            "phase_starting, summary, concerns_json, estimated_remaining_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (checkpoint_id, binding.worker_id, binding.bundle_id, phase_completed,
+             phase_starting, summary, json.dumps(concerns), json.dumps(estimated_remaining), now),
+        )
+        await self.db.conn.commit()
+
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("worker.checkpoint_reported", "worker", binding.worker_id,
+             json.dumps({"checkpoint_id": checkpoint_id, "phase_completed": phase_completed}), now),
+        )
+        await self.db.conn.commit()
+
+        return {"accepted": True, "checkpoint_id": checkpoint_id}
+
+    # ── worker.respond_to_query (Bundle 5.1) ──────────────────────────────
+
+    async def handle_respond_to_query(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        injection_id = params.get("injection_id", "")
+        response = params.get("response", {})
+
+        if not injection_id:
+            return {"accepted": False, "reason": "injection_id is required"}
+
+        # The pending call is resolved by ConnectionManager via _pending_calls
+        return {"accepted": True, "injection_id": injection_id}
+
+    # ── worker.inject_context (Bundle 5.1 — promoted from stub) ───────────
+
+    async def handle_inject_context(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        """Process inject_context acknowledgement from worker."""
+        injection_id = params.get("injection_id", "")
+        acknowledged = params.get("acknowledged", True)
+        worker_response = params.get("worker_response", "")
+
+        now = self.now()
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("worker.inject_context_ack", "worker", binding.worker_id,
+             json.dumps({"injection_id": injection_id, "acknowledged": acknowledged,
+                         "worker_response": worker_response[:500]}), now),
+        )
+        await self.db.conn.commit()
+
+        return {"accepted": True, "injection_id": injection_id}
+
+
 class ConnectionManager:
     """Unix domain socket server that accepts worker connections and dispatches RPC."""
 
@@ -1010,6 +1238,7 @@ class ConnectionManager:
         self.db = db
         self._bindings: dict[str, WorkerBinding] = {}
         self._by_worker_id: dict[str, WorkerBinding] = {}
+        self._pending_calls: dict[str, asyncio.Future] = {}
         self._server: asyncio.AbstractServer | None = None
 
     @property
@@ -1050,6 +1279,50 @@ class ConnectionManager:
         data = (json.dumps(message) + "\n").encode()
         binding.writer.write(data)
         await binding.writer.drain()
+
+    async def call_worker(self, worker_id: str, method: str, params: dict,
+                           timeout: float = 30.0) -> dict | None:
+        """Send a JSON-RPC request to a connected worker and await the response.
+
+        Returns the result dict, or None on timeout.
+        """
+        import logging
+        _logger = logging.getLogger(__name__)
+
+        binding = self._by_worker_id.get(worker_id)
+        if binding is None:
+            raise ValueError(f"Worker {worker_id} not connected")
+
+        corr_id = params.get("injection_id", "")
+        if not corr_id:
+            import ulid
+            corr_id = str(ulid.ULID())
+
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_calls[corr_id] = future
+
+        self._req_counter = getattr(self, '_req_counter', 0) + 1
+        setattr(self, '_req_counter', self._req_counter)
+        req_id = self._req_counter
+
+        message = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": req_id,
+        }
+        data = (json.dumps(message) + "\n").encode()
+        binding.writer.write(data)
+        await binding.writer.drain()
+
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+            return result
+        except asyncio.TimeoutError:
+            _logger.warning("call_worker timeout for worker %s method %s (%.1fs)",
+                            worker_id, method, timeout)
+            self._pending_calls.pop(corr_id, None)
+            return None
 
     async def _audit_security(self, event_type: str, subject_type: str,
                                subject_id: str, payload: dict) -> None:
@@ -1163,11 +1436,42 @@ class ConnectionManager:
             writer.write((json.dumps(_make_result({"bound": True, "worker_id": worker_id}, auth_msg.get("id"))) + "\n").encode())
             await writer.drain()
 
-            # Read loop — process RPC messages
+            # Read loop — process RPC messages; detect responses to pending calls
             while True:
                 line = await reader.readline()
                 if not line:
                     break
+
+                # Check if this is a response to a pending orchestrator-initiated call
+                try:
+                    body = json.loads(line.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    response = await self.dispatcher.dispatch(binding, line)
+                    if response is not None:
+                        writer.write(response)
+                        await writer.drain()
+                    continue
+
+                if "method" not in body and "id" in body:
+                    # This is a response to an orchestrator-initiated request
+                    # Try to match via worker.respond_to_query params
+                    result = body.get("result", {})
+                    injection_id = result.get("injection_id", "")
+                    if not injection_id:
+                        # Try matching by raw response — check all pending calls
+                        pass
+                    future = self._pending_calls.pop(injection_id, None)
+                    if future is not None and not future.done():
+                        future.set_result(body)
+                    # Also check _pending_calls for any request id match
+                    req_id = body.get("id")
+                    if req_id is not None:
+                        for key, fut in list(self._pending_calls.items()):
+                            if not fut.done():
+                                fut.set_result(body)
+                                del self._pending_calls[key]
+                                break
+                    continue
 
                 response = await self.dispatcher.dispatch(binding, line)
                 if response is not None:
@@ -1219,11 +1523,15 @@ def create_rpc_system(
     # human input (implemented in Bundle 2.6)
     dispatcher.register("worker.request_human_input", handlers.handle_request_human_input)
     dispatcher.register("worker.poll_human_input", handlers.handle_poll_human_input)
+    # Bundle 5.1: bidirectional introspection protocol
+    dispatcher.register("worker.ask_question", handlers.handle_ask_question)
+    dispatcher.register("worker.report_checkpoint", handlers.handle_report_checkpoint)
+    dispatcher.register("worker.respond_to_query", handlers.handle_respond_to_query)
+    dispatcher.register("worker.inject_context", handlers.handle_inject_context)
     # Stub methods also registered so dispatcher finds them (but they return -32000)
     dispatcher.register("worker.pause", _make_stub_handler("worker.pause"))
     dispatcher.register("worker.resume", _make_stub_handler("worker.resume"))
     dispatcher.register("worker.cancel", _make_stub_handler("worker.cancel"))
-    dispatcher.register("worker.inject_context", _make_stub_handler("worker.inject_context"))
     # mcp.* handlers (system surface, called by MCP server process)
     dispatcher.register("mcp.approve_bundle", handlers.handle_mcp_approve_bundle)
     dispatcher.register("mcp.reject_bundle", handlers.handle_mcp_reject_bundle)
