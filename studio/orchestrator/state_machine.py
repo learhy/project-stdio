@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .models import BundleState
 from .approval import CooldownError
@@ -133,9 +133,14 @@ class BundleStateMachine:
         self.db = db
         self.kernel_mode = kernel_mode
         self._github: "GitHubClient | None" = None
+        self._on_bundle_complete: "Any | None" = None
 
     def set_github_client(self, github_client: "GitHubClient") -> None:
         self._github = github_client
+
+    def set_on_bundle_complete(self, cb: "Any") -> None:
+        """Callback: on_bundle_complete(bundle_id). Fired on transition 17 (COMPLETE)."""
+        self._on_bundle_complete = cb
 
     @staticmethod
     def now() -> int:
@@ -671,6 +676,10 @@ class BundleStateMachine:
             )
             await self._audit("verification_passed", "bundle", bundle_id,
                             {"from_state": current, "to_state": BundleState.COMPLETE})
+
+        # Fire final report callback for GitHub posting (Bundle 5.3)
+        if self._on_bundle_complete:
+            await self._on_bundle_complete(bundle_id)
 
     # ── Transition 19: verification failed (VERIFYING -> FAILED) ───────
 

@@ -128,11 +128,11 @@ class TestRpcDispatcherDispatch:
 
     @pytest.mark.asyncio
     async def test_stub_method_returns_32000(self, dispatcher, binding):
-        raw = b'{"jsonrpc":"2.0","method":"worker.pause","params":{},"id":1}'
+        raw = b'{"jsonrpc":"2.0","method":"worker.cancel","params":{},"id":1}'
         resp = await dispatcher.dispatch(binding, raw)
         body = json.loads(resp.decode())
         assert body["error"]["code"] == METHOD_NOT_IMPLEMENTED
-        assert "worker.pause" in body["error"]["message"]
+        assert "worker.cancel" in body["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_method_not_found(self, dispatcher, binding):
@@ -578,7 +578,7 @@ class TestCreateRpcSystem:
         assert dispatcher is not None
         assert handlers is not None
         assert conn_mgr is not None
-        assert len(dispatcher._handlers) == 27
+        assert len(dispatcher._handlers) == 28
 
     def test_register_all_methods(self, db_mock, tmp_path):
         sp = str(tmp_path / "test.sock")
@@ -596,7 +596,7 @@ class TestCreateRpcSystem:
             "mcp.approve_bundle", "mcp.reject_bundle",
             "mcp.request_modification", "mcp.escalate_bundle",
             "mcp.pause_bundle", "mcp.resume_bundle",
-            "mcp.kill_worker",
+            "mcp.kill_worker", "mcp.list_escalations",
         }
         assert set(dispatcher._handlers.keys()) == expected
 
@@ -671,16 +671,14 @@ class TestBundleFiveOne:
 
         assert result["status"] == "received"
 
-        # Verify escalated status was set (not answered)
+        # Verify escalated status was set (not answered), and escalated_at was set
         escalated_calls = [c for c in db_mock.execute.call_args_list
                            if "UPDATE worker_questions SET status" in str(c[0][0])
                            and "escalated" in str(c[0][1])]
         assert len(escalated_calls) == 1
 
-        # Verify rate limit audit entry
-        audit_calls = [c for c in db_mock.execute.call_args_list
-                       if "question_rate_limited" in str(c[0][1])]
-        assert len(audit_calls) == 1
+        # Verify escalated_at was also set (Bundle 5.3 adds this column)
+        assert "escalated_at" in str(escalated_calls[0][0][0])
 
     @pytest.mark.asyncio
     async def test_report_checkpoint_stored(self, handlers, db_mock, binding):
@@ -956,16 +954,21 @@ class TestBundleFiveTwo:
 
     @pytest.mark.asyncio
     async def test_handle_escalate_verdict(self, review_scheduler, db_mock):
-        """escalate_to_human verdict: audit log with escalation."""
+        """escalate_to_human verdict: calls escalation module."""
         verdict = {
             "verdict": "escalate_to_human", "confidence": "high",
             "rationale": "Worker is stuck.",
             "action": {"type": "escalate", "escalation_reason": "Repeated failures"},
         }
         await review_scheduler._handle_verdict("w1", "b1", "n1", verdict, "time_trigger")
-        escalate_calls = [c for c in db_mock.execute.call_args_list
-                          if "review.escalated_to_human" in str(c[0][1])]
-        assert len(escalate_calls) == 1
+        # Verify intervention was inserted and worker paused
+        pause_calls = [c for c in db_mock.execute.call_args_list
+                       if "UPDATE workers SET state" in str(c[0][0])
+                       and "paused" in str(c[0][1])]
+        assert len(pause_calls) == 1
+        int_calls = [c for c in db_mock.execute.call_args_list
+                     if "INSERT INTO worker_interventions" in str(c[0][0])]
+        assert len(int_calls) == 1
 
     # ── trigger_review (PM-initiated) ──────────────────────────────────────
 
@@ -991,8 +994,213 @@ class TestBundleFiveTwo:
     # ── Handler count unchanged for Bundle 5.2 ─────────────────────────────
 
     def test_handler_count_unchanged(self, db_mock, tmp_path):
-        """Bundle 5.2 does not add new RPC handlers — describe_progress/show_artifact
-        are worker-side only (orchestrator sends requests, worker responds)."""
+        """Bundle 5.3 adds mcp.list_escalations — handler count now 28."""
         sp = str(tmp_path / "test.sock")
         dispatcher, _, _ = create_rpc_system(db_mock, sp)
-        assert len(dispatcher._handlers) == 27
+        assert len(dispatcher._handlers) == 28
+
+
+# ── Bundle 5.3: Intervention actions ──────────────────────────────────────────
+
+class TestBundleFiveThree:
+    """Tests for pause/resume handlers, escalation routing, MCP escalation resource."""
+
+    @pytest.fixture
+    def sys_binding(self):
+        from studio.orchestrator.rpc import SystemBinding
+        return SystemBinding("mcp", MagicMock(), MagicMock())
+
+    # ── Stub methods ────────────────────────────────────────────────────────
+
+    def test_only_cancel_remains_stubbed(self):
+        """Only worker.cancel should remain in _STUB_METHODS after Bundle 5.3."""
+        assert _STUB_METHODS == frozenset({"worker.cancel"})
+        assert "worker.pause" not in _STUB_METHODS
+        assert "worker.resume" not in _STUB_METHODS
+
+    # ── handle_pause ────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_pause_handler_updates_worker_state(self, handlers, db_mock, binding):
+        """handle_pause sets worker state to paused and records audit."""
+        result = await handlers.handle_pause(binding, {"reason": "PM requested"}, 1)
+
+        assert result["paused"] is True
+        assert result["worker_id"] == "w1"
+
+        # Verify DB update: worker state set to paused
+        pause_calls = [c for c in db_mock.execute.call_args_list
+                       if "UPDATE workers SET state" in str(c[0][0])
+                       and "paused" in str(c[0][1])]
+        assert len(pause_calls) == 1
+
+        # Verify audit log recorded
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "worker.paused" in str(c[0][1])]
+        assert len(audit_calls) == 1
+
+    # ── handle_resume ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_resume_handler_updates_worker_state(self, handlers, db_mock, binding):
+        """handle_resume sets worker state to running and records audit."""
+        result = await handlers.handle_resume(binding, {"context": "carry on"}, 1)
+
+        assert result["resumed"] is True
+        assert result["worker_id"] == "w1"
+
+        # Verify DB update: worker state set to running
+        resume_calls = [c for c in db_mock.execute.call_args_list
+                        if "UPDATE workers SET state" in str(c[0][0])
+                        and "running" in str(c[0][1])]
+        assert len(resume_calls) == 1
+
+        # Verify audit log recorded
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "worker.resumed" in str(c[0][1])]
+        assert len(audit_calls) == 1
+
+    # ── mcp.list_escalations ────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_mcp_list_escalations_returns_pending(self, handlers, db_mock, sys_binding):
+        """mcp.list_escalations returns pending interventions."""
+        db_mock.fetch_all = AsyncMock(return_value=[
+            {"intervention_id": "int-1", "worker_id": "w1", "w_bundle_id": "b1",
+             "node_id": "n1", "type": "question_escalation", "content": "Help needed",
+             "triggered_by": "question_rate_limited", "status": "pending",
+             "created_at": 1700000000},
+            {"intervention_id": "int-2", "worker_id": "w2", "w_bundle_id": "b1",
+             "node_id": "n2", "type": "review_escalation", "content": "Stuck worker",
+             "triggered_by": "time_trigger", "status": "pending",
+             "created_at": 1700000100},
+        ])
+
+        result = await handlers.handle_mcp_list_escalations(sys_binding, {}, 1)
+
+        assert result["count"] == 2
+        assert len(result["escalations"]) == 2
+        assert result["escalations"][0]["intervention_id"] == "int-1"
+        assert result["escalations"][1]["type"] == "review_escalation"
+
+    @pytest.mark.asyncio
+    async def test_mcp_list_escalations_empty(self, handlers, db_mock, sys_binding):
+        """mcp.list_escalations returns empty list when no pending interventions."""
+        db_mock.fetch_all = AsyncMock(return_value=[])
+
+        result = await handlers.handle_mcp_list_escalations(sys_binding, {}, 1)
+
+        assert result["count"] == 0
+        assert result["escalations"] == []
+
+    # ── _route_question escalation ──────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_route_question_rate_limit_escalates(self, handlers, db_mock):
+        """When questions_asked > 10 and conn_mgr set, escalates to PM."""
+        conn_mgr = MagicMock()
+        conn_mgr.call_worker = AsyncMock()
+        handlers.set_conn_mgr(conn_mgr)
+
+        with patch("studio.orchestrator.escalation.escalate_to_pm",
+                   new_callable=AsyncMock) as mock_esc:
+            await handlers._route_question(
+                "w1", "b1", "q1", "question?", "context", False, questions_asked=12,
+            )
+
+        # Verify escalated_at was set on the question
+        esc_calls = [c for c in db_mock.execute.call_args_list
+                     if "UPDATE worker_questions SET status" in str(c[0][0])
+                     and "escalated" in str(c[0][1])]
+        assert len(esc_calls) == 1
+
+        # Verify escalation module was called
+        mock_esc.assert_called_once()
+        call_args = mock_esc.call_args
+        assert call_args[0][4] == "w1"  # worker_id
+        assert call_args[0][5] == "b1"  # bundle_id
+        assert call_args[0][7] == "question_rate_limited"  # reason
+
+    @pytest.mark.asyncio
+    async def test_route_question_rate_limit_no_conn_mgr(self, handlers, db_mock):
+        """When questions_asked > 10 but no conn_mgr set, skips escalation call."""
+        # Default handlers fixture has no conn_mgr set
+        await handlers._route_question(
+            "w1", "b1", "q1", "question?", "context", False, questions_asked=12,
+        )
+
+        # escalated_at should still be set
+        esc_calls = [c for c in db_mock.execute.call_args_list
+                     if "UPDATE worker_questions SET status" in str(c[0][0])
+                     and "escalated" in str(c[0][1])]
+        assert len(esc_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_route_question_low_confidence_escalates(self, handlers, db_mock):
+        """When LLM returns low confidence and conn_mgr set, escalates to PM."""
+        conn_mgr = MagicMock()
+        conn_mgr.call_worker = AsyncMock()
+        handlers.set_conn_mgr(conn_mgr)
+
+        # Mock LLM to return low confidence
+        with patch.object(handlers, "_call_question_llm",
+                          return_value=(None, "low")), \
+             patch("studio.orchestrator.escalation.escalate_to_pm",
+                   new_callable=AsyncMock) as mock_esc:
+            await handlers._route_question(
+                "w1", "b1", "q1", "question?", "context", False, questions_asked=3,
+            )
+
+        # Verify escalated_at was set
+        esc_calls = [c for c in db_mock.execute.call_args_list
+                     if "UPDATE worker_questions SET status" in str(c[0][0])
+                     and "escalated" in str(c[0][1])]
+        assert len(esc_calls) == 1
+
+        # Verify escalation module was called
+        mock_esc.assert_called_once()
+        call_args = mock_esc.call_args
+        assert call_args[0][7] == "low_llm_confidence"
+
+    @pytest.mark.asyncio
+    async def test_route_question_low_confidence_no_conn_mgr(self, handlers, db_mock):
+        """When LLM returns low confidence but no conn_mgr set, skips escalation call."""
+        with patch.object(handlers, "_call_question_llm",
+                          return_value=(None, "low")):
+            await handlers._route_question(
+                "w1", "b1", "q1", "question?", "context", False, questions_asked=3,
+            )
+
+        # escalated_at should still be set
+        esc_calls = [c for c in db_mock.execute.call_args_list
+                     if "UPDATE worker_questions SET status" in str(c[0][0])
+                     and "escalated" in str(c[0][1])]
+        assert len(esc_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_route_question_high_confidence_answers(self, handlers, db_mock):
+        """When LLM returns high confidence, answer is stored and injected."""
+        handlers._on_inject_context = AsyncMock()
+
+        with patch.object(handlers, "_call_question_llm",
+                          return_value=("Here is the answer", "high")):
+            await handlers._route_question(
+                "w1", "b1", "q1", "question?", "context", False, questions_asked=3,
+            )
+
+        # Verify answer stored
+        answer_calls = [c for c in db_mock.execute.call_args_list
+                        if "UPDATE worker_questions SET status" in str(c[0][0])
+                        and "answered" in str(c[0][1])]
+        assert len(answer_calls) == 1
+
+        # Verify inject_context was called
+        handlers._on_inject_context.assert_called_once()
+
+    # ── Handler count ───────────────────────────────────────────────────────
+
+    def test_handler_count_is_28(self, db_mock, tmp_path):
+        """Bundle 5.3: 28 registered handlers."""
+        sp = str(tmp_path / "test.sock")
+        dispatcher, _, _ = create_rpc_system(db_mock, sp)
+        assert len(dispatcher._handlers) == 28
