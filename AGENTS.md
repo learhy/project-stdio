@@ -2,18 +2,18 @@
 
 ## What this repo is
 
-This is the Studio agent orchestration system: a Python async orchestrator that accepts bundle submissions, drives worker tasks through a DAG executor, enforces capability-based security, and writes outcomes to SQLite. Phase 1 shipped the linear kernel. Phase 2 added the bundler agent, full DAG executor, artifact protocol, review tracks, approval matrix, GitHub Issues surface, MCP server, and QA verification. Phase 3 hardened the system with egress proxy, schema versioning, ops tooling, security features (token expiry, secret rotation, audit), and rate-limit-aware GitHub integration.
+This is the Studio agent orchestration system: a Python async orchestrator that accepts bundle submissions, drives worker tasks through a DAG executor, enforces capability-based security, and writes outcomes to SQLite. Phase 1 shipped the linear kernel. Phase 2 added the bundler agent, full DAG executor, artifact protocol, review tracks, approval matrix, GitHub Issues surface, MCP server, and QA verification. Phase 3 hardened the system with egress proxy, schema versioning, ops tooling, security features (token expiry, secret rotation, audit), and rate-limit-aware GitHub integration. Phase 4 extended worker execution to remote hosts via SSH fleet, Kubernetes Jobs, and Docker containers, added TCP/TLS transport with mTLS, and added RunnerSelector for mixed-fleet operation.
 
 ## Layout
 
 ```
 studio/
   orchestrator/    # kernel: DB, state machine, RPC, executor, runner, CLI, main
-    db.py          # SQLite schema v6, connection pool, decorator-based migrations
+    db.py          # SQLite schema v11, connection pool, decorator-based migrations
     models.py      # Pydantic models for submissions, manifests, settings, DAG, review
     state_machine.py  # 20+ bundle lifecycle transitions
     rpc.py         # JSON-RPC 2.0 dispatcher, connection manager, worker auth
-    runner.py      # LocalBwrapWorkerRunner (bubblewrap) / NoopWorkerRunner (test)
+    runner.py      # 4 runner impls + RunnerSelector + capability translation functions
     executor.py    # DAG executor: worker, gate, aggregator nodes + dynamic expansion
     scheduler.py   # Periodic dispatch + heartbeat timeout checks
     reconciler.py  # Kill-all crash recovery
@@ -27,6 +27,7 @@ studio/
     visualizer.py  # Mermaid DAG renderer
     expression.py  # Expression evaluator for artifact gate predicates
     reducers.py    # Aggregator reduce functions
+    tls.py         # mTLS: CA bootstrap, worker certificate issuance
     settings.py    # Settings loader (JSON → Pydantic)
     cli.py         # CLI entry point (submit/approve/reject/list/show/kill/status/...)
     main.py        # Orchestrator: wires all subsystems, Starlette HTTP server, polling
@@ -40,10 +41,16 @@ studio/
     server.py      # Starlette MCP HTTP server
     tools.py       # MCP tool definitions (submit, approve, reject, modify, status)
     resources.py   # MCP resource handlers (bundles, capabilities)
-  tests/           # 763 unit tests across 28 test files
+  tests/           # 948 unit tests across 35 test files
   systemd/         # studio-orchestrator.service
-pyproject.toml     # Python 3.12, hatchling build
-settings.json      # All runtime configuration
+docker/            # Container images
+  Dockerfile.orchestrator
+  Dockerfile.worker
+  Dockerfile.proxy
+deploy/helm/studio-workers/  # Helm chart for k8s runner (ServiceAccount, RBAC, NetworkPolicy)
+docker-compose.yml           # Orchestrator-in-Docker with dynamic worker spawning
+pyproject.toml               # Python 3.12, hatchling build
+settings.json.example        # All runtime configuration reference
 ```
 
 ## Key invariants
@@ -112,7 +119,27 @@ Secrets live in `memory/secrets/<name>.json` (file store takes precedence over e
 
 ## Egress proxy
 
-Per-worker egress proxy enforces network grants. Each worker gets a dedicated Unix socket proxy process. The proxy handles HTTP CONNECT tunneling with TLS SNI inspection for HTTPS destinations. HTTP requests are rewritten with the proxy as forward proxy.
+Per-worker egress proxy enforces network grants. Each worker gets a dedicated Unix socket proxy process (or sidecar container for k8s/Docker runners). The proxy handles HTTP CONNECT tunneling with TLS SNI inspection for HTTPS destinations. HTTP requests are rewritten with the proxy as forward proxy. Identical egress enforcement semantics across all four runner types.
+
+## Worker runners
+
+Four runner implementations, all sharing the same `WorkerRunner` interface (`spawn_worker`, `kill_worker`):
+
+- **LocalBwrapWorkerRunner**: Bubblewrap-isolated subprocesses on the orchestrator host. Full bwrap enforcement of exec_allowlist, filesystem isolation, and network namespaces. Used for development and single-machine deployments.
+- **RemoteSSHWorkerRunner**: Workers on a managed fleet of Linux hosts via SSH + bubblewrap. Fleet registry in `settings.json` with per-host semaphores, health pings, and `least_loaded` / `round_robin` selection policy. Identical bwrap isolation model as local.
+- **K8sJobWorkerRunner**: Workers as Kubernetes Jobs with sidecar egress proxy, NetworkPolicy egress enforcement, init containers for git clone, and Pod event watching for eviction/OOMKill detection. Helm chart at `deploy/helm/studio-workers/` provisions RBAC. Exec allowlist is enforced at RPC level, not kernel level — `allow_unenforced_grants` must be enabled.
+- **DockerWorkerRunner**: Workers as sibling Docker containers. Per-worker internal network, named volumes for worktree and proxy socket, proxy sidecar with shared volume. Enables macOS/Windows support via Docker Desktop. Same security defaults as k8s (`--read-only`, `--no-new-privileges`, `--cap-drop ALL`, `--user 10000:10000`).
+
+### RunnerSelector
+
+`RunnerSelector` routes each task to the appropriate runner based on:
+
+1. `runner_preference` in the task spec (`local`, `remote_ssh`, `k8s`, `docker`, or `any`)
+2. Capability compatibility via `capability_to_runner_compatibility()` — k8s and Docker runners report `exec_allowlist` as unenforced
+3. `allow_unenforced_grants` setting — if false, incompatible runners are skipped
+4. Falls back to `default_preference` when task doesn't specify one
+
+Selected runner type is recorded on the worker row and audit-logged.
 
 ## Ops tooling
 
@@ -134,7 +161,7 @@ Runs on a 60s loop:
 ## Testing
 
 ```bash
-uv run python -m pytest studio/tests/ -v       # 763 tests
+uv run python -m pytest studio/tests/ -v       # 948 tests
 STUDIO_TEST_MODE=1 bash studio/tests/acceptance.sh  # acceptance tests
 ```
 
@@ -142,10 +169,10 @@ Test mode uses `NoopWorkerRunner` (no bubblewrap needed) and in-memory/temp-file
 
 | File | Coverage |
 |------|----------|
-| test_db_migrations.py | Schema creation, all 6 migrations |
+| test_db_migrations.py | Schema creation, all 11 migrations |
 | test_state_machine.py | All bundle lifecycle transitions |
 | test_executor.py | DAG execution, gates, aggregators, expansion |
-| test_rpc.py | Auth, dispatch, heartbeat, artifact, secrets RPC |
+| test_rpc.py | Auth, dispatch, heartbeat, artifact, secrets RPC, TCP/TLS transport |
 | test_runner.py | Bwrap arg building, worker spawning |
 | test_approval.py | Approval matrix tiers, cooldown, triggers |
 | test_review.py | Review track workflows |
@@ -170,3 +197,7 @@ Test mode uses `NoopWorkerRunner` (no bubblewrap needed) and in-memory/temp-file
 | test_visualizer.py | Mermaid rendering |
 | test_reducers.py | Reduce functions |
 | test_worker.py | Worker base class |
+| test_docker_runner.py | DockerWorkerHandle, capability_to_docker_args, DockerWorkerRunner, CLI handlers |
+| test_kubernetes_runner.py | capability_to_pod_spec, K8sWorkerHandle, K8sJobWorkerRunner |
+| test_runner_selector.py | RunnerSelector routing, compatibility checks, mixed-fleet dispatch |
+| test_tls.py | CA bootstrap, worker certificate issuance, mTLS configuration |

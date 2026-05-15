@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Linux** (kernel 5.x+). macOS and Windows are not supported.
+- **Linux** (kernel 5.x+) for VM/bare-metal install. macOS and Windows are supported via the Docker installation path.
 - **Python 3.12+** (`python3 --version`)
 - **git**
 - **bubblewrap** (`bwrap --version`) — for worker sandboxing
@@ -207,6 +207,193 @@ journalctl -u studio-mcp -f
 # User install
 journalctl --user -u studio-orchestrator -f
 journalctl --user -u studio-mcp -f
+```
+
+## VM / Linux server installation
+
+For installing on a fresh Linux VM or server for production use.
+
+### 1. Prerequisites
+
+```bash
+apt update && apt install -y python3.12 python3-pip git bubblewrap
+curl -LsSf https://astral.sh/uv/install.sh | sh
+curl -fsSL https://opencode.ai/install | bash
+```
+
+### 2. Clone and run installer
+
+```bash
+git clone https://github.com/learhy/project-stdio.git
+cd project-stdio
+sudo bash installer.sh
+```
+
+### 3. Configure settings.json
+
+Edit `/etc/studio/settings.json` to set production paths and enable remote workers:
+
+```json
+{
+  "orchestrator": {
+    "socket_path": "/run/studio/orchestrator.sock",
+    "db_path": "/var/lib/studio/state.db",
+    "memory_root": "/var/lib/studio/memory/"
+  },
+  "remote_workers": {
+    "enabled": true,
+    "listen_addr": "0.0.0.0:7811"
+  }
+}
+```
+
+### 4. Enable and start via systemd
+
+```bash
+systemctl enable --now studio-orchestrator
+systemctl enable --now studio-mcp
+```
+
+### 5. Open firewall port 7811 for worker connections
+
+```bash
+# ufw
+ufw allow 7811/tcp
+
+# firewalld
+firewall-cmd --add-port=7811/tcp --permanent && firewall-cmd --reload
+```
+
+### 6. Verify
+
+```bash
+studio health
+studio status
+```
+
+## Docker installation (recommended for macOS/Windows)
+
+Run the orchestrator in a Docker container with workers as sibling containers via DockerWorkerRunner. This path supports Linux, macOS, and Windows hosts.
+
+### 1. Prerequisites
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
+- git
+
+### 2. Clone and configure
+
+```bash
+git clone https://github.com/learhy/project-stdio.git
+cd project-stdio
+mkdir -p config data
+cp settings.json.example config/settings.json
+```
+
+Edit `config/settings.json` to set your `OLLAMA_CLOUD_API_KEY` and any other required fields. The `docker_runner` section is pre-configured for the Docker path.
+
+### 3. Start the orchestrator
+
+```bash
+OLLAMA_CLOUD_API_KEY="your-key" docker compose up -d
+```
+
+### 4. Verify
+
+```bash
+# Check containers are running
+docker compose ps
+
+# View orchestrator logs
+docker logs studio-orchestrator-1
+
+# Check health
+docker exec studio-orchestrator-1 studio health
+```
+
+### 5. Submit a bundle
+
+```bash
+docker exec studio-orchestrator-1 studio submit /build/studio/tests/fixtures/hello-world.json
+```
+
+Workers run as sibling containers automatically via DockerWorkerRunner. Use `studio docker-status` and `studio docker-images` inside the container to inspect them.
+
+### 6. Docker socket security
+
+Mounting `/var/run/docker.sock` into the orchestrator container gives it root-equivalent access to the host. This is a standard pattern for container-spawning orchestrators (used by Portainer, Watchtower, CI runners) but it is a meaningful privilege. If this is a concern, use the K8sJobWorkerRunner instead, which scopes permissions to a namespace. See the warning comment in `docker-compose.yml`.
+
+## Kubernetes installation
+
+For running workers on a Kubernetes cluster. The orchestrator itself can run anywhere (VM, Docker, or bare-metal) — only workers are scheduled on the cluster.
+
+### 1. Prerequisites
+
+- `kubectl` configured with access to the target cluster
+- Helm 3 installed
+- Orchestrator already running (VM or Docker path above) with `remote_workers.enabled: true`
+
+### 2. Install the Helm chart
+
+```bash
+helm install studio-workers deploy/helm/studio-workers/
+```
+
+This creates the `studio-workers` namespace, ServiceAccount, Role, RoleBinding, and default NetworkPolicy.
+
+### 3. Verify RBAC
+
+```bash
+kubectl get pods -n studio-workers
+kubectl get sa,role,rolebinding -n studio-workers
+```
+
+### 4. Configure settings.json
+
+On the orchestrator host, edit `settings.json` to enable the k8s runner:
+
+```json
+{
+  "k8s_runner": {
+    "enabled": true,
+    "orchestrator_tcp_addr": "<your-orchestrator-host>:7811"
+  },
+  "runner_selector": {
+    "allow_unenforced_grants": true
+  }
+}
+```
+
+`orchestrator_tcp_addr` must be reachable from the Kubernetes cluster. `allow_unenforced_grants: true` is required because k8s cannot enforce exec_allowlist at the kernel level (the same grant is enforced by the worker via RPC).
+
+### 5. Verify connectivity
+
+```bash
+studio k8s-status
+```
+
+If the orchestrator can reach the cluster, this shows no active Jobs (none running yet).
+
+### 6. Test with a bundle
+
+Submit a bundle with `runner_preference: k8s` in the task spec:
+
+```bash
+echo '{
+  "bundle_input": {"idea": "K8s test: add a hello-world endpoint"},
+  "task_dag": {
+    "nodes": [{"id": "n1", "kind": "worker", "spec": {
+      "objective": "Create hello endpoint",
+      "runner_preference": "k8s"
+    }}],
+    "edges": [], "entry_nodes": ["n1"], "exit_nodes": ["n1"]
+  }
+}' | studio submit -
+```
+
+Watch workers spin up:
+
+```bash
+kubectl get jobs -n studio-workers -w
 ```
 
 ## Uninstalling

@@ -8,17 +8,26 @@ Studio is an agent orchestration system where a central orchestrator process man
 
 ### Architecture
 
+The orchestrator runs as a single process on one machine (Linux VM, bare-metal, or Docker container) with SQLite as its state store. Workers scale out across four runner types depending on the environment:
+
+- **Local** (`LocalBwrapWorkerRunner`): bubblewrap-isolated subprocesses on the same host. Development and single-machine use.
+- **Remote SSH** (`RemoteSSHWorkerRunner`): workers dispatched to a managed fleet of Linux hosts via SSH + bubblewrap.
+- **Kubernetes** (`K8sJobWorkerRunner`): workers as Jobs in a Kubernetes namespace, with NetworkPolicy enforcement and sidecar egress proxy.
+- **Docker** (`DockerWorkerRunner`): workers as sibling containers, enabling macOS/Windows support via Docker Desktop.
+
+A `RunnerSelector` routes each task to the appropriate runner based on `runner_preference`, capability compatibility, and available capacity.
+
 ```
 CLI / MCP / GitHub Issues (approval surfaces)
   │
   ▼
 Orchestrator (single process)
-  ├── SQLite (WAL mode) — single writer, schema v6
+  ├── SQLite (WAL mode) — single writer
   ├── BundleStateMachine — 20+ transitions, 12 states
   ├── RpcDispatcher — worker RPC + CLI handlers
-  ├── ConnectionManager — Unix socket, token auth with expiry
+  ├── ConnectionManager — Unix socket + TCP/TLS, token auth with expiry
   ├── DagExecutor — worker / gate / aggregator nodes + dynamic expansion
-  ├── LocalBwrapWorkerRunner — bubblewrap isolation + egress proxy
+  ├── RunnerSelector — routes tasks to local, SSH, k8s, or Docker runners
   ├── GitHubClient — JWT App auth, issue management, rate-limit aware
   ├── Scheduler — periodic dispatch + heartbeat checks
   ├── Reconciler — kill-all crash recovery
@@ -28,7 +37,14 @@ Orchestrator (single process)
   └── Calibration loop — estimated-vs-actual scoring outcomes
   │
   ▼
-Worker subprocesses (bubblewrap containers)
+Workers (4 runner types)
+  ├── Local (bubblewrap subprocess)
+  ├── Remote SSH (Linux fleet host + bubblewrap)
+  ├── Kubernetes (Job in studio-workers namespace)
+  └── Docker (sibling container)
+  │
+  ▼
+Worker roles
   ├── Bundler — idea → proposal + DAG
   ├── Developer — implements tasks in git worktrees
   ├── Review (adversarial / security / QA) — pre-execution review tracks
@@ -338,6 +354,27 @@ Recent errors: (none)
 | `studio show-worker <id>` | Show worker detail, phase, heartbeat age, recent logs |
 | `studio recall <bundle-id>` | Recall a completed bundle within 48h (creates reversal bundle) |
 
+### Fleet (remote Linux hosts)
+
+| Command | Description |
+|---------|-------------|
+| `studio fleet-status` | Show fleet hosts: current worker count, status (healthy/degraded), last ping time |
+| `studio fleet-add <name> <addr>` | Add a host to the remote fleet registry |
+| `studio fleet-remove <name>` | Remove a host from the fleet registry |
+
+### Kubernetes
+
+| Command | Description |
+|---------|-------------|
+| `studio k8s-status` | Show active Jobs in the studio-workers namespace: Pod status, age, bundle ID |
+
+### Docker
+
+| Command | Description |
+|---------|-------------|
+| `studio docker-status` | Show running worker containers: bundle ID, status, image, uptime |
+| `studio docker-images` | Show worker and proxy image versions currently in use |
+
 ### Security
 
 | Command | Description |
@@ -387,6 +424,54 @@ All keys and their defaults:
 | `socket_dir` | `/run/studio` | Directory for proxy Unix sockets |
 | `connect_timeout_seconds` | `10` | Upstream connect timeout |
 | `read_timeout_seconds` | `30` | Upstream read timeout |
+
+### `remote_workers`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable the TCP/TLS listener for remote workers |
+| `listen_addr` | `0.0.0.0:7811` | Address and port for TCP/TLS listener |
+| `tls_ca_cert_path` | `/etc/studio/tls/ca.crt` | CA certificate for issuing mTLS worker certs |
+| `tls_ca_key_path` | `/etc/studio/tls/ca.key` | CA private key |
+| `tls_server_cert_path` | `/etc/studio/tls/server.crt` | Server certificate for the TCP listener |
+| `tls_server_key_path` | `/etc/studio/tls/server.key` | Server private key |
+
+### `remote_fleet`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable the SSH fleet registry |
+| `hosts` | `[]` | Array of fleet host objects (name, addr, ssh_user, ssh_key_path, capabilities, max_concurrent_workers, arch, worktree_mode) |
+| `selection_policy` | `least_loaded` | Host selection policy: `least_loaded` or `round_robin` |
+
+### `k8s_runner`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable Kubernetes Job runner |
+| `kubeconfig_path` | `null` | Path to kubeconfig (null = in-cluster or ~/.kube/config) |
+| `namespace` | `studio-workers` | Namespace for worker Jobs, Pods, NetworkPolicies, and Secrets |
+| `orchestrator_tcp_addr` | `orchestrator.internal:7811` | TCP address workers use to connect back to the orchestrator |
+| `image_pull_policy` | `IfNotPresent` | Kubernetes image pull policy |
+| `worktree_mode` | `init_container` | Git worktree strategy: `init_container`, `pvc`, or `nfs_mount` |
+| `default_storage_class` | `null` | Default StorageClass for PVCs |
+| `worker_image` | `studio-worker:latest` | Worker container image |
+| `proxy_image` | `studio-proxy:latest` | Egress proxy sidecar image |
+
+### `docker_runner`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable Docker worker runner |
+| `socket_path` | `/var/run/docker.sock` | Docker daemon socket path |
+| `worker_image` | `project-stdio-worker:latest` | Worker container image |
+| `proxy_image` | `project-stdio-proxy:latest` | Egress proxy sidecar image |
+| `network_prefix` | `studio-worker` | Prefix for per-worker Docker network names |
+| `volume_prefix` | `studio-worktree` | Prefix for per-worker Docker volume names |
+| `registry` | `null` | Optional remote registry URL (null = local images only) |
+| `pull_policy` | `if_not_present` | Image pull behavior: `always`, `if_not_present`, or `never` |
+
+### `runner_selector`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `allow_unenforced_grants` | `false` | Allow dispatching to runners that cannot enforce all grants (must be true for k8s or Docker with exec_allowlist) |
+| `default_preference` | `any` | Default runner preference when task doesn't specify one: `local`, `remote_ssh`, `k8s`, `docker`, or `any` |
 
 ### `github`
 | Key | Default | Description |
