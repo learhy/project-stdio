@@ -232,6 +232,9 @@ def format_worker_show(
     lines.append(f"Node:   {node_id}")
     lines.append(f"State:  {state}")
     lines.append(f"Phase:  {phase}")
+    runner_type = worker.get("runner_type")
+    if runner_type:
+        lines.append(f"Runner: {runner_type}")
 
     # Age / runtime
     age_secs = _now() - created_at if created_at else 0

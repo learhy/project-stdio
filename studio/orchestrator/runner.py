@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import asyncssh
 
-from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost, K8sRunnerSettings
+from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost, K8sRunnerSettings, RunnerSelectorSettings
 from . import tls as tls_helpers
 
 if TYPE_CHECKING:
@@ -92,6 +92,28 @@ def capability_to_bwrap_args(
     args.extend(["--dev", "/dev"])
 
     return args
+
+
+def capability_to_runner_compatibility(
+    manifest: CapabilityManifest,
+) -> dict[str, dict[str, Any]]:
+    """Return per-runner compatibility info including which grants each runner enforces.
+
+    k8s runners cannot enforce exec_allowlist (no bubblewrap), so those grants
+    are reported as unenforced. local and SSH runners enforce everything.
+    """
+    compat: dict[str, dict[str, Any]] = {
+        "local": {"compatible": True, "unenforced_grants": []},
+        "remote_ssh": {"compatible": True, "unenforced_grants": []},
+        "k8s": {"compatible": True, "unenforced_grants": []},
+    }
+
+    # k8s can't enforce exec allowlists — no bwrap in containers
+    exec_grants = manifest.grants.process.exec
+    if exec_grants:
+        compat["k8s"]["unenforced_grants"] = ["exec_allowlist"]
+
+    return compat
 
 
 class WorkerSpawnResult:
@@ -1551,3 +1573,204 @@ class K8sJobWorkerRunner:
         if self._api_client:
             await self._api_client.close()
             self._api_client = None
+
+
+class RunnerSelector:
+    """Selects from multiple enabled runners per-task based on preference and capacity (Bundle 4.4).
+
+    Presents the same spawn_worker / kill_worker interface as a single runner.
+    Selection policy: runner_preference → capability compatibility → capacity → default local.
+    """
+
+    def __init__(
+        self,
+        db: "Database",
+        settings: RunnerSelectorSettings,
+        local: LocalBwrapWorkerRunner | None = None,
+        remote_ssh: RemoteSSHWorkerRunner | None = None,
+        k8s: K8sJobWorkerRunner | None = None,
+    ) -> None:
+        self._db = db
+        self._settings = settings
+        self._runners: dict[str, LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner] = {}
+        if local:
+            self._runners["local"] = local
+        if remote_ssh:
+            self._runners["remote_ssh"] = remote_ssh
+        if k8s:
+            self._runners["k8s"] = k8s
+
+    @staticmethod
+    def now() -> int:
+        return int(time.time())
+
+    def _default_preference(self) -> str:
+        """Effective default preference from settings."""
+        pref = self._settings.default_preference
+        if pref == "any":
+            return "local"
+        return pref
+
+    def _select_runner(
+        self,
+        preference: str,
+        manifest: CapabilityManifest | None = None,
+    ) -> tuple[str, LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner | None]:
+        """Pick a runner given preference and capability compatibility.
+
+        Returns (runner_type, runner_instance) or ("", None) if nothing matches.
+        """
+        available = list(self._runners.keys())
+        if not available:
+            return "", None
+
+        # Resolve "any" to concrete preference order: explicit preference → local fallback
+        candidates: list[str]
+        if preference == "any":
+            candidates = [self._default_preference()] + [r for r in available if r != self._default_preference()]
+        elif preference in self._runners:
+            candidates = [preference] + [r for r in available if r != preference]
+        else:
+            # Unknown preference — treat as "any"
+            logger.warning("Unknown runner_preference %r, falling back to available runners", preference)
+            candidates = [self._default_preference()] + [r for r in available if r != self._default_preference()]
+
+        # Check capability compatibility
+        if manifest:
+            compat = capability_to_runner_compatibility(manifest)
+            for candidate in candidates:
+                if candidate in self._runners:
+                    info = compat.get(candidate, {})
+                    if not info.get("compatible"):
+                        continue
+                    unenforced = info.get("unenforced_grants", [])
+                    if unenforced and not self._settings.allow_unenforced_grants:
+                        logger.warning(
+                            "Runner %s has unenforced grants %s, skipping (allow_unenforced_grants=false)",
+                            candidate, unenforced,
+                        )
+                        continue
+                    if unenforced:
+                        logger.info(
+                            "Runner %s: unenforced grants %s (allowed by settings)",
+                            candidate, unenforced,
+                        )
+                    return candidate, self._runners[candidate]
+        else:
+            for candidate in candidates:
+                if candidate in self._runners:
+                    return candidate, self._runners[candidate]
+
+        return "", None
+
+    async def spawn_worker(
+        self,
+        worker_id: str,
+        bundle_id: str,
+        node_id: str,
+        manifest: CapabilityManifest,
+        worktree_path: str,
+        task_spec: dict[str, Any] | None = None,
+        base_branch: str = "main",
+    ) -> WorkerSpawnResult:
+        """Select a runner and delegate spawn_worker to it."""
+        preference = "any"
+        if task_spec:
+            preference = task_spec.get("runner_preference", "any")
+
+        runner_type, runner = self._select_runner(preference, manifest)
+
+        if runner is None:
+            return WorkerSpawnResult(
+                worker_id=worker_id,
+                token="",
+                node_id=node_id,
+                error=f"No compatible runner available (preference={preference}, "
+                      f"available={sorted(self._runners.keys())})",
+            )
+
+        logger.info(
+            "RunnerSelector: worker %s → %s (preference=%s)",
+            worker_id, runner_type, preference,
+        )
+
+        result = await runner.spawn_worker(
+            worker_id=worker_id,
+            bundle_id=bundle_id,
+            node_id=node_id,
+            manifest=manifest,
+            worktree_path=worktree_path,
+            task_spec=task_spec,
+            base_branch=base_branch,
+        )
+
+        # Record runner_type on the worker row
+        if not result.error:
+            await self._db.execute(
+                "UPDATE workers SET runner_type = ? WHERE id = ?",
+                (runner_type, worker_id),
+            )
+            await self._db.conn.commit()
+
+            # Audit: runner selection
+            compat = capability_to_runner_compatibility(manifest) if manifest else {}
+            runner_compat = compat.get(runner_type, {})
+            await self._db.execute(
+                "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("runner_selected", "worker", worker_id,
+                 json.dumps({
+                     "bundle_id": bundle_id,
+                     "node_id": node_id,
+                     "runner_type": runner_type,
+                     "preference": preference,
+                     "unenforced_grants": runner_compat.get("unenforced_grants", []),
+                 }),
+                 self.now()),
+            )
+            await self._db.conn.commit()
+
+        return result
+
+    async def kill_worker(
+        self,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle,
+        worker_id: str = "",
+    ) -> None:
+        """Dispatch kill to the appropriate runner based on handle type."""
+        if isinstance(process, K8sWorkerHandle):
+            runner = self._runners.get("k8s")
+            if runner:
+                await runner.kill_worker(process, worker_id)
+        elif isinstance(process, RemoteWorkerHandle):
+            runner = self._runners.get("remote_ssh")
+            if runner:
+                await runner.kill_worker(process, worker_id)
+        else:
+            runner = self._runners.get("local")
+            if runner:
+                await runner.kill_worker(process, worker_id)
+
+    async def close(self) -> None:
+        """Close all runners that have a close method."""
+        for name, runner in self._runners.items():
+            closer = getattr(runner, "close", None)
+            if closer:
+                try:
+                    await closer()
+                except Exception as exc:
+                    logger.warning("Error closing runner %s: %s", name, exc)
+
+    async def start_watches(self) -> None:
+        """Start background watches on runners that support them (k8s)."""
+        k8s = self._runners.get("k8s")
+        if k8s and hasattr(k8s, "start_watch"):
+            await k8s.start_watch()
+
+    def get_runner(self, name: str) -> LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner | None:
+        """Access a specific runner by name (for fleet health, CLI handlers, etc.)."""
+        return self._runners.get(name)
+
+    @property
+    def runner_names(self) -> list[str]:
+        return sorted(self._runners.keys())

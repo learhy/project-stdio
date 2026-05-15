@@ -42,7 +42,7 @@ from .rpc import (
     CAPABILITY_DENIED,
     INTERNAL_ERROR,
 )
-from .runner import LocalBwrapWorkerRunner, RemoteSSHWorkerRunner, K8sJobWorkerRunner
+from .runner import LocalBwrapWorkerRunner, RemoteSSHWorkerRunner, K8sJobWorkerRunner, RunnerSelector
 from . import tls as tls_helpers
 from .executor import DagExecutor
 from .scheduler import Scheduler
@@ -70,7 +70,7 @@ class Orchestrator:
         self.dispatcher: RpcDispatcher | None = None
         self.handlers: RpcHandlers | None = None
         self.conn_mgr: ConnectionManager | None = None
-        self.runner: LocalBwrapWorkerRunner | None = None
+        self.runner: RunnerSelector | LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner | None = None
         self.executor: DagExecutor | None = None
         self.scheduler: Scheduler | None = None
         self.reconciler: Reconciler | None = None
@@ -428,37 +428,45 @@ class Orchestrator:
                 token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
             )
             logger.info("Test mode: using NoopWorkerRunner")
-        elif self.settings.k8s_runner.enabled:
-            self.runner = K8sJobWorkerRunner(
-                self.db,
-                self.settings.k8s_runner,
-                egress_proxy=self.settings.egress_proxy,
-                token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
-                ca_cert_path=self.settings.remote_workers.tls_ca_cert_path,
-                ca_key_path=self.settings.remote_workers.tls_ca_key_path,
-            )
-            logger.info("K8s runner mode: using K8sJobWorkerRunner (ns=%s)",
-                        self.settings.k8s_runner.namespace)
-        elif self.settings.remote_fleet.enabled:
-            self.runner = RemoteSSHWorkerRunner(
-                self.db,
-                self.settings.remote_fleet,
-                egress_proxy=self.settings.egress_proxy,
-                token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
-                ca_cert_path=self.settings.remote_workers.tls_ca_cert_path,
-                ca_key_path=self.settings.remote_workers.tls_ca_key_path,
-            )
-            logger.info("Remote fleet mode: using RemoteSSHWorkerRunner with %d hosts",
-                        len(self.settings.remote_fleet.hosts))
         else:
-            self.runner = LocalBwrapWorkerRunner(
-                self.db,
-                cfg.socket_path,
+            # Bundle 4.4: instantiate all enabled runners, wrap in RunnerSelector
+            common = dict(
                 egress_proxy=self.settings.egress_proxy,
                 token_expiry_minutes=self.settings.ops.worker_token_expiry_minutes,
                 ca_cert_path=self.settings.remote_workers.tls_ca_cert_path,
                 ca_key_path=self.settings.remote_workers.tls_ca_key_path,
             )
+            local_runner = LocalBwrapWorkerRunner(
+                self.db, cfg.socket_path, **common,
+            )
+            ssh_runner: RemoteSSHWorkerRunner | None = None
+            k8s_runner: K8sJobWorkerRunner | None = None
+
+            if self.settings.remote_fleet.enabled:
+                ssh_runner = RemoteSSHWorkerRunner(
+                    self.db, self.settings.remote_fleet, **common,
+                )
+                logger.info("RemoteSSHWorkerRunner enabled (%d hosts)",
+                            len(self.settings.remote_fleet.hosts))
+            if self.settings.k8s_runner.enabled:
+                k8s_runner = K8sJobWorkerRunner(
+                    self.db, self.settings.k8s_runner, **common,
+                )
+                logger.info("K8sJobWorkerRunner enabled (ns=%s)",
+                            self.settings.k8s_runner.namespace)
+
+            self.runner = RunnerSelector(
+                self.db,
+                self.settings.runner_selector,
+                local=local_runner,
+                remote_ssh=ssh_runner,
+                k8s=k8s_runner,
+            )
+            logger.info("RunnerSelector: %s", ", ".join(self.runner.runner_names))
+
+            # Store individual runner refs for fleet health / k8s watch / CLI handlers
+            self._ssh_runner = ssh_runner
+            self._k8s_runner = k8s_runner
 
         # 5. Executor
         self.executor = DagExecutor(
@@ -518,13 +526,13 @@ class Orchestrator:
                      self.settings.ops.recall_window_hours)
 
         # 9.7. Fleet health monitoring (Bundle 4.2)
-        if self.settings.remote_fleet.enabled and isinstance(self.runner, RemoteSSHWorkerRunner):
-            self._fleet_health_task = asyncio.create_task(self._run_fleet_health_loop(self.runner))
+        if self._ssh_runner is not None:
+            self._fleet_health_task = asyncio.create_task(self._run_fleet_health_loop(self._ssh_runner))
             logger.info("Fleet health monitoring started (%d hosts)", len(self.settings.remote_fleet.hosts))
 
         # 9.8. K8s Pod event watching (Bundle 4.3)
-        if self.settings.k8s_runner.enabled and isinstance(self.runner, K8sJobWorkerRunner):
-            await self.runner.start_watch()
+        if self._k8s_runner is not None:
+            await self._k8s_runner.start_watch()
             logger.info("K8s Pod event watching started (ns=%s)", self.settings.k8s_runner.namespace)
 
         # 10. Bind Unix socket (always — workers + CLI + MCP)
@@ -576,6 +584,14 @@ class Orchestrator:
             )
             await self.db.conn.commit()
 
+        # Record runner_selector enabled state (Bundle 4.4)
+        await self.db.execute(
+            "INSERT OR REPLACE INTO settings_metadata (key, value, updated_at) "
+            "VALUES (?, ?, ?)",
+            ("runner_selector_enabled", "1", int(time.time())),
+        )
+        await self.db.conn.commit()
+
         self._running = True
 
     async def stop(self) -> None:
@@ -604,15 +620,8 @@ class Orchestrator:
             except asyncio.CancelledError:
                 pass
 
-        if self._k8s_watch_task:
-            self._k8s_watch_task.cancel()
-            try:
-                await self._k8s_watch_task
-            except asyncio.CancelledError:
-                pass
-
-        if isinstance(self.runner, K8sJobWorkerRunner):
-            await self.runner.close()
+        if self._k8s_runner is not None:
+            await self._k8s_runner.close()
 
         if self._http_server:
             self._http_server.should_exit = True
@@ -1708,12 +1717,13 @@ async def _cli_rotate_secret(app: Orchestrator, params: dict) -> dict:
 
 async def _cli_fleet_status(app: Orchestrator, params: dict) -> dict:
     """Show status of all fleet hosts (Bundle 4.2)."""
-    if not isinstance(app.runner, RemoteSSHWorkerRunner):
+    ssh_runner = app._ssh_runner
+    if ssh_runner is None:
         return {"error": "Remote fleet is not enabled. Set remote_fleet.enabled=true in settings.json."}
-    statuses = await app.runner.ping_hosts()
+    statuses = await ssh_runner.ping_hosts()
     hosts_detail = []
     for host in app.settings.remote_fleet.hosts:
-        sem = app.runner._host_semaphores.get(host.name)
+        sem = ssh_runner._host_semaphores.get(host.name)
         capacity_used = host.max_concurrent_workers
         if sem:
             # Approximate active count from semaphore
@@ -1724,7 +1734,7 @@ async def _cli_fleet_status(app: Orchestrator, params: dict) -> dict:
             "status": statuses.get(host.name, "unknown"),
             "active_workers": capacity_used,
             "max_workers": host.max_concurrent_workers,
-            "last_ping": app.runner._host_last_ping.get(host.name, 0),
+            "last_ping": ssh_runner._host_last_ping.get(host.name, 0),
         })
     return {"hosts": hosts_detail}
 
@@ -1755,9 +1765,9 @@ async def _cli_fleet_add(app: Orchestrator, params: dict) -> dict:
     app.settings.remote_fleet.hosts.append(new_host)
 
     # Add semaphore and health tracking if runner is active
-    if isinstance(app.runner, RemoteSSHWorkerRunner):
-        app.runner._host_semaphores[name] = asyncio.Semaphore(new_host.max_concurrent_workers)
-        app.runner._host_health[name] = True
+    if app._ssh_runner is not None:
+        app._ssh_runner._host_semaphores[name] = asyncio.Semaphore(new_host.max_concurrent_workers)
+        app._ssh_runner._host_health[name] = True
 
     # Persist to settings.json
     _persist_fleet_settings(app.settings)
@@ -1780,10 +1790,10 @@ async def _cli_fleet_remove(app: Orchestrator, params: dict) -> dict:
         return {"error": f"Host '{name}' not found in fleet registry."}
 
     # Remove from runner tracking
-    if isinstance(app.runner, RemoteSSHWorkerRunner):
-        app.runner._host_semaphores.pop(name, None)
-        app.runner._host_health.pop(name, None)
-        app.runner._host_last_ping.pop(name, None)
+    if app._ssh_runner is not None:
+        app._ssh_runner._host_semaphores.pop(name, None)
+        app._ssh_runner._host_health.pop(name, None)
+        app._ssh_runner._host_last_ping.pop(name, None)
 
     # Persist to settings.json
     _persist_fleet_settings(app.settings)
@@ -1793,10 +1803,10 @@ async def _cli_fleet_remove(app: Orchestrator, params: dict) -> dict:
 
 async def _cli_k8s_status(app: Orchestrator, params: dict) -> dict:
     """Show active Kubernetes Jobs in studio-workers namespace (Bundle 4.3)."""
-    if not isinstance(app.runner, K8sJobWorkerRunner):
+    if app._k8s_runner is None:
         return {"error": "K8s runner is not enabled. Set k8s_runner.enabled=true in settings.json."}
     try:
-        api_client = await app.runner._ensure_client()
+        api_client = await app._k8s_runner._ensure_client()
         batch_v1 = api_client.BatchV1Api
         jobs = await batch_v1.list_namespaced_job(
             namespace=app.settings.k8s_runner.namespace,

@@ -51,7 +51,7 @@ class DagExecutor:
         self.heartbeat_timeout_multiplier = heartbeat_timeout_multiplier
 
         # Active tracking
-        self._running_workers: dict[str, asyncio.subprocess.Process] = {}
+        self._running_workers: dict[str, asyncio.subprocess.Process | Any] = {}
         self._active_bundles: set[str] = set()
         self._artifact_events: asyncio.Queue[Any] = asyncio.Queue()
         self._artifact_store: Any = None

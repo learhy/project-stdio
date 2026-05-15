@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class DatabaseVersionError(RuntimeError):
@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS workers (
   started_at INTEGER,
   last_heartbeat INTEGER,
   ended_at INTEGER,
-  exit_reason TEXT
+  exit_reason TEXT,
+  runner_type TEXT
 );
 
 CREATE TABLE IF NOT EXISTS capabilities (
@@ -350,6 +351,21 @@ async def _migrate_v9(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         "INSERT OR IGNORE INTO settings_metadata (key, value, updated_at) VALUES (?, ?, ?)",
         ("k8s_runner_enabled", "0", 0),
+    )
+
+
+@migration(10)
+async def _migrate_v10(conn: aiosqlite.Connection) -> None:
+    """Add runner_type column to workers, record runner_selector_enabled setting (Bundle 4.4)."""
+    cursor = await conn.execute("PRAGMA table_info('workers')")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "runner_type" not in columns:
+        await conn.execute(
+            "ALTER TABLE workers ADD COLUMN runner_type TEXT"
+        )
+    await conn.execute(
+        "INSERT OR IGNORE INTO settings_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+        ("runner_selector_enabled", "0", 0),
     )
 
 
