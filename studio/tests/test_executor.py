@@ -772,13 +772,13 @@ class TestAcceptanceFirstSuccessCancellation:
 
         db_mock.fetch_all = AsyncMock()
         db_mock.fetch_all.side_effect = [
-            fired_incoming,   # _dispatch_aggregator: fired incoming
-            all_incoming,     # _cancel_aggregator_siblings: all incoming
-            [],               # _process_node_completion: outgoing edges from agg node
-            [],               # _check_bundle_completion -> _compute_bundle_status (no exit nodes)
-            [{"state": NodeState.COMPLETED}],  # fallback all nodes
-            [],               # _check_bundle_completion: failed nodes check
-            [],               # _dispatch_ready: ready nodes
+            fired_incoming,   # 0: _dispatch_aggregator: fired incoming
+            [],               # 1: _process_node_completion: outgoing edges
+            [],               # 2: _compute_bundle_status: exit nodes
+            [{"state": NodeState.COMPLETED}],  # 3: _compute_bundle_status fallback: all nodes
+            [],               # 4: _check_bundle_completion: failed nodes check
+            all_incoming,     # 5: _cancel_aggregator_siblings: all incoming
+            [],               # 6: _dispatch_ready: ready nodes
         ]
         db_mock.fetch_one = AsyncMock()
         db_mock.fetch_one.side_effect = [

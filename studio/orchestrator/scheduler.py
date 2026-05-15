@@ -6,10 +6,13 @@ Phase 1 uses FIFO scheduling by ready_at timestamp (handled in executor).
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .db import Database
+
+logger = logging.getLogger(__name__)
 
 
 class Scheduler:
@@ -61,7 +64,7 @@ class Scheduler:
                     # can transition to VERIFYING / COMPLETE.
                     await self.executor._check_bundle_completion(bundle_id)
             except Exception:
-                pass
+                logger.exception("Dispatch loop error — continuing")
             await asyncio.sleep(self.dispatch_interval)
 
     async def _heartbeat_loop(self) -> None:
@@ -70,5 +73,5 @@ class Scheduler:
             try:
                 await self.executor.check_heartbeat_timeouts()
             except Exception:
-                pass
+                logger.exception("Heartbeat check error — continuing")
             await asyncio.sleep(self.heartbeat_check_interval)

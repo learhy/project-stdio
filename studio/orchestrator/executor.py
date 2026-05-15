@@ -881,6 +881,14 @@ class DagExecutor:
         # Apply output strategy
         output = self._apply_aggregator_output(predecessor_outputs, output_strategy, reducer_name, config)
 
+        # Fire review aggregator callback for approval matrix evaluation BEFORE
+        # processing node completion, so approval gates run before downstream
+        # code workers are dispatched.
+        if node["node_id"] == "review-aggregator" and self._on_review_aggregator_complete:
+            await self._on_review_aggregator_complete(bundle_id, output or {})
+
+        await self._process_node_completion(bundle_id, node["node_id"], NodeState.COMPLETED)
+
         await self.db.execute(
             "UPDATE dag_nodes SET state = ?, ended_at = ?, output_json = ? WHERE id = ?",
             (NodeState.COMPLETED, now, json.dumps(output or {}), node["id"]),
@@ -892,13 +900,6 @@ class DagExecutor:
 
         await self.db.conn.commit()
 
-        # Fire review aggregator callback for approval matrix evaluation BEFORE
-        # processing node completion, so approval gates run before downstream
-        # code workers are dispatched.
-        if node["node_id"] == "review-aggregator" and self._on_review_aggregator_complete:
-            await self._on_review_aggregator_complete(bundle_id, output or {})
-
-        await self._process_node_completion(bundle_id, node["node_id"], NodeState.COMPLETED)
         await self._dispatch_ready(bundle_id)
 
     def _apply_aggregator_output(

@@ -133,7 +133,19 @@ class Orchestrator:
         Bundle 2.4: calls the approval matrix evaluator stub (always returns approved).
         Bundle 2.5: replaces with the real matrix evaluator.
         """
-        logger.info("Review tracks complete for bundle %s; evaluating approval matrix stub", bundle_id)
+        # Normalize aggregator output: COLLECT strategy produces a list of
+        # per-reviewer dicts; evaluator expects a dict keyed by role name.
+        if isinstance(merged, list):
+            findings_by_role: dict = {}
+            for item in merged:
+                if isinstance(item, dict):
+                    role = item.get("role", "unknown")
+                    findings_by_role[role] = item.get("findings", item)
+                else:
+                    findings_by_role.setdefault("unknown", []).append(item)
+            merged = findings_by_role
+
+        logger.info("Review tracks complete for bundle %s; evaluating approval matrix", bundle_id)
         await self._evaluate_approval_matrix(bundle_id, merged)
 
     async def _evaluate_approval_matrix(self, bundle_id: str, merged_findings: dict) -> None:
