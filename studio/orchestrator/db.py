@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class DatabaseVersionError(RuntimeError):
@@ -366,6 +366,15 @@ async def _migrate_v10(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         "INSERT OR IGNORE INTO settings_metadata (key, value, updated_at) VALUES (?, ?, ?)",
         ("runner_selector_enabled", "0", 0),
+    )
+
+
+@migration(11)
+async def _migrate_v11(conn: aiosqlite.Connection) -> None:
+    """Record docker_runner_enabled in settings_metadata (Bundle 4.5)."""
+    await conn.execute(
+        "INSERT OR IGNORE INTO settings_metadata (key, value, updated_at) VALUES (?, ?, ?)",
+        ("docker_runner_enabled", "0", 0),
     )
 
 

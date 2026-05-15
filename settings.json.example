@@ -66,6 +66,16 @@
     "worker_image": "studio-worker:latest",
     "proxy_image": "studio-proxy:latest"
   },
+  "docker_runner": {
+    "enabled": false,
+    "socket_path": "/var/run/docker.sock",
+    "worker_image": "project-stdio-worker:latest",
+    "proxy_image": "project-stdio-proxy:latest",
+    "network_prefix": "studio-worker",
+    "volume_prefix": "studio-worktree",
+    "registry": null,
+    "pull_policy": "if_not_present"
+  },
   "runner_selector": {
     "allow_unenforced_grants": false,
     "default_preference": "any"

@@ -17,6 +17,7 @@ dependencies = [
     "uvicorn>=0.46.0",
     "asyncssh>=2.23.0",
     "kubernetes-asyncio>=35.0.1",
+    "docker>=7.1.0",
 ]
 
 [project.optional-dependencies]

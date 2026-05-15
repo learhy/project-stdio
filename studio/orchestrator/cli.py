@@ -409,6 +409,65 @@ async def cmd_calibration_report() -> int:
     return 0
 
 
+async def cmd_docker_status() -> int:
+    """Show running Docker worker containers (Bundle 4.5)."""
+    resp = await _send_rpc(_get_socket_path(), "studio.docker_status", {})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    if "error" in data:
+        print(f"Error: {data['error']}", file=sys.stderr)
+        return 1
+
+    containers = data.get("containers", [])
+    if not containers:
+        print("No running Docker worker containers.")
+        return 0
+
+    print(f"{'Container ID':<14} {'Name':<28} {'Bundle ID':<28} {'Status':<14} {'Image':<20}")
+    print("-" * 104)
+    for c in containers:
+        print(f"{c.get('container_id', ''):<14} {c.get('name', ''):<28} "
+              f"{c.get('bundle_id', ''):<28} {c.get('status', ''):<14} "
+              f"{c.get('image', ''):<20}")
+    return 0
+
+
+async def cmd_docker_images() -> int:
+    """Show worker and proxy Docker images (Bundle 4.5)."""
+    resp = await _send_rpc(_get_socket_path(), "studio.docker_images", {})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    if "error" in data:
+        print(f"Error: {data['error']}", file=sys.stderr)
+        return 1
+
+    images = data.get("images", [])
+    expected_worker = data.get("expected_worker", "")
+    expected_proxy = data.get("expected_proxy", "")
+
+    print(f"Expected worker image: {expected_worker}")
+    print(f"Expected proxy image:  {expected_proxy}")
+    print()
+    if not images:
+        print("No matching images found. Build with: docker compose build")
+        return 0
+
+    print(f"{'Image ID':<14} {'Tags':<40} {'Size':<12} {'Created':<20}")
+    print("-" * 86)
+    for img in images:
+        tags = ", ".join(img.get("tags", []))
+        size_mb = img.get("size", 0) / 1_000_000
+        print(f"{img.get('id', ''):<14} {tags:<40} {size_mb:.1f} MB{'':<6} "
+              f"{img.get('created', '')[:19]:<20}")
+    return 0
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -475,6 +534,12 @@ def main() -> None:
     # k8s-status (Bundle 4.3)
     sub.add_parser("k8s-status", help="Show active Kubernetes Jobs for workers")
 
+    # docker-status (Bundle 4.5)
+    sub.add_parser("docker-status", help="Show running Docker worker containers")
+
+    # docker-images (Bundle 4.5)
+    sub.add_parser("docker-images", help="Show worker and proxy Docker images")
+
     # fleet-add (Bundle 4.2)
     p_fadd = sub.add_parser("fleet-add", help="Add a host to the remote fleet")
     p_fadd.add_argument("name", help="Host name")
@@ -526,6 +591,10 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_fleet_status())
         elif args.command == "k8s-status":
             exit_code = loop.run_until_complete(cmd_k8s_status())
+        elif args.command == "docker-status":
+            exit_code = loop.run_until_complete(cmd_docker_status())
+        elif args.command == "docker-images":
+            exit_code = loop.run_until_complete(cmd_docker_images())
         elif args.command == "fleet-add":
             exit_code = loop.run_until_complete(cmd_fleet_add(args.name, args.addr, args))
         elif args.command == "fleet-remove":
