@@ -73,8 +73,8 @@ class TestStartBundle:
     async def test_marks_entry_nodes_ready(self, executor, db_mock):
         bundle_id = "b1"
         nodes = [
-            {"id": "b1:n1", "node_id": "n1"},
-            {"id": "b1:n2", "node_id": "n2"},
+            {"id": "b1:n1", "node_id": "n1", "state": NodeState.PENDING},
+            {"id": "b1:n2", "node_id": "n2", "state": NodeState.PENDING},
         ]
         db_mock.fetch_all.return_value = nodes
         # start_bundle: n1 no edge, n2 has edge | then _dispatch_ready: _count_running_workers
@@ -777,6 +777,7 @@ class TestAcceptanceFirstSuccessCancellation:
             [],               # _process_node_completion: outgoing edges from agg node
             [],               # _check_bundle_completion -> _compute_bundle_status (no exit nodes)
             [{"state": NodeState.COMPLETED}],  # fallback all nodes
+            [],               # _check_bundle_completion: failed nodes check
             [],               # _dispatch_ready: ready nodes
         ]
         db_mock.fetch_one = AsyncMock()

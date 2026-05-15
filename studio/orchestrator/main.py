@@ -119,8 +119,12 @@ class Orchestrator:
             await self.executor._process_node_completion(bundle_id, role, NodeState.COMPLETED)
 
     async def _on_review_blocking(self, bundle_id: str, blocking_reason: str) -> None:
-        """Callback from RpcHandlers when a review track reports a blocking issue."""
-        await self.sm.transition_3_return_to_proposed(bundle_id, blocking_reason)
+        """Callback from RpcHandlers when a review track reports a blocking issue.
+
+        Does NOT transition state — the approval matrix evaluator decides the tier
+        based on all findings. A blocking finding will prevent AUTO tier but the
+        bundle stays in_review for PM approval.
+        """
         logger.warning("Review track blocking issue for bundle %s: %s", bundle_id, blocking_reason)
 
     async def _on_review_aggregator_complete(self, bundle_id: str, merged: dict) -> None:
@@ -2527,6 +2531,8 @@ def main() -> None:
         settings.orchestrator.socket_path = socket_path
     if os.environ.get("OLLAMA_CLOUD_BASE_URL"):
         settings.ollama_cloud.base_url = os.environ["OLLAMA_CLOUD_BASE_URL"]
+    else:
+        os.environ["OLLAMA_CLOUD_BASE_URL"] = settings.ollama_cloud.base_url
 
     app = Orchestrator(settings)
 

@@ -1,0 +1,26 @@
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.orchestrator
+    restart: unless-stopped
+    volumes:
+      - ./data:/var/lib/studio
+      - ./config/settings.json:/etc/studio/settings.json:ro
+      # WARNING: Mounting the Docker socket gives the orchestrator root-equivalent
+      # access to the host. This is required for the DockerWorkerRunner and is the
+      # standard pattern for container-spawning orchestrators. If this is a concern,
+      # use the K8sJobWorkerRunner instead, which scopes permissions to a namespace.
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "7810:7810"
+      - "7811:7811"
+    environment:
+      - OLLAMA_CLOUD_API_KEY=${OLLAMA_CLOUD_API_KEY}
+      - STUDIO_SOCKET_PATH=/var/lib/studio/orchestrator.sock
+    networks:
+      - studio-internal
+
+networks:
+  studio-internal:
+    driver: bridge

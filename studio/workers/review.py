@@ -246,10 +246,14 @@ def _call_llm(system_prompt: str, user_message: str) -> dict:
         "stream": False,
     }).encode("utf-8")
 
+    api_key = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
         f"{_OLLAMA_BASE_URL}/chat/completions",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
 

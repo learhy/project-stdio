@@ -42,6 +42,7 @@ class TestReconcilerReconcile:
             [{"id": "w1", "bundle_id": "b1", "node_id": "n1"}],  # running workers
             [],  # skip_downstream edges
             [],  # verifying bundles
+            [],  # in_progress bundles
         ]
 
         counts = await reconciler.reconcile()
@@ -55,6 +56,7 @@ class TestReconcilerReconcile:
             [{"id": "w1", "bundle_id": "b1", "node_id": "n1"}],
             [],  # skip_downstream
             [],  # verifying bundles
+            [],  # in_progress bundles
         ]
 
         await reconciler.reconcile()
@@ -66,6 +68,7 @@ class TestReconcilerReconcile:
         db_mock.fetch_all.side_effect = [
             [],  # no running workers
             [],  # verifying bundles
+            [],  # in_progress bundles
         ]
 
         counts = await reconciler.reconcile()
@@ -78,6 +81,7 @@ class TestReconcilerReconcile:
         db_mock.fetch_all.side_effect = [
             [],  # no running workers
             [{"id": "b2"}],  # bundles in verifying
+            [],  # in_progress bundles
         ]
 
         counts = await reconciler.reconcile()
@@ -97,6 +101,7 @@ class TestReconcilerReconcile:
             [],  # skip_downstream w2
             [],  # skip_downstream w3
             [],  # verifying bundles
+            [],  # in_progress bundles
         ]
 
         counts = await reconciler.reconcile()
@@ -110,6 +115,7 @@ class TestReconcilerReconcile:
             [{"id": "w_paused", "bundle_id": "b1", "node_id": "n1"}],
             [],
             [],
+            [],  # in_progress bundles
         ]
 
         counts = await reconciler.reconcile()
@@ -135,6 +141,7 @@ class TestReconcilerReconcile:
         db_mock.fetch_all.side_effect = [
             [],
             [],
+            [],  # in_progress bundles
         ]
 
         await reconciler.reconcile()
@@ -153,6 +160,7 @@ class TestReconcilerReconcile:
             [{"id": "w1", "bundle_id": "b1", "node_id": "n1"}],
             [],
             [],
+            [],  # in_progress bundles
         ]
         await reconciler.reconcile()
         assert sm_mock.transition_25_fail_execution.call_count == 1
@@ -164,6 +172,7 @@ class TestReconcilerReconcile:
             [{"id": "w1", "bundle_id": "b1", "node_id": "n1"}],
             [],
             [],
+            [],  # in_progress bundles
         ]
         await reconciler.reconcile()
         assert sm_mock.transition_25_fail_execution.call_count == 1

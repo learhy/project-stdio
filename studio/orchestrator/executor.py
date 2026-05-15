@@ -110,9 +110,9 @@ class DagExecutor:
         """
         self._active_bundles.add(bundle_id)
 
-        # Mark entry nodes as ready
+        # Mark entry nodes as ready (only if still pending)
         nodes = await self.db.fetch_all(
-            "SELECT id, node_id FROM dag_nodes WHERE bundle_id = ?", (bundle_id,)
+            "SELECT id, node_id, state FROM dag_nodes WHERE bundle_id = ?", (bundle_id,)
         )
 
         # Find entry nodes: those with no incoming edges
@@ -121,7 +121,7 @@ class DagExecutor:
                 "SELECT id FROM dag_edges WHERE bundle_id = ? AND to_node_id = ?",
                 (bundle_id, node["node_id"]),
             )
-            if edge is None:
+            if edge is None and node["state"] == NodeState.PENDING:
                 now = self.now()
                 await self.db.execute(
                     "UPDATE dag_nodes SET state = ?, ready_at = ? WHERE id = ?",
@@ -899,6 +899,7 @@ class DagExecutor:
             await self._on_review_aggregator_complete(bundle_id, output or {})
 
         await self._process_node_completion(bundle_id, node["node_id"], NodeState.COMPLETED)
+        await self._dispatch_ready(bundle_id)
 
     def _apply_aggregator_output(
         self,

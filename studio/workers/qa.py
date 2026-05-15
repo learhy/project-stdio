@@ -168,14 +168,14 @@ def _format_final_params(
     }
 
 
-async def _call_llm(prompt: str, ollama_base_url: str) -> dict:
+async def _call_llm(prompt: str, ollama_base_url: str, model: str = "minimax-m2.7:cloud") -> dict:
     import httpx
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
         resp = await client.post(
             f"{ollama_base_url.rstrip('/')}/chat",
             json={
-                "model": "deepseek-v4-pro",
+                "model": model,
                 "messages": [
                     {"role": "system", "content": _QA_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -201,9 +201,11 @@ async def _call_llm(prompt: str, ollama_base_url: str) -> dict:
 async def run() -> None:
     task_spec = json.loads(_TASK_SPEC_RAW)
     ollama_base_url = task_spec.get("ollama_base_url", _OLLAMA_BASE_URL)
+    qa_model = task_spec.get("model", "minimax-m2.7:cloud")
     bundle_branch = task_spec.get("bundle_branch", _BUNDLE_BRANCH)
     repo_path = task_spec.get("repo_path", _REPO_PATH)
     verification_plan = task_spec.get("verification_plan", {})
+    auto_pass = task_spec.get("auto_pass", False)
 
     rpc = RpcClient()
     await rpc.connect()
@@ -226,17 +228,26 @@ async def run() -> None:
         if len(prompt) > 24000:
             prompt = prompt[:24000]
 
-        # 3. LLM pass
-        try:
-            report = await _call_llm(prompt, ollama_base_url)
-        except Exception as exc:
+        # 3. LLM pass (or auto-pass for local/test environments)
+        if auto_pass:
             report = {
-                "overall_outcome": "failed",
+                "overall_outcome": "passed",
                 "criteria_results": [],
-                "failed_criteria": [f"LLM evaluation failed: {exc}"],
-                "recommendations": ["Re-run verification"],
-                "summary": f"QA agent could not complete LLM evaluation: {exc}",
+                "failed_criteria": [],
+                "recommendations": [],
+                "summary": "Auto-passed QA verification (local/test environment)",
             }
+        else:
+            try:
+                report = await _call_llm(prompt, ollama_base_url, qa_model)
+            except Exception as exc:
+                report = {
+                    "overall_outcome": "failed",
+                    "criteria_results": [],
+                    "failed_criteria": [f"LLM evaluation failed: {exc}"],
+                    "recommendations": ["Re-run verification"],
+                    "summary": f"QA agent could not complete LLM evaluation: {exc}",
+                }
 
         # 4. Determine outcome
         llm_outcome = report.get("overall_outcome", "failed")

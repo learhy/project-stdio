@@ -166,7 +166,7 @@ class DeveloperWorker:
 
     async def _execute_task(self) -> dict:
         objective = self.task_spec.get("objective", self.task_spec.get("idea", "execute task"))
-        model = self.task_spec.get("model", "deepseek/deepseek-v4-pro")
+        model = self.task_spec.get("model", "ollama-cloud/deepseek-v4-pro")
         gates: list[str] = self.task_spec.get("gates", [])
 
         # Set up git identity in worktree

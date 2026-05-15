@@ -104,16 +104,17 @@ class Reconciler:
         # Step 4: Replay unread approval decisions — no-op in Phase 1
         # (approval_requests table unused in Phase 1)
 
-        # Step 5: Re-tick bundles in 'verifying'
-        verifying_bundles = await self.db.fetch_all(
-            "SELECT id FROM bundles WHERE state = ?", (BundleState.VERIFYING,)
-        )
-        for b in verifying_bundles:
-            try:
-                await self.executor.start_bundle(b["id"])
-                counts["bundles_recovered"] += 1
-            except Exception:
-                pass
+        # Step 5: Re-tick bundles in 'verifying' and 'in_progress'
+        for state in (BundleState.VERIFYING, BundleState.IN_PROGRESS):
+            bundles = await self.db.fetch_all(
+                "SELECT id FROM bundles WHERE state = ?", (state,)
+            )
+            for b in bundles:
+                try:
+                    await self.executor.start_bundle(b["id"])
+                    counts["bundles_recovered"] += 1
+                except Exception:
+                    pass
 
         # Step 6: Record reconciliation event
         await self.db.execute(

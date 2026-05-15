@@ -239,12 +239,12 @@ def _call_llm(system_prompt: str, user_message: str) -> dict:
         "options": {"thinking_mode": "high"},
     }).encode()
 
+    api_key = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
     url = f"{_OLLAMA_BASE_URL}/chat/completions"
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=body, headers=headers)
 
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:

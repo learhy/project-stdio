@@ -278,6 +278,12 @@ CREATE TABLE IF NOT EXISTS review_calibration (
   actor TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS settings_metadata (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 """
 
 
