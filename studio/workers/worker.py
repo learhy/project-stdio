@@ -137,12 +137,69 @@ class Worker:
             # Check for incoming messages from orchestrator
             try:
                 msg = await self.rpc.receive(timeout=0.1)
-                if msg and msg.get("method") == "worker.inject_context":
+                if msg is None:
+                    pass
+                elif msg.get("method") == "worker.inject_context":
                     await self._handle_inject_context(msg)
+                elif msg.get("method") == "worker.describe_progress":
+                    result = await self._handle_describe_progress(msg.get("params", {}))
+                    if msg.get("id") is not None:
+                        await self.rpc.respond(msg["id"], result)
+                elif msg.get("method") == "worker.show_artifact":
+                    result = await self._handle_show_artifact(msg.get("params", {}))
+                    if msg.get("id") is not None:
+                        await self.rpc.respond(msg["id"], result)
             except Exception:
                 pass
 
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
+
+    # ── Describe progress handler (Bundle 5.2) ────────────────────────────
+
+    async def _handle_describe_progress(self, params: dict) -> dict:
+        """Return structured current state snapshot for the orchestrator."""
+        agent_running = self._agent_process is not None and self._agent_process.returncode is None
+        return {
+            "current_activity": "executing task" if agent_running else "idle",
+            "completed_steps": getattr(self, '_completed_steps', []),
+            "planned_steps": getattr(self, '_planned_steps', []),
+            "blockers": getattr(self, '_blockers', []),
+            "confidence": "medium",
+            "recent_tool_calls": getattr(self, '_recent_tool_calls', [])[-5:],
+            "agent_running": agent_running,
+            "objective": self.task_spec.get("objective", "")[:200],
+        }
+
+    # ── Show artifact handler (Bundle 5.2) ────────────────────────────────
+
+    async def _handle_show_artifact(self, params: dict) -> dict:
+        """Return the current contents of a file within the worktree."""
+        path = params.get("path", "")
+        if not path:
+            return {"error": "path is required"}
+
+        import os
+        cwd = os.getcwd()
+        full_path = os.path.join(cwd, path)
+
+        # Security: refuse absolute paths and path traversal
+        if os.path.isabs(path) or ".." in path.split(os.sep):
+            return {"path": path, "error": "path traversal denied"}
+
+        try:
+            st = os.stat(full_path)
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            return {
+                "path": path,
+                "content": content[:100_000],
+                "size_bytes": st.st_size,
+                "last_modified": int(st.st_mtime),
+            }
+        except FileNotFoundError:
+            return {"path": path, "error": "file not found"}
+        except Exception as exc:
+            return {"path": path, "error": str(exc)}
 
     # ── Inject context handler (Bundle 5.1) ───────────────────────────────
 

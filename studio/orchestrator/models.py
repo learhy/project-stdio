@@ -698,6 +698,16 @@ class OpsSettings(BaseModel):
     worker_token_expiry_minutes: int = 15
 
 
+class ReviewSettings(BaseModel):
+    """Review scheduler and LLM evaluation configuration (Bundle 5.2)."""
+    enabled: bool = True
+    interval_minutes: int = 10
+    time_divergence_threshold: float = 1.5
+    checkpoint_silence_minutes: int = 15
+    min_interval_seconds: int = 120
+    model: str | None = None
+
+
 class RemoteWorkersSettings(BaseModel):
     """TCP/TLS listener for remote worker connections with mutual TLS (Bundle 4.1)."""
     enabled: bool = False
@@ -774,6 +784,7 @@ class Settings(BaseModel):
     github: GitHubSettings = Field(default_factory=GitHubSettings)
     approval: ApprovalSettings = Field(default_factory=ApprovalSettings)
     ops: OpsSettings = Field(default_factory=OpsSettings)
+    review: ReviewSettings = Field(default_factory=ReviewSettings)
     secrets_config: list[SecretsConfigEntry] = Field(default_factory=list)
 
 

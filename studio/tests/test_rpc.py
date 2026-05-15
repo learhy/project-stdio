@@ -1,6 +1,7 @@
 """Tests for rpc.py — JSON-RPC dispatcher, handlers, connection manager."""
 import asyncio
 import json
+import os
 import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -770,3 +771,228 @@ class TestEdgeCases:
         # Binding should be cleaned up
         assert "w1" not in conn_mgr._by_worker_id
         writer.close.assert_called()
+
+
+# ── Bundle 5.2: Review scheduler and LLM evaluation ──────────────────────────
+
+class TestBundleFiveTwo:
+    """Tests for ReviewScheduler triggers, LLM verdict parsing, and deduplication."""
+
+    @pytest.fixture
+    def review_settings(self):
+        from studio.orchestrator.models import ReviewSettings
+        return ReviewSettings(
+            enabled=True, interval_minutes=10,
+            time_divergence_threshold=1.5, checkpoint_silence_minutes=15,
+            min_interval_seconds=120, model=None,
+        )
+
+    @pytest.fixture
+    def review_scheduler(self, db_mock, review_settings, handlers):
+        from studio.orchestrator.review import ReviewScheduler
+        conn_mgr = MagicMock()
+        conn_mgr.call_worker = AsyncMock(return_value=None)
+        rs = ReviewScheduler(db_mock, review_settings, handlers, conn_mgr)
+        return rs
+
+    # ── Trigger evaluation ─────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_time_trigger_fires_after_interval(self, review_scheduler, db_mock):
+        """Worker running > interval_minutes and > 5 min should trigger time review."""
+        now = int(time.time())
+        worker = {
+            "id": "w1", "bundle_id": "b1", "node_id": "n1",
+            "last_heartbeat": now, "created_at": now - 900,
+            "started_at": now - 900, "last_reviewed_at": 0,
+            "questions_asked": 2, "proposal_json": "{}",
+        }
+        db_mock.fetch_one = AsyncMock(return_value=None)
+        await review_scheduler._evaluate_triggers(worker, now)
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "review.triggered" in str(c[0][1])]
+        assert len(audit_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_skip_worker_running_too_early(self, review_scheduler, db_mock):
+        """Worker running < 5 minutes should be skipped."""
+        now = int(time.time())
+        worker = {
+            "id": "w2", "bundle_id": "b2", "node_id": "n2",
+            "last_heartbeat": now, "created_at": now - 180,
+            "started_at": now - 180, "last_reviewed_at": 0,
+            "questions_asked": 1, "proposal_json": "{}",
+        }
+        db_mock.fetch_one = AsyncMock(return_value=None)
+        await review_scheduler._evaluate_triggers(worker, now)
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "review.triggered" in str(c[0][1])]
+        assert len(audit_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_dedup_skips_recently_reviewed(self, review_scheduler, db_mock):
+        """Worker reviewed within min_interval_seconds should be skipped."""
+        now = int(time.time())
+        worker = {
+            "id": "w3", "bundle_id": "b3", "node_id": "n3",
+            "last_heartbeat": now, "created_at": now - 900,
+            "started_at": now - 900, "last_reviewed_at": now - 30,
+            "questions_asked": 3, "proposal_json": "{}",
+        }
+        db_mock.fetch_one = AsyncMock(return_value=None)
+        await review_scheduler._evaluate_triggers(worker, now)
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "review.triggered" in str(c[0][1])]
+        assert len(audit_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_wall_time_divergence_trigger(self, review_scheduler, db_mock):
+        """Worker elapsed time > 1.5x estimate triggers anomaly review."""
+        now = int(time.time())
+        worker = {
+            "id": "w4", "bundle_id": "b4", "node_id": "n4",
+            "last_heartbeat": now, "created_at": now - 500,
+            "started_at": now - 500, "last_reviewed_at": 0,
+            "questions_asked": 1,
+            "proposal_json": json.dumps({"proposal": {"estimated_duration_seconds": 200}}),
+        }
+        db_mock.fetch_one = AsyncMock(return_value=None)
+        await review_scheduler._evaluate_triggers(worker, now)
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "review.triggered" in str(c[0][1])]
+        assert len(audit_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_silence_trigger(self, review_scheduler, db_mock):
+        """No checkpoint in silence_minutes on long task triggers review."""
+        now = int(time.time())
+        worker = {
+            "id": "w5", "bundle_id": "b5", "node_id": "n5",
+            "last_heartbeat": now, "created_at": now - 1200,
+            "started_at": now - 1200, "last_reviewed_at": 0,
+            "questions_asked": 1,
+            "proposal_json": json.dumps({"proposal": {"estimated_duration_seconds": 1200}}),
+        }
+        # No checkpoints found, and _review_worker context fetch returns None to short-circuit
+        db_mock.fetch_one = AsyncMock(return_value={"last_cp": 0})
+
+        await review_scheduler._evaluate_triggers(worker, now)
+
+        # Check that review was triggered via audit log
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "review.triggered" in str(c[0][1])]
+        assert len(audit_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_silence_not_triggered_for_short_task(self, review_scheduler, db_mock):
+        """Short tasks (<10 min estimated, no divergence) skip checkpoint check."""
+        now = int(time.time())
+        worker = {
+            "id": "w6", "bundle_id": "b6", "node_id": "n6",
+            "last_heartbeat": now, "created_at": now - 400,
+            "started_at": now - 400, "last_reviewed_at": 0,
+            "questions_asked": 1,
+            "proposal_json": json.dumps({"proposal": {"estimated_duration_seconds": 300}}),
+        }
+        await review_scheduler._evaluate_triggers(worker, now)
+        # Should not trigger review at all
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "review.triggered" in str(c[0][1])]
+        assert len(audit_calls) == 0
+
+    # ── LLM verdict parsing ────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_parse_valid_llm_verdict(self, review_scheduler):
+        """Valid JSON verdict from LLM is parsed correctly."""
+        raw = json.dumps({
+            "verdict": "on_track",
+            "confidence": "high",
+            "rationale": "Worker is making good progress.",
+            "action": {"type": "none"},
+        })
+        with patch.object(review_scheduler, '_ollama_call', return_value=raw):
+            verdict = await review_scheduler._call_review_llm({"objective": "test"})
+        assert verdict["verdict"] == "on_track"
+        assert verdict["confidence"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_parse_llm_verdict_with_fences(self, review_scheduler):
+        """JSON wrapped in markdown code fences is parsed correctly."""
+        raw = '```json\n{"verdict": "request_clarification", "confidence": "medium", "rationale": "Unclear approach.", "action": {"type": "inject_context", "content": "Please explain your plan."}}\n```'
+        with patch.object(review_scheduler, '_ollama_call', return_value=raw):
+            verdict = await review_scheduler._call_review_llm({"objective": "test"})
+        assert verdict["verdict"] == "request_clarification"
+        assert verdict["action"]["type"] == "inject_context"
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_defaults_on_track(self, review_scheduler):
+        """When LLM returns invalid JSON, defaults to on_track."""
+        with patch.object(review_scheduler, '_ollama_call', return_value="not json"):
+            verdict = await review_scheduler._call_review_llm({"objective": "test"})
+        assert verdict["verdict"] == "on_track"
+        assert verdict["confidence"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_llm_call_returns_none_when_no_api_key(self, review_scheduler):
+        """When no API key is set, _ollama_call returns None."""
+        with patch.dict(os.environ, {}, clear=True):
+            result = review_scheduler._ollama_call("test prompt")
+        assert result is None
+
+    # ── Verdict handling ───────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_handle_on_track_verdict(self, review_scheduler, db_mock):
+        """on_track verdict: audit logged, no intervention."""
+        verdict = {
+            "verdict": "on_track", "confidence": "high",
+            "rationale": "Looking good.", "action": {"type": "none"},
+        }
+        await review_scheduler._handle_verdict("w1", "b1", "n1", verdict, "time_trigger")
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "review.verdict" in str(c[0][1])]
+        assert len(audit_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_handle_escalate_verdict(self, review_scheduler, db_mock):
+        """escalate_to_human verdict: audit log with escalation."""
+        verdict = {
+            "verdict": "escalate_to_human", "confidence": "high",
+            "rationale": "Worker is stuck.",
+            "action": {"type": "escalate", "escalation_reason": "Repeated failures"},
+        }
+        await review_scheduler._handle_verdict("w1", "b1", "n1", verdict, "time_trigger")
+        escalate_calls = [c for c in db_mock.execute.call_args_list
+                          if "review.escalated_to_human" in str(c[0][1])]
+        assert len(escalate_calls) == 1
+
+    # ── trigger_review (PM-initiated) ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_trigger_review_records_audit(self, review_scheduler, db_mock):
+        """trigger_review records audit entry and sets last_reviewed_at."""
+        with patch.object(review_scheduler, '_collect_review_context',
+                          return_value={"objective": "test"}), \
+             patch.object(review_scheduler, '_call_review_llm',
+                          return_value={"verdict": "on_track", "confidence": "high",
+                                        "rationale": "OK", "action": {"type": "none"}}):
+            await review_scheduler.trigger_review("w1", "b1", "n1", "pm_initiated")
+
+        audit_calls = [c for c in db_mock.execute.call_args_list
+                       if "review.triggered" in str(c[0][1])]
+        assert len(audit_calls) == 1
+
+        # Verify last_reviewed_at was updated
+        update_calls = [c for c in db_mock.execute.call_args_list
+                        if "last_reviewed_at" in str(c[0][0])]
+        assert len(update_calls) == 1
+
+    # ── Handler count unchanged for Bundle 5.2 ─────────────────────────────
+
+    def test_handler_count_unchanged(self, db_mock, tmp_path):
+        """Bundle 5.2 does not add new RPC handlers — describe_progress/show_artifact
+        are worker-side only (orchestrator sends requests, worker responds)."""
+        sp = str(tmp_path / "test.sock")
+        dispatcher, _, _ = create_rpc_system(db_mock, sp)
+        assert len(dispatcher._handlers) == 27

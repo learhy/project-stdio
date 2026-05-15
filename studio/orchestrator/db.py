@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 class DatabaseVersionError(RuntimeError):
@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS workers (
   ended_at INTEGER,
   exit_reason TEXT,
   runner_type TEXT,
-  questions_asked INTEGER NOT NULL DEFAULT 0
+  questions_asked INTEGER NOT NULL DEFAULT 0,
+  last_reviewed_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS capabilities (
@@ -440,6 +441,17 @@ async def _migrate_v12(conn: aiosqlite.Connection) -> None:
           created_at INTEGER NOT NULL
         );
     """)
+
+
+@migration(13)
+async def _migrate_v13(conn: aiosqlite.Connection) -> None:
+    """Add last_reviewed_at column to workers for review deduplication (Bundle 5.2)."""
+    cursor = await conn.execute("PRAGMA table_info('workers')")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "last_reviewed_at" not in columns:
+        await conn.execute(
+            "ALTER TABLE workers ADD COLUMN last_reviewed_at INTEGER"
+        )
 
 
 class Database:

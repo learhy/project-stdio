@@ -56,6 +56,7 @@ from .approval import (
 from .artifact import SecretStore
 from .ops import OpsTooling
 from .notify import Notifier
+from .review import ReviewScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,8 @@ class Orchestrator:
         self._k8s_runner: "K8sJobWorkerRunner | None" = None
         self._docker_runner: "DockerWorkerRunner | None" = None
         self._secret_store: "SecretStore | None" = None
+        self._review_scheduler: ReviewScheduler | None = None
+        self._review_task: asyncio.Task | None = None
         self._running = False
 
     async def _on_bundler_report(self, bundle_id: str, proposal: dict) -> None:
@@ -308,6 +311,16 @@ class Orchestrator:
         except ValueError:
             logger.warning("Cannot send inject_context: worker %s not connected", worker_id)
 
+    # ── Checkpoint callback (Bundle 5.2) ─────────────────────────────────
+
+    async def _on_worker_checkpoint(self, worker_id: str, bundle_id: str,
+                                    node_id: str, checkpoint_data: dict) -> None:
+        """Post-checkpoint review trigger: ask ReviewScheduler to evaluate."""
+        if self._review_scheduler is not None:
+            await self._review_scheduler.trigger_review(
+                worker_id, bundle_id, node_id, "post_checkpoint",
+            )
+
     # ── Calibration loop ───────────────────────────────────────────────────
 
     async def _record_calibration(self, bundle_id: str) -> None:
@@ -445,6 +458,9 @@ class Orchestrator:
         # Wire inject_context callback (Bundle 5.1)
         self.handlers.set_on_inject_context(self._on_inject_context)
 
+        # Wire checkpoint callback for post-checkpoint reviews (Bundle 5.2)
+        self.handlers.set_on_checkpoint(self._on_worker_checkpoint)
+
         # 3.5. Secret store (hybrid file+env, Bundle 3.4)
         self._secret_store = SecretStore(
             self.settings.secrets_config,
@@ -543,6 +559,14 @@ class Orchestrator:
         # 9. Start periodic loops
         await self.scheduler.start()
         logger.info("Scheduler started")
+
+        # 9.1. Start review scheduler (Bundle 5.2)
+        if self.settings.review.enabled:
+            self._review_scheduler = ReviewScheduler(
+                self.db, self.settings.review, self.handlers, self.conn_mgr,
+            )
+            await self._review_scheduler.start()
+            logger.info("ReviewScheduler started")
 
         # 9.5. Start HTTP server + GitHub polling (if enabled)
         if self.settings.github.enabled:
@@ -684,6 +708,9 @@ class Orchestrator:
 
         if self.github_client:
             await self.github_client.close()
+
+        if self._review_scheduler:
+            await self._review_scheduler.stop()
 
         if self.scheduler:
             await self.scheduler.stop()
@@ -1933,6 +1960,28 @@ async def _cli_docker_images(app: Orchestrator, params: dict) -> dict:
         return {"error": f"Failed to list Docker images: {exc}"}
 
 
+async def _cli_review_worker(app: Orchestrator, params: dict) -> dict:
+    """PM-initiated review of a specific worker (Bundle 5.2)."""
+    worker_id = params.get("worker_id", "")
+    if not worker_id:
+        return {"error": "worker_id is required"}
+
+    if app._review_scheduler is None:
+        return {"error": "Review scheduler is not enabled. Set review.enabled=true in settings.json."}
+
+    row = await app.db.fetch_one(
+        "SELECT bundle_id, node_id FROM workers WHERE id = ? AND state = ?",
+        (worker_id, "running"),
+    )
+    if row is None:
+        return {"error": f"Worker {worker_id} not found or not running"}
+
+    verdict = await app._review_scheduler.trigger_review(
+        worker_id, row["bundle_id"], row["node_id"], "pm_initiated",
+    )
+    return {"reviewed": True, "worker_id": worker_id, "verdict": verdict}
+
+
 def _persist_fleet_settings(settings: Settings) -> None:
     """Write current fleet settings back to settings.json."""
     import json as _json
@@ -1981,6 +2030,7 @@ _CLI_HANDLERS = {
     "studio.k8s_status": _cli_k8s_status,
     "studio.docker_status": _cli_docker_status,
     "studio.docker_images": _cli_docker_images,
+    "studio.review_worker": _cli_review_worker,
 }
 
 

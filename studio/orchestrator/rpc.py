@@ -225,6 +225,7 @@ class RpcHandlers:
         self._on_review_blocking: Callable[[str, str], Awaitable[None]] | None = None
         self._on_qa_pass: Callable[[str, dict], Awaitable[None]] | None = None
         self._on_qa_fail: Callable[[str, str, dict], Awaitable[None]] | None = None
+        self._on_checkpoint: Callable[[str, str, str, dict], Awaitable[None]] | None = None
         self._on_inject_context: Callable[[str, str, str, str, str | None], Awaitable[None]] | None = None
         self._artifact_store: "ArtifactStore | None" = None
         self._secret_store: "SecretStore | None" = None
@@ -264,6 +265,10 @@ class RpcHandlers:
     def set_on_qa_fail(self, cb: Callable[[str, str, dict], Awaitable[None]]) -> None:
         """Callback: on_qa_fail(bundle_id, reason, verification_report)."""
         self._on_qa_fail = cb
+
+    def set_on_checkpoint(self, cb: Callable[[str, str, str, dict], Awaitable[None]]) -> None:
+        """Callback: on_checkpoint(worker_id, bundle_id, node_id, checkpoint_data)."""
+        self._on_checkpoint = cb
 
     def set_on_inject_context(self, cb: Callable[[str, str, str, str, str | None], Awaitable[None]]) -> None:
         """Callback: on_inject_context(worker_id, injection_id, type, content, question_id)."""
@@ -1186,6 +1191,15 @@ class RpcHandlers:
              json.dumps({"checkpoint_id": checkpoint_id, "phase_completed": phase_completed}), now),
         )
         await self.db.conn.commit()
+
+        # Fire post-checkpoint review (Bundle 5.2)
+        if self._on_checkpoint:
+            await self._on_checkpoint(
+                binding.worker_id, binding.bundle_id, binding.node_id,
+                {"checkpoint_id": checkpoint_id, "phase_completed": phase_completed,
+                 "phase_starting": phase_starting, "summary": summary,
+                 "concerns": concerns, "estimated_remaining": estimated_remaining},
+            )
 
         return {"accepted": True, "checkpoint_id": checkpoint_id}
 
