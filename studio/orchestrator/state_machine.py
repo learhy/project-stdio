@@ -372,7 +372,7 @@ class BundleStateMachine:
                 await self.db.execute(
                     "INSERT INTO dag_nodes (id, bundle_id, node_id, kind, spec_json, state) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    (node_db_id, bundle_id, role, "worker", spec, "pending"),
+                    (node_db_id, bundle_id, role, "review_worker", spec, "pending"),
                 )
 
             # Inject review aggregator node

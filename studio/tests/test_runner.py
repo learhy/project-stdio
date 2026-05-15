@@ -399,3 +399,68 @@ class TestWorkerRespawn:
                         if "DELETE FROM workers" in str(c[0][0])]
         assert len(delete_calls) == 0
         assert result.worker_id == "w4"
+
+
+class TestWorkerTypeRouting:
+    """Tests for worker_type parameter: review workers run studio-review."""
+
+    @pytest.fixture
+    def db_mock(self):
+        db = MagicMock()
+        db.execute = AsyncMock()
+        db.fetch_one = AsyncMock(return_value=None)
+        db.conn = MagicMock()
+        db.conn.commit = AsyncMock()
+        return db
+
+    @pytest.fixture
+    def runner(self, db_mock):
+        return LocalBwrapWorkerRunner(db_mock, "/run/studio/test.sock")
+
+    @pytest.mark.asyncio
+    async def test_review_worker_uses_studio_review_command(self, runner, db_mock):
+        """worker_type='review' spawns studio-review instead of studio-worker."""
+        manifest = make_manifest()
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt",
+                                          worker_type="review")
+
+        cmd = mock_spawn.call_args[0]
+        assert "studio-review" in cmd
+        assert "studio-worker" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_developer_worker_uses_default_worker_command(self, runner, db_mock):
+        """Default worker_type='developer' uses the configured worker_command."""
+        manifest = make_manifest()
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
+
+        cmd = mock_spawn.call_args[0]
+        assert "studio-worker" in cmd
+
+    @pytest.mark.asyncio
+    async def test_review_worker_with_bwrap_includes_studio_review(self, runner, db_mock):
+        """worker_type='review' with bwrap spawns bwrap + studio-review."""
+        manifest = make_manifest()
+        runner._bwrap_available = True
+        with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt",
+                                          worker_type="review")
+
+        cmd = mock_spawn.call_args[0]
+        assert "bwrap" in cmd
+        assert "studio-review" in cmd
+        assert "studio-worker" not in cmd

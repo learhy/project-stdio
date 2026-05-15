@@ -607,7 +607,11 @@ class DagExecutor:
         return dispatched
 
     async def _dispatch_worker(self, bundle_id: str, node: Any) -> None:
-        """Spawn a worker subprocess for a ready worker node."""
+        """Spawn a worker subprocess for a ready worker node.
+
+        Routes review_worker nodes to studio-review (review.py) and regular
+        worker nodes to studio-worker (developer.py).
+        """
         worker_id = f"w_{node['id'].replace(':', '_')}"
 
         manifest = CapabilityManifest(
@@ -623,19 +627,29 @@ class DagExecutor:
             metadata={"rationale": "auto-generated"},
         )
 
+        node_kind = node["kind"]
+
         try:
             spec = json.loads(node["spec_json"])
         except (json.JSONDecodeError, TypeError):
             spec = {}
 
-        # Normalize: ensure objective is always present for the worker
-        inner = spec.get("spec", spec)
-        if isinstance(inner, dict):
-            normalized = dict(inner)
+        if node_kind == "review_worker":
+            # Review workers get the full spec as-is (role, proposal data, etc.)
+            worker_type = "review"
+            normalized = spec
             if "objective" not in normalized:
-                normalized["objective"] = inner.get("description") or inner.get("capability") or "execute task"
+                normalized["objective"] = f"Review bundle {bundle_id} as {node['node_id']}"
         else:
-            normalized = {"objective": str(inner)}
+            # Developer workers: extract objective from spec
+            worker_type = "developer"
+            inner = spec.get("spec", spec)
+            if isinstance(inner, dict):
+                normalized = dict(inner)
+                if "objective" not in normalized:
+                    normalized["objective"] = inner.get("description") or inner.get("capability") or "execute task"
+            else:
+                normalized = {"objective": str(inner)}
 
         worktree_path = f"/tmp/studio-worktrees/{bundle_id}/{node['node_id']}"
 
@@ -663,6 +677,7 @@ class DagExecutor:
             worktree_path=worktree_path,
             task_spec=normalized,
             target=target,
+            worker_type=worker_type,
         )
 
         if result.error:

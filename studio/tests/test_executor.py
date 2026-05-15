@@ -1002,3 +1002,129 @@ class TestDispatchAggregatorOrdering:
             f"Expected approval before completion, got {call_order}"
         )
 
+
+class TestWorkerRouting:
+    """Tests for review_worker routing: review_worker nodes run studio-review
+    instead of studio-worker."""
+
+    @pytest.fixture
+    def executor(self, db_mock, sm_mock, runner_mock, rpc_handlers_mock, conn_mgr_mock):
+        return DagExecutor(
+            db=db_mock, sm=sm_mock, runner=runner_mock,
+            rpc_handlers=rpc_handlers_mock, conn_mgr=conn_mgr_mock,
+        )
+
+    @pytest.mark.asyncio
+    async def test_review_worker_passes_worker_type_review(self, executor, db_mock, runner_mock):
+        """review_worker kind passes worker_type='review' to runner.spawn_worker."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"proposal_json": "{}"},  # bundle proposal
+            {"cnt": 0},  # _count_running_workers
+        ]
+        db_mock.fetch_all = AsyncMock()
+
+        result = MagicMock()
+        result.worker_id = "w_b1_adversarial"
+        result.process = MagicMock()
+        result.error = None
+        runner_mock.spawn_worker.return_value = result
+
+        node = {
+            "id": "b1:adversarial", "node_id": "adversarial", "kind": "review_worker",
+            "spec_json": json.dumps({"role": "adversarial", "proposal": {"title": "test"}}),
+        }
+
+        await executor._dispatch_worker("b1", node)
+
+        call_kwargs = runner_mock.spawn_worker.call_args.kwargs
+        assert call_kwargs["worker_type"] == "review"
+
+    @pytest.mark.asyncio
+    async def test_regular_worker_passes_worker_type_developer(self, executor, db_mock, runner_mock):
+        """Regular worker kind passes worker_type='developer' to runner.spawn_worker."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"proposal_json": "{}"},  # bundle proposal
+            {"cnt": 0},  # _count_running_workers
+        ]
+        db_mock.fetch_all = AsyncMock()
+
+        result = MagicMock()
+        result.worker_id = "w_b1_n1"
+        result.process = MagicMock()
+        result.error = None
+        runner_mock.spawn_worker.return_value = result
+
+        node = {
+            "id": "b1:n1", "node_id": "n1", "kind": "worker",
+            "spec_json": json.dumps({"spec": {"objective": "write code"}}),
+        }
+
+        await executor._dispatch_worker("b1", node)
+
+        call_kwargs = runner_mock.spawn_worker.call_args.kwargs
+        assert call_kwargs["worker_type"] == "developer"
+
+    @pytest.mark.asyncio
+    async def test_review_worker_keeps_full_spec(self, executor, db_mock, runner_mock):
+        """review_worker task_spec preserves the full spec including role and proposal data."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"proposal_json": "{}"},  # bundle proposal
+            {"cnt": 0},  # _count_running_workers
+        ]
+        db_mock.fetch_all = AsyncMock()
+
+        result = MagicMock()
+        result.worker_id = "w_b1_security"
+        result.process = MagicMock()
+        result.error = None
+        runner_mock.spawn_worker.return_value = result
+
+        original_spec = {
+            "role": "security",
+            "proposal_json": {"title": "API bundle", "risk": "high"},
+            "acceptance_criteria": ["no secrets exposed", "input validation"],
+        }
+
+        node = {
+            "id": "b1:security", "node_id": "security", "kind": "review_worker",
+            "spec_json": json.dumps(original_spec),
+        }
+
+        await executor._dispatch_worker("b1", node)
+
+        call_kwargs = runner_mock.spawn_worker.call_args.kwargs
+        task_spec = call_kwargs["task_spec"]
+        assert task_spec["role"] == "security"
+        assert task_spec["proposal_json"] == {"title": "API bundle", "risk": "high"}
+        assert "acceptance_criteria" in task_spec
+
+    @pytest.mark.asyncio
+    async def test_developer_worker_extracts_objective_from_spec(self, executor, db_mock, runner_mock):
+        """Developer worker extracts objective from the 'spec' wrapper."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"proposal_json": "{}"},  # bundle proposal
+            {"cnt": 0},  # _count_running_workers
+        ]
+        db_mock.fetch_all = AsyncMock()
+
+        result = MagicMock()
+        result.worker_id = "w_b1_n1"
+        result.process = MagicMock()
+        result.error = None
+        runner_mock.spawn_worker.return_value = result
+
+        node = {
+            "id": "b1:n1", "node_id": "n1", "kind": "worker",
+            "spec_json": json.dumps({"spec": {"objective": "add login page"}}),
+        }
+
+        await executor._dispatch_worker("b1", node)
+
+        call_kwargs = runner_mock.spawn_worker.call_args.kwargs
+        task_spec = call_kwargs["task_spec"]
+        assert task_spec["objective"] == "add login page"
+

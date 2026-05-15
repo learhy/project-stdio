@@ -262,6 +262,7 @@ class LocalBwrapWorkerRunner:
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
         target: str = "existing-repo",
+        worker_type: str = "developer",
     ) -> WorkerSpawnResult:
         """Spawn a worker subprocess in a bubblewrap container with egress proxy.
 
@@ -272,6 +273,9 @@ class LocalBwrapWorkerRunner:
 
         When target is 'new-repo', initializes an empty git repository
         instead of creating a worktree from the base branch.
+
+        worker_type "review" runs studio-review (review.py); "developer" runs
+        the configured worker_command (default studio-worker / developer.py).
         """
         token = _generate_token()
         token_expires_at = self.now() + (self.token_expiry_minutes * 60)
@@ -391,12 +395,13 @@ class LocalBwrapWorkerRunner:
                 self._bwrap_available = await self._check_bwrap()
         use_bwrap = self._bwrap_available
 
+        worker_cmd = ["studio-review"] if worker_type == "review" else self.worker_command
         # Build bwrap args or run directly
         if use_bwrap:
             bwrap_args = capability_to_bwrap_args(manifest, worktree_path, self.socket_path, proxy_socket)
-            cmd = [*bwrap_args, *self.worker_command]
+            cmd = [*bwrap_args, *worker_cmd]
         else:
-            cmd = [*self.worker_command]
+            cmd = [*worker_cmd]
 
         # http_proxy over Unix socket: httpx and some tools support this
         worker_env = {
@@ -599,6 +604,7 @@ class NoopWorkerRunner:
         worktree_path: str,
         task_spec: dict[str, Any] | None = None,
         target: str = "existing-repo",
+        worker_type: str = "developer",
     ) -> WorkerSpawnResult:
         token = _generate_token()
         token_expires_at = int(time.time()) + (self.token_expiry_minutes * 60)
@@ -779,6 +785,7 @@ class RemoteSSHWorkerRunner:
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
         target: str = "existing-repo",
+        worker_type: str = "developer",
     ) -> WorkerSpawnResult:
         """Spawn a worker on a remote fleet host via SSH + bubblewrap."""
         token = _generate_token()
@@ -915,7 +922,8 @@ class RemoteSSHWorkerRunner:
                 worker_env["STUDIO_WORKER_KEY"] = f"{workdir}/worker.key"
                 worker_env["STUDIO_ORCHESTRATOR_CA"] = f"{workdir}/ca.crt"
 
-            cmd_parts = bwrap_args + self.worker_command
+            worker_cmd = ["studio-review"] if worker_type == "review" else self.worker_command
+            cmd_parts = bwrap_args + worker_cmd
             cmd_str = " ".join(cmd_parts)
 
             worker_env_str = " ".join(
@@ -1458,6 +1466,7 @@ class K8sJobWorkerRunner:
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
         target: str = "existing-repo",
+        worker_type: str = "developer",
     ) -> WorkerSpawnResult:
         """Spawn a worker as a Kubernetes Job in the configured namespace."""
         token = _generate_token()
@@ -1895,6 +1904,7 @@ class DockerWorkerRunner:
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
         target: str = "existing-repo",
+        worker_type: str = "developer",
     ) -> WorkerSpawnResult:
         token = _generate_token()
         token_expires_at = self.now() + (self._token_expiry_minutes * 60)
@@ -2210,6 +2220,7 @@ class RunnerSelector:
         task_spec: dict[str, Any] | None = None,
         base_branch: str = "main",
         target: str = "existing-repo",
+        worker_type: str = "developer",
     ) -> WorkerSpawnResult:
         """Select a runner and delegate spawn_worker to it."""
         preference = "any"
@@ -2241,6 +2252,7 @@ class RunnerSelector:
             task_spec=task_spec,
             base_branch=base_branch,
             target=target,
+            worker_type=worker_type,
         )
 
         # Record runner_type on the worker row
