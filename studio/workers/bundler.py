@@ -22,7 +22,7 @@ _BUNDLE_ID = os.environ.get("STUDIO_BUNDLE_ID", "unknown")
 _NODE_ID = os.environ.get("STUDIO_NODE_ID", "bundler")
 _TASK_SPEC_RAW = os.environ.get("STUDIO_TASK_SPEC", "{}")
 _HEARTBEAT_INTERVAL = float(os.environ.get("STUDIO_HEARTBEAT_INTERVAL", "30"))
-_OLLAMA_BASE_URL = os.environ.get("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/api")
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/v1")
 
 # ── Bundler system prompt ─────────────────────────────────────────────────────
 
@@ -66,7 +66,13 @@ Respond with a single JSON object matching this schema exactly:
       {
         "id": "<string>",
         "kind": "worker | gate | aggregator",
-        "spec": { ... }
+        "spec": {
+          "objective": "<required: exact task this worker must complete>",
+          "capability": "<code | file | documentation | review>",
+          "description": "<what to produce and how>",
+          "language": "<python | markdown | etc>",
+          "dependencies": ["<package names>"]
+        }
       }
     ],
     "edges": [

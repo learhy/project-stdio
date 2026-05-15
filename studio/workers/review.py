@@ -22,7 +22,7 @@ _BUNDLE_ID = os.environ.get("STUDIO_BUNDLE_ID", "unknown")
 _NODE_ID = os.environ.get("STUDIO_NODE_ID", "adversarial")
 _TASK_SPEC_RAW = os.environ.get("STUDIO_TASK_SPEC", "{}")
 _HEARTBEAT_INTERVAL = float(os.environ.get("STUDIO_HEARTBEAT_INTERVAL", "30"))
-_OLLAMA_BASE_URL = os.environ.get("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/api")
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/v1")
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
@@ -247,7 +247,7 @@ def _call_llm(system_prompt: str, user_message: str) -> dict:
     }).encode("utf-8")
 
     req = urllib.request.Request(
-        f"{_OLLAMA_BASE_URL}/chat",
+        f"{_OLLAMA_BASE_URL}/chat/completions",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",

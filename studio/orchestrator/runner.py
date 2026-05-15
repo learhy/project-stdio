@@ -404,6 +404,7 @@ class LocalBwrapWorkerRunner:
             "STUDIO_WORKTREE_PATH": worktree_path,
             "STUDIO_BASE_BRANCH": base_branch,
             "STUDIO_TARGET": target,
+            "OLLAMA_CLOUD_BASE_URL": os.environ.get("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/v1"),
         }
 
         if proxy_socket:
@@ -883,6 +884,7 @@ class RemoteSSHWorkerRunner:
                 "STUDIO_WORKTREE_PATH": remote_workdir,
                 "STUDIO_BASE_BRANCH": base_branch,
                 "STUDIO_TARGET": target,
+                "OLLAMA_CLOUD_BASE_URL": os.environ.get("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/v1"),
                 "STUDIO_PROXY_SOCKET": proxy_socket,
                 "http_proxy": f"http+unix://{proxy_socket.replace('/', '%2F')}",
                 "https_proxy": f"http+unix://{proxy_socket.replace('/', '%2F')}",

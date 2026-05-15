@@ -629,7 +629,7 @@ class WorkerSettings(BaseModel):
 
 
 class OllamaCloudSettings(BaseModel):
-    base_url: str = "https://ollama.com/api"
+    base_url: str = "https://ollama.com/v1"
     health_check_interval_seconds: int = 30
     grace_window_minutes: int = 5
 

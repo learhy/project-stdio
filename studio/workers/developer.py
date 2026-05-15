@@ -31,7 +31,7 @@ _TASK_SPEC_RAW = os.environ.get("STUDIO_TASK_SPEC", "{}")
 _HEARTBEAT_INTERVAL = float(os.environ.get("STUDIO_HEARTBEAT_INTERVAL", "30"))
 _WORKTREE_PATH = os.environ.get("STUDIO_WORKTREE_PATH", "")
 _BASE_BRANCH = os.environ.get("STUDIO_BASE_BRANCH", "main")
-_OLLAMA_BASE_URL = os.environ.get("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/api")
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/v1")
 
 _STUCK_WINDOW = 20
 _STUCK_THRESHOLD = 3
