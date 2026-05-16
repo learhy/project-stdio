@@ -96,6 +96,59 @@ class VerificationStrategy(BaseModel):
 # ── Criterion scoring ─────────────────────────────────────────────────────
 
 
+def detect_artifact_type_from_idea(idea: str) -> ArtifactType:
+    """Heuristic pre-check to detect the likely artifact type from an idea string.
+
+    Called before the bundler LLM runs so it has a strong prior. The bundler
+    can override this, but major mismatches trigger a re-prompt.
+    """
+    lower = idea.lower()
+
+    # Multi-service signals
+    if any(kw in lower for kw in ("docker-compose", "docker compose",
+                                    "multiple services", "microservice",
+                                    "micro-service", "multi-service")):
+        return ArtifactType.MIXED
+
+    # Flask/FastAPI/Django + frontend = MIXED
+    web_backend = any(kw in lower for kw in ("flask", "fastapi", "express",
+                                               "django", "rails", "gin"))
+    web_frontend = any(kw in lower for kw in ("react", "vue", "angular",
+                                                "next.js", "svelte", "dashboard"))
+    if web_backend and web_frontend:
+        return ArtifactType.MIXED
+
+    # Single web backend
+    if web_backend:
+        return ArtifactType.EXECUTABLE_APP
+
+    # Frontend-only
+    if web_frontend:
+        return ArtifactType.EXECUTABLE_APP
+
+    # Library signals
+    if any(kw in lower for kw in ("library", "package", "module", "sdk",
+                                    "pip install", "npm package")):
+        return ArtifactType.LIBRARY
+
+    # Infrastructure signals
+    if any(kw in lower for kw in ("dockerfile", "helm chart", "terraform",
+                                    "kubernetes manifest", "k8s", "ansible")):
+        return ArtifactType.INFRASTRUCTURE
+
+    # Documentation-only signals
+    if any(kw in lower for kw in ("readme", "api docs", "documentation-only",
+                                    "specification document")):
+        return ArtifactType.DOCUMENTATION
+
+    # Data schema signals
+    if any(kw in lower for kw in ("sql migration", "json schema",
+                                    "openapi spec", "graphql schema")):
+        return ArtifactType.DATA_SCHEMA
+
+    return ArtifactType.LIBRARY  # conservative fallback
+
+
 class CriterionScore(BaseModel):
     criterion: str = ""
     score: float = 0.0  # 0.0 to 1.0

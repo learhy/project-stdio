@@ -166,11 +166,17 @@ class Orchestrator:
 
         # Fetch bundle proposal data
         row = await self.db.fetch_one(
-            "SELECT proposal_json, complexity_score, risk_score, tier FROM bundles WHERE id = ?",
+            "SELECT proposal_json, complexity_score, risk_score, tier, state FROM bundles WHERE id = ?",
             (bundle_id,),
         )
         if row is None:
             logger.error("Bundle %s not found for approval matrix evaluation", bundle_id)
+            return
+
+        # Guard: if bundle is already past review (e.g. review-aggregator dispatched
+        # again as part of execution DAG), skip the approval transition.
+        if row["state"] not in (BundleState.IN_REVIEW,):
+            logger.debug("Bundle %s is already %s; skipping approval matrix re-evaluation", bundle_id, row["state"])
             return
 
         proposal_json = json.loads(row["proposal_json"] or "{}")
@@ -1682,6 +1688,16 @@ def _drain_subprocess(process: asyncio.subprocess.Process, name: str) -> None:
     asyncio.create_task(_read_stream(process.stderr, "stderr"))
 
 
+def _get_artifact_type_hint(bundle_input: dict) -> str:
+    """Detect artifact type from idea for bundler task spec hint."""
+    idea = bundle_input.get("idea", "")
+    if not idea:
+        return ""
+    from .artifacts import detect_artifact_type_from_idea
+    t = detect_artifact_type_from_idea(idea)
+    return t.value
+
+
 async def _spawn_bundler(app: Orchestrator, bundle_id: str, bundle_input: dict) -> None:
     """Spawn a bundler worker as a standalone process (not part of a DAG)."""
     if os.environ.get("STUDIO_TEST_MODE") == "1":
@@ -1723,6 +1739,7 @@ async def _spawn_bundler(app: Orchestrator, bundle_id: str, bundle_input: dict) 
         "STUDIO_TASK_SPEC": json.dumps({
             "idea": bundle_input.get("idea", ""),
             "bundle_input": bundle_input,
+            "artifact_type_hint": _get_artifact_type_hint(bundle_input),
         }),
         "OLLAMA_CLOUD_BASE_URL": app.settings.ollama_cloud.base_url,
     }

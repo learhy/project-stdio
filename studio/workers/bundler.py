@@ -195,6 +195,22 @@ Classification guidelines:
 - Tests-only → test_suite
 - Multiple types → mixed (describe each sub-type in sub_strategies)
 
+## Multi-service applications
+
+If the idea describes multiple services (e.g. "a Flask API and a React frontend", "3 microservices", "a backend and dashboard"), you MUST:
+1. Set artifact_type to "mixed"
+2. Create separate top-level DAG nodes for each service (e.g. build-situation-room, build-metric-massager, build-war-room-dashboard)
+3. Each service node should be executable_app type with its own verification_strategy
+4. Create a final integration-setup node that depends on ALL service nodes and writes the docker-compose.yml and top-level README
+5. Do NOT collapse multiple services into a single library — each service must be independently deployable
+
+Signs that an idea is a multi-service app:
+- Mentions multiple ports (port 5001, port 5002, port 3000)
+- Mentions Docker Compose or docker-compose.yml
+- Describes a "frontend" AND "backend" or "API"
+- Describes 2+ independent web services with different responsibilities
+- Uses words like "microservice", "service mesh", "multi-service"
+
 ## Worker spec requirements — CRITICAL
 
 Every worker node spec MUST be self-contained. The worker runs in an isolated environment with no access to the original idea or other nodes' specs. It cannot ask questions (the question tool is disabled in headless mode). If the worker lacks any detail it needs, it will fail silently.
@@ -400,6 +416,27 @@ def _extract_json(text: str) -> dict:
     return {"parse_error": True, "raw_text": text[:1000]}
 
 
+def _has_multi_service_signals(idea: str) -> bool:
+    """Detect whether an idea string describes a multi-service application."""
+    lower = idea.lower()
+    if any(kw in lower for kw in ("docker-compose", "docker compose",
+                                    "multiple services", "microservice",
+                                    "micro-service", "multi-service")):
+        return True
+    web_backend = any(kw in lower for kw in ("flask", "fastapi", "express",
+                                               "django", "rails"))
+    web_frontend = any(kw in lower for kw in ("react", "vue", "angular",
+                                                "next.js", "svelte", "dashboard"))
+    if web_backend and web_frontend:
+        return True
+    # Multiple port mentions
+    import re
+    ports = re.findall(r"port\s*(\d+)", lower)
+    if len(set(ports)) >= 2:
+        return True
+    return False
+
+
 # ── Bundler Worker ─────────────────────────────────────────────────────────────
 
 
@@ -507,10 +544,18 @@ class BundlerWorker:
             "message": "Calling deepseek-v4-pro to plan bundle...",
         })
 
+        # Pass artifact type hint from orchestrator if available
+        hint = self.task_spec.get("artifact_type_hint", "")
+        hint_line = (
+            f"\nIMPORTANT: The orchestrator detected artifact_type_hint={hint}. "
+            f"Strongly prefer this type unless you have a clear reason to override.\n"
+            if hint else ""
+        )
+
         user_message = f"""## Idea to plan
 
 {idea}
-
+{hint_line}
 ## Memory context
 
 {memory_ctx}
@@ -544,25 +589,51 @@ Produce the bundle proposal JSON now. Include all required fields: complexity an
                 "errors": ["LLM response could not be parsed as JSON"],
             }
 
-        proposal = {
-            "complexity_score": result.get("complexity_score", 0),
-            "risk_score": result.get("risk_score", 0),
-            "complexity_factors": result.get("complexity_factors", {}),
-            "risk_factors": result.get("risk_factors", {}),
-            "estimated_loc": result.get("estimated_loc", 0),
-            "estimated_duration_seconds": result.get("estimated_duration_seconds", 0),
-            "estimated_worker_count": result.get("estimated_worker_count", 0),
-            "estimated_tokens": result.get("estimated_tokens", 0),
-            "target": result.get("target", "control-plane"),
-            "target_rationale": result.get("target_rationale", ""),
-            "concerns": result.get("concerns", ["(bundler did not populate concerns)"]),
-            "requirements_summary": result.get("requirements_summary", ""),
-            "rfc_summary": result.get("rfc_summary", ""),
-            "implementation_plan": result.get("implementation_plan", ""),
-            "task_dag": result.get("task_dag", {"nodes": [], "edges": []}),
-            "artifact_type": result.get("artifact_type", "mixed"),
-            "verification_strategy": result.get("verification_strategy", None),
-        }
+        def _build_proposal(r: dict) -> dict:
+            return {
+                "complexity_score": r.get("complexity_score", 0),
+                "risk_score": r.get("risk_score", 0),
+                "complexity_factors": r.get("complexity_factors", {}),
+                "risk_factors": r.get("risk_factors", {}),
+                "estimated_loc": r.get("estimated_loc", 0),
+                "estimated_duration_seconds": r.get("estimated_duration_seconds", 0),
+                "estimated_worker_count": r.get("estimated_worker_count", 0),
+                "estimated_tokens": r.get("estimated_tokens", 0),
+                "target": r.get("target", "control-plane"),
+                "target_rationale": r.get("target_rationale", ""),
+                "concerns": r.get("concerns", ["(bundler did not populate concerns)"]),
+                "requirements_summary": r.get("requirements_summary", ""),
+                "rfc_summary": r.get("rfc_summary", ""),
+                "implementation_plan": r.get("implementation_plan", ""),
+                "task_dag": r.get("task_dag", {"nodes": [], "edges": []}),
+                "artifact_type": r.get("artifact_type", "mixed"),
+                "verification_strategy": r.get("verification_strategy", None),
+            }
+
+        proposal = _build_proposal(result)
+
+        # ── Validation: multi-service idea but wrong artifact_type ─────────
+        has_multi = _has_multi_service_signals(idea)
+        artifact_type = proposal.get("artifact_type", "")
+        if has_multi and artifact_type not in ("mixed",):
+            self._log(
+                f"Warning: idea has multi-service signals but artifact_type={artifact_type}. "
+                f"Re-prompting bundler to use MIXED with separate service nodes."
+            )
+            correction = (
+                f"\nYour plan has artifact_type={artifact_type} but the idea describes what "
+                f"appears to be a multi-service application. Please reconsider and use "
+                f"artifact_type=mixed with separate DAG nodes for each service, plus an "
+                f"integration-setup node for docker-compose.yml.\n"
+            )
+            user_message += correction
+            result2 = await asyncio.to_thread(_call_llm, _BUNDLER_SYSTEM_PROMPT, user_message)
+            if not result2.get("error") and not result2.get("parse_error") and not result2.get("fallback"):
+                proposal = _build_proposal(result2)
+                self._log(
+                    f"Re-prompted proposal: artifact_type={proposal.get('artifact_type')}"
+                )
+        # ──────────────────────────────────────────────────────────────────
 
         await self.rpc.notify("worker.progress_report", {
             "stage": "complete",

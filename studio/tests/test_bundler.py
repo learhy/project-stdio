@@ -500,3 +500,131 @@ class TestBundlerWorker:
         with patch("studio.workers.bundler.os.path.exists", return_value=False):
             from studio.workers.bundler import _read_file
             assert _read_file("nonexistent.md") is None
+
+
+class TestDetectArtifactType:
+    """Tests for detect_artifact_type_from_idea in artifacts.py."""
+
+    def test_detect_artifact_type_flask_and_react(self):
+        from studio.orchestrator.artifacts import detect_artifact_type_from_idea, ArtifactType
+        result = detect_artifact_type_from_idea(
+            "Build a Flask API on port 5001 and a React dashboard on port 3000"
+        )
+        assert result == ArtifactType.MIXED
+
+    def test_detect_artifact_type_library(self):
+        from studio.orchestrator.artifacts import detect_artifact_type_from_idea, ArtifactType
+        result = detect_artifact_type_from_idea(
+            "Build a Python library called 'war-room' that analyzes meeting effectiveness"
+        )
+        assert result == ArtifactType.LIBRARY
+
+    def test_detect_artifact_type_single_flask(self):
+        from studio.orchestrator.artifacts import detect_artifact_type_from_idea, ArtifactType
+        result = detect_artifact_type_from_idea(
+            "Create a Flask API with a /health endpoint"
+        )
+        assert result == ArtifactType.EXECUTABLE_APP
+
+    def test_detect_artifact_type_docker_compose_is_mixed(self):
+        from studio.orchestrator.artifacts import detect_artifact_type_from_idea, ArtifactType
+        result = detect_artifact_type_from_idea(
+            "Set up 3 microservices with docker-compose.yml"
+        )
+        assert result == ArtifactType.MIXED
+
+    def test_detect_artifact_type_infrastructure(self):
+        from studio.orchestrator.artifacts import detect_artifact_type_from_idea, ArtifactType
+        result = detect_artifact_type_from_idea(
+            "Create a Dockerfile and Kubernetes manifests for deployment"
+        )
+        assert result == ArtifactType.INFRASTRUCTURE
+
+    def test_detect_artifact_type_frontend_only(self):
+        from studio.orchestrator.artifacts import detect_artifact_type_from_idea, ArtifactType
+        result = detect_artifact_type_from_idea(
+            "Build a React frontend with a dashboard"
+        )
+        assert result == ArtifactType.EXECUTABLE_APP
+
+
+class TestBundlerValidation:
+    """Tests for bundler validation and re-prompt logic."""
+
+    def test_has_multi_service_signals_detects_docker_compose(self):
+        from studio.workers.bundler import _has_multi_service_signals
+        assert _has_multi_service_signals("Build a Flask API and React frontend with docker-compose.yml")
+        assert _has_multi_service_signals("3 microservices talking over gRPC")
+
+    def test_has_multi_service_signals_detects_backend_and_frontend(self):
+        from studio.workers.bundler import _has_multi_service_signals
+        assert _has_multi_service_signals("Flask API backend and React dashboard frontend")
+
+    def test_has_multi_service_signals_detects_multiple_ports(self):
+        from studio.workers.bundler import _has_multi_service_signals
+        assert _has_multi_service_signals("Service on port 5001 and another on port 5002")
+
+    def test_has_multi_service_signals_no_false_positive_single_service(self):
+        from studio.workers.bundler import _has_multi_service_signals
+        assert not _has_multi_service_signals("Build a Python library for data analysis")
+        assert not _has_multi_service_signals("Create a single Flask app on port 5001")
+
+    @pytest.mark.asyncio
+    async def test_bundler_validation_multi_service_re_prompt(self):
+        """If bundler produces LIBRARY for multi-service idea, it should re-prompt."""
+        from studio.workers.bundler import BundlerWorker, _BUNDLER_SYSTEM_PROMPT
+
+        worker = BundlerWorker()
+        worker.task_spec = {"idea": "Build a Flask API and React frontend with docker-compose"}
+
+        # Mock RPC
+        worker.rpc = MagicMock()
+        worker.rpc.call = AsyncMock()
+        worker.rpc.notify = AsyncMock()
+        worker.rpc.close = AsyncMock()
+
+        # First LLM call returns LIBRARY (wrong)
+        result1 = {
+            "complexity_score": 3,
+            "risk_score": 2,
+            "artifact_type": "library",
+            "verification_strategy": {"type": "library", "test_command": "pytest"},
+            "complexity_factors": {},
+            "risk_factors": {},
+            "estimated_loc": 200,
+            "estimated_duration_seconds": 600,
+            "estimated_worker_count": 1,
+            "estimated_tokens": 3000,
+            "target": "new-repo",
+            "target_rationale": "test",
+            "concerns": ["test"],
+            "requirements_summary": "test",
+            "rfc_summary": "test",
+            "implementation_plan": "test",
+            "task_dag": {"nodes": [], "edges": []},
+        }
+        # Second LLM call returns MIXED (corrected)
+        result2 = dict(result1, artifact_type="mixed", verification_strategy={
+            "type": "mixed",
+            "sub_strategies": [
+                {"type": "executable_app", "startup_command": "flask run"},
+                {"type": "executable_app", "startup_command": "npm start"},
+            ],
+        })
+
+        call_count = [0]
+
+        def _mock_llm(system, user):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return result1
+            return result2
+
+        with patch("studio.workers.bundler._build_memory_context", return_value="(test memory)"):
+            with patch("studio.workers.bundler.asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+                mock_thread.side_effect = lambda fn, *args: _mock_llm(*args)
+                outcome = await worker._execute_task(worker.task_spec["idea"])
+
+        assert outcome["outcome"] == "success"
+        assert outcome["proposal"]["artifact_type"] == "mixed"
+        assert call_count[0] == 2  # Re-prompt happened
