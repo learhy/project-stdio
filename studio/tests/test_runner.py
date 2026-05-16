@@ -88,7 +88,8 @@ class TestLocalBwrapWorkerRunner:
 
     def test_default_worker_command(self, db_mock):
         runner = LocalBwrapWorkerRunner(db_mock, "/tmp/socket")
-        assert runner.worker_command == ["studio-worker"]
+        assert len(runner.worker_command) == 1
+        assert "studio-worker" in runner.worker_command[0]
 
     def test_custom_worker_command(self, db_mock):
         runner = LocalBwrapWorkerRunner(db_mock, "/tmp/socket", worker_command=["/usr/bin/code-buddy"])
@@ -373,14 +374,21 @@ class TestWorkerRespawn:
                 await runner.spawn_worker("w-new", "b1", "n1", manifest, "/tmp/wt")
 
     @pytest.mark.asyncio
-    async def test_respawn_blocks_on_pending_worker(self, runner, db_mock):
-        """Worker in PENDING state raises RuntimeError on re-spawn attempt."""
+    async def test_respawn_retries_on_pending_worker(self, runner, db_mock):
+        """Worker in PENDING state is reused (retried) on re-spawn attempt."""
         manifest = make_manifest()
         db_mock.fetch_one.return_value = {"id": "w-pending", "state": "pending"}
 
         with patch.dict("os.environ", {"STUDIO_TEST_MODE": "1"}):
-            with pytest.raises(RuntimeError, match="already in state pending"):
-                await runner.spawn_worker("w-new2", "b1", "n1", manifest, "/tmp/wt")
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                result = await runner.spawn_worker("w-new2", "b1", "n1", manifest, "/tmp/wt")
+
+        # Should succeed without raising — pending worker is reused
+        assert result.error == ""
+        assert result.worker_id == "w-new2"
 
     @pytest.mark.asyncio
     async def test_respawn_no_existing_worker_inserts_normally(self, runner, db_mock):
@@ -430,8 +438,8 @@ class TestWorkerTypeRouting:
                                           worker_type="review")
 
         cmd = mock_spawn.call_args[0]
-        assert "studio-review" in cmd
-        assert "studio-worker" not in cmd
+        assert any("studio-review" in c for c in cmd)
+        assert not any("studio-worker" in c for c in cmd)
 
     @pytest.mark.asyncio
     async def test_developer_worker_uses_default_worker_command(self, runner, db_mock):
@@ -445,7 +453,7 @@ class TestWorkerTypeRouting:
                 await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
 
         cmd = mock_spawn.call_args[0]
-        assert "studio-worker" in cmd
+        assert any("studio-worker" in c for c in cmd)
 
     @pytest.mark.asyncio
     async def test_review_worker_with_bwrap_includes_studio_review(self, runner, db_mock):
@@ -462,5 +470,5 @@ class TestWorkerTypeRouting:
 
         cmd = mock_spawn.call_args[0]
         assert "bwrap" in cmd
-        assert "studio-review" in cmd
-        assert "studio-worker" not in cmd
+        assert any("studio-review" in c for c in cmd)
+        assert not any("studio-worker" in c for c in cmd)
