@@ -25,7 +25,7 @@ from .display import (
 async def _send_rpc(socket_path: str, method: str, params: dict[str, Any] | None = None) -> dict:
     """Send a JSON-RPC request over the Unix socket and return the result."""
     try:
-        reader, writer = await asyncio.open_unix_connection(socket_path)
+        reader, writer = await asyncio.open_unix_connection(socket_path, limit=2**20)
     except (FileNotFoundError, ConnectionRefusedError):
         return {
             "error": {

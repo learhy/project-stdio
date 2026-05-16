@@ -258,6 +258,8 @@ class Orchestrator:
         elif decision.tier == ApprovalTier.AUTO:
             # Auto-approve: fire transition 4 automatically
             await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix")
+            await self.sm.transition_6_start_execution(bundle_id)
+            await self.executor.start_bundle(bundle_id)
             await self.sm._github_post_mirror(
                 bundle_id,
                 f"Auto-approved (tier: {tier_str}, reason: {decision.reason})",
@@ -265,6 +267,8 @@ class Orchestrator:
         elif decision.tier == ApprovalTier.AUTO_NOTIFY:
             # Auto-notify: fire transition 4 automatically, post notification
             await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix")
+            await self.sm.transition_6_start_execution(bundle_id)
+            await self.executor.start_bundle(bundle_id)
             await self.sm._github_post_mirror(
                 bundle_id,
                 f"Auto-approved with notification (tier: {tier_str}, reason: {decision.reason})",

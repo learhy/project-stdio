@@ -602,6 +602,7 @@ class TestApprovalMatrixStub:
         app.sm = MagicMock()
         app.sm.transition_4_approve_from_review = AsyncMock()
         app.sm._github_post_mirror = AsyncMock()
+        app.sm.transition_6_start_execution = AsyncMock()
         app.sm.now = MagicMock(return_value=1700000000)
 
         # Mock DB to return a low-score bundle proposal
@@ -619,12 +620,15 @@ class TestApprovalMatrixStub:
         # Mock executor with artifact store
         app.executor = MagicMock()
         app.executor._artifact_store = None
+        app.executor.start_bundle = AsyncMock()
 
         await app._evaluate_approval_matrix("01TEST", {})
 
         app.sm.transition_4_approve_from_review.assert_called_once_with(
             "01TEST", "approval-matrix"
         )
+        app.sm.transition_6_start_execution.assert_called_once_with("01TEST")
+        app.executor.start_bundle.assert_called_once_with("01TEST")
 
 
 class TestMemoryRootSetting:

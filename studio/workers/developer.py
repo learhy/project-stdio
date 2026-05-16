@@ -140,6 +140,7 @@ class DeveloperWorker:
             "tests_failed": outcome.get("tests_failed", 0),
             "errors": outcome.get("errors", []),
             "summary": outcome.get("summary", ""),
+            "attempts": outcome.get("attempts", 1),
         }
 
         await self.rpc.call("worker.final_report", final_params)
