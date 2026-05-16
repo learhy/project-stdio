@@ -1,6 +1,6 @@
 import random
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -56,6 +56,36 @@ SURVIVAL_GUIDES = {
         ],
         "mantra": "A plan is just a list of things that won't happen.",
     },
+    "exec-briefing": {
+        "type": "exec-briefing",
+        "tips": [
+            "Lead with the bottom line — execs read nothing else.",
+            "Pre-answer the three questions they always ask: cost, timeline, risk.",
+            "Have a single slide. Maximum two bullet points. One is better.",
+            "If they ask a hard question, say 'we have a tiger team on it'.",
+        ],
+        "mantra": "If you can't explain it in 30 seconds, it doesn't exist.",
+    },
+    "all-hands": {
+        "type": "all-hands",
+        "tips": [
+            "Sit in the back row — closer to the exit.",
+            "Never ask the first question. Or the second. Or any question.",
+            "Clap when everyone else claps. You're a team player.",
+            "If called on, say 'great question, let me follow up async'.",
+        ],
+        "mantra": "All hands on deck, one hand on the door.",
+    },
+    "one-on-one": {
+        "type": "one-on-one",
+        "tips": [
+            "Always have one 'career goal' ready to deflect from your actual work.",
+            "Mention a book you're 'reading' about leadership.",
+            "Ask for feedback first — it makes you look coachable.",
+            "If they ask about weaknesses, pick something that's secretly a strength.",
+        ],
+        "mantra": "Your manager is also just trying to survive.",
+    },
 }
 
 EXCUSES = [
@@ -74,10 +104,12 @@ EXCUSES = [
 ]
 
 
-@app.route("/threat-assessment", methods=["GET"])
+@app.route("/threat-assessment", methods=["POST"])
 def threat_assessment():
+    body = request.get_json(silent=True) or {}
+    stakeholders = body.get("stakeholders", [])
     level = random.choice(THREAT_LEVELS)
-    return jsonify(level)
+    return jsonify({**level, "stakeholders": stakeholders, "headcount": len(stakeholders)})
 
 
 @app.route("/meeting-survival-guide/<meeting_type>", methods=["GET"])
@@ -88,10 +120,14 @@ def meeting_survival_guide(meeting_type):
     return jsonify(guide)
 
 
-@app.route("/excuse-generator", methods=["GET"])
+@app.route("/excuse-generator", methods=["POST"])
 def excuse_generator():
-    excuse = random.choice(EXCUSES)
-    return jsonify({"excuse": excuse})
+    body = request.get_json(silent=True) or {}
+    missed = body.get("missed", "an unspecified deadline")
+    reason = body.get("reason", "reasons beyond my control")
+    template = random.choice(EXCUSES).strip('"')
+    contextual = f"I missed {missed} because of {reason}. Also, {template}"
+    return jsonify({"excuse": contextual, "missed": missed, "blamed_on": reason})
 
 
 if __name__ == "__main__":

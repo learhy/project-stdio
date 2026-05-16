@@ -56,8 +56,24 @@ TREND_PROJECTIONS = [
 
 @app.route("/spin", methods=["GET"])
 def spin():
+    metric = request.args.get("metric", "")
+    value_raw = request.args.get("value", "")
     adjective = random.choice(SPIN_ADJECTIVES)
     verb = random.choice(SPIN_VERBS)
+
+    if metric and value_raw:
+        try:
+            value = float(value_raw)
+        except ValueError:
+            return jsonify({"error": f"Invalid value: {value_raw}"}), 400
+        spun_value = round(value * random.uniform(1.15, 2.8), 2)
+        return jsonify({
+            "original_metric": metric,
+            "original_value": value,
+            "spun_value": spun_value,
+            "spin_factor": round(spun_value / value, 2),
+            "narrative": f"{metric} is {adjective}, {verb}",
+        })
 
     raw_input = {
         "revenue_growth": round(random.uniform(-2.0, 3.0), 1),
@@ -102,19 +118,45 @@ def trend():
     adverb = random.choice(TREND_ADVERBS)
     projection = random.choice(TREND_PROJECTIONS)
 
-    quarters = ["Q1", "Q2", "Q3", "Q4"]
-    data = [
-        {"quarter": q, "value": round(random.uniform(70, 140), 1)}
-        for q in quarters
-    ]
+    data_points_raw = request.args.get("data_points", "")
 
-    growth = round(((data[-1]["value"] - data[0]["value"]) / data[0]["value"]) * 100, 1)
+    if data_points_raw:
+        parts = [p.strip() for p in data_points_raw.split(",") if p.strip()]
+        try:
+            points = [float(p) for p in parts]
+        except ValueError:
+            return jsonify({"error": "Invalid data_points: must be comma-separated numbers"}), 400
+    else:
+        quarters = ["Q1", "Q2", "Q3", "Q4"]
+        data = [
+            {"quarter": q, "value": round(random.uniform(70, 140), 1)}
+            for q in quarters
+        ]
+        growth = round(((data[-1]["value"] - data[0]["value"]) / data[0]["value"]) * 100, 1)
+        return jsonify({
+            "historical_data": data,
+            "projection": f"{adverb} {projection}",
+            "projected_growth": f"{growth}%",
+            "confidence": "This trend line was drawn by someone who believes in you.",
+        })
+
+    if len(points) < 2:
+        return jsonify({"error": "Need at least 2 data points"}), 400
+
+    first = points[0]
+    last = points[-1]
+    avg_delta = (last - first) / (len(points) - 1)
+    projected = round(last + avg_delta, 2)
+    growth = round(((last - first) / first) * 100, 1) if first != 0 else 0
+
+    trend_direction = "upward" if growth > 0 else "downward" if growth < 0 else "flat"
 
     return jsonify({
-        "historical_data": data,
-        "projection": f"{adverb} {projection}",
+        "data_points": points,
+        "trend": trend_direction,
+        "projected_next": projected,
         "projected_growth": f"{growth}%",
-        "confidence": "This trend line was drawn by someone who believes in you.",
+        "narrative": f"Based on these {len(points)} data points, the trend is {adverb} {trend_direction}. Next value {adverb} {projection}.",
     })
 
 
