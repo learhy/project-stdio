@@ -526,6 +526,53 @@ class Orchestrator:
         else:
             interventions_correct = 0
 
+        # ── Bundle 6.4: code quality dimensions ──────────────────────────
+
+        # Developer verification attempts from dag_nodes output_json
+        dev_rows = await self.db.fetch_all(
+            "SELECT output_json FROM dag_nodes WHERE bundle_id = ? AND kind = 'worker'",
+            (bundle_id,),
+        )
+        developer_verification_attempts = 1
+        first_attempt_pass = False
+        for r in dev_rows or []:
+            try:
+                output = json.loads(r["output_json"] or "{}")
+                attempts = output.get("attempts", 1)
+                if isinstance(attempts, int) and attempts > developer_verification_attempts:
+                    developer_verification_attempts = attempts
+            except (json.JSONDecodeError, TypeError):
+                pass
+        first_attempt_pass = developer_verification_attempts == 1
+
+        # QA criterion scores from outcome_json
+        verification = outcome.get("verification", {})
+        qa_criterion_scores = verification.get("criterion_scores", [])
+        qa_criterion_pass_rate = None
+        if qa_criterion_scores:
+            passing = sum(1 for s in qa_criterion_scores if s.get("pass_fail"))
+            qa_criterion_pass_rate = round(passing / len(qa_criterion_scores), 2)
+
+        # Verification strategy accuracy: strategy was provided AND usable
+        verification_strategy = bundler_proposal.get("verification_strategy")
+        artifact_type = bundler_proposal.get("artifact_type", "")
+        verification_strategy_provided = bool(verification_strategy)
+        verification_passed = outcome.get("status") == "shipped"
+        verification_strategy_accurate = verification_strategy_provided and verification_passed
+
+        # Failure category distribution from verification failures
+        failure_categories: dict[str, int] = {}
+        dev_failures = verification.get("failures", [])
+        if not dev_failures:
+            # Try from criteria_results
+            criteria_results = verification.get("criteria_results", [])
+            for cr in criteria_results:
+                if not cr.get("passed"):
+                    evidence = cr.get("evidence", "")
+                    from studio.orchestrator.artifacts import categorize_failure
+                    cat = categorize_failure(evidence, "")
+                    failure_categories[cat] = failure_categories.get(cat, 0) + 1
+
         # Compute divergence: >50% on any axis triggers post-mortem flag
         def _pct_divergence(estimated: int, actual: int) -> float | None:
             if estimated == 0:
@@ -562,6 +609,14 @@ class Orchestrator:
             "questions_escalated": questions_escalated,
             "escalation_response_time_seconds": escalation_response_time_seconds,
             "checkpoints_count": checkpoints_count,
+            "developer_verification_attempts": developer_verification_attempts,
+            "first_attempt_pass": first_attempt_pass,
+            "verification_strategy_provided": verification_strategy_provided,
+            "verification_strategy_accurate": verification_strategy_accurate,
+            "qa_criterion_scores": qa_criterion_scores,
+            "qa_criterion_pass_rate": qa_criterion_pass_rate,
+            "artifact_type": artifact_type,
+            "failure_categories": failure_categories,
         }
 
         # Write to memory/calibration/scoring-outcomes.jsonl
@@ -593,6 +648,25 @@ class Orchestrator:
                 logger.info("Post-mortem written for bundle %s: %s", bundle_id, diverged)
             except Exception as exc:
                 logger.warning("Failed to write post-mortem for %s: %s", bundle_id, exc)
+
+        # Bundle 6.4: Todoist escalation when thresholds exceeded
+        todoist_attempts_threshold = developer_verification_attempts >= 4
+        todoist_qa_threshold = (
+            qa_criterion_pass_rate is not None and qa_criterion_pass_rate < 0.7
+        )
+        if todoist_attempts_threshold or todoist_qa_threshold:
+            try:
+                from .todoist import create_review_task
+                bundle_idea = bundler_proposal.get("requirements_summary", bundle_id)
+                await create_review_task(
+                    bundle_id=bundle_id,
+                    bundle_idea=bundle_idea,
+                    attempts=developer_verification_attempts,
+                    qa_pass_rate=qa_criterion_pass_rate,
+                    artifact_type=artifact_type,
+                )
+            except Exception as exc:
+                logger.warning("Failed to create Todoist task for %s: %s", bundle_id, exc)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -1815,11 +1889,86 @@ async def _cli_calibration_report(app: Orchestrator, params: dict) -> dict:
         "missed_rate": round(missed_count / total_feedback, 2) if total_feedback > 0 else 0,
     }
 
+    # ── Bundle 6.4: Code quality metrics ─────────────────────────────────
+
+    # Filter entries that have verification data (skip documentation / skip_verification)
+    verified = [e for e in entries
+                if e.get("developer_verification_attempts", 0) > 0
+                and e.get("artifact_type") not in ("documentation", None)]
+
+    first_attempt_count = sum(1 for e in verified if e.get("first_attempt_pass"))
+    total_verified = len(verified)
+    first_attempt_pass_rate = (
+        round(first_attempt_count / total_verified * 100) if total_verified > 0 else None
+    )
+
+    avg_fix_attempts = (
+        round(sum(e.get("developer_verification_attempts", 1) for e in verified) / total_verified, 1)
+        if total_verified > 0 else None
+    )
+
+    # QA criterion pass rate across all entries that have it
+    qa_rates = [e["qa_criterion_pass_rate"] for e in entries
+                if e.get("qa_criterion_pass_rate") is not None]
+    avg_qa_criterion_pass_rate = (
+        round(sum(qa_rates) / len(qa_rates) * 100) if qa_rates else None
+    )
+
+    # Failure category distribution
+    all_categories: dict[str, int] = {}
+    for e in entries:
+        for cat, cnt in e.get("failure_categories", {}).items():
+            all_categories[cat] = all_categories.get(cat, 0) + cnt
+    total_failures = sum(all_categories.values())
+    most_common_category = None
+    most_common_pct = 0
+    if all_categories:
+        top_cat = max(all_categories, key=lambda k: all_categories[k])
+        most_common_category = top_cat
+        most_common_pct = round(all_categories[top_cat] / total_failures * 100)
+
+    # Spec clarity score: 100 - (multi_attempt / total * 100)
+    spec_clarity_score = None
+    if total_verified >= 5:
+        multi_attempt = sum(1 for e in verified if not e.get("first_attempt_pass"))
+        spec_clarity_score = round(100 - (multi_attempt / total_verified * 100))
+
+    # Recommendations from thresholds
+    recommendations: list[str] = []
+    if all_categories.get("missing_dependencies", 0) / max(total_failures, 1) > 0.3:
+        recommendations.append(
+            '"Missing dependencies" failures suggest bundler should include '
+            "explicit dependency lists in task specs"
+        )
+    if first_attempt_pass_rate is not None and first_attempt_pass_rate < 60:
+        recommendations.append(
+            f"First-attempt pass rate is {first_attempt_pass_rate}% (target: >80%). "
+            "Review spec quality and acceptance criteria clarity."
+        )
+    if avg_fix_attempts is not None and avg_fix_attempts > 3:
+        recommendations.append(
+            f"Average fix attempts is {avg_fix_attempts} (target: <2.0). "
+            "Review bundles with 4+ attempts for systematic issues."
+        )
+
+    code_quality = {
+        "first_attempt_pass_rate": first_attempt_pass_rate,
+        "avg_fix_attempts": avg_fix_attempts,
+        "qa_criterion_pass_rate": avg_qa_criterion_pass_rate,
+        "most_common_failure_category": most_common_category,
+        "most_common_failure_pct": most_common_pct,
+        "spec_clarity_score": spec_clarity_score,
+        "total_verified": total_verified,
+        "all_categories": all_categories,
+        "recommendations": recommendations,
+    }
+
     return {
         "total_entries": total,
         "entries_with_divergence": diverged_count,
         "recent": recent,
         "review_quality": review_quality,
+        "code_quality": code_quality,
     }
 
 

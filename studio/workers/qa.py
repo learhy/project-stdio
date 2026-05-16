@@ -152,7 +152,9 @@ def _format_final_params(
     outcome: str,
     report: dict,
     summary: str,
+    criterion_scores: list | None = None,
 ) -> dict:
+    scores = criterion_scores or []
     return {
         "outcome": outcome,
         "summary": summary,
@@ -164,6 +166,7 @@ def _format_final_params(
             "recommendations": report.get("recommendations", []),
             "summary": report.get("summary", ""),
             "produced_at": int(time.time()),
+            "criterion_scores": _dump_scores(scores),
         },
     }
 
@@ -482,7 +485,7 @@ async def run() -> None:
 
         # 7. Send final_report
         await rpc.call("worker.final_report", _format_final_params(
-            final_outcome, report, final_summary,
+            final_outcome, report, final_summary, criterion_scores,
         ))
 
     finally:

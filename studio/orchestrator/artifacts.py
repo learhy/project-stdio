@@ -20,6 +20,22 @@ class VerificationFailure(BaseModel):
     actual: str = ""
     error_output: str = ""
     summary: str = ""
+    category: str = ""  # missing_dependencies, logic_error, spec_deviation, infrastructure, other
+
+
+def categorize_failure(error_output: str, summary: str) -> str:
+    """Heuristic keyword matching to categorize a verification failure."""
+    text = f"{error_output} {summary}".lower()
+    if any(kw in text for kw in ("importerror", "modulenotfounderror", "no module named")):
+        return "missing_dependencies"
+    if any(kw in text for kw in ("assertionerror", "assert")):
+        return "logic_error"
+    if any(kw in text for kw in ("attributeerror", "keyerror", "typeerror", "valueerror")):
+        return "spec_deviation"
+    if any(kw in text for kw in ("timeout", "connectionrefused", "connection refused",
+                                  "timed out", "connectionerror")):
+        return "infrastructure"
+    return "other"
 
 
 class VerificationResult(BaseModel):
