@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import secrets
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,18 @@ if TYPE_CHECKING:
     from .db import Database
 
 logger = logging.getLogger(__name__)
+
+# Resolve worker binaries relative to sys.executable so subprocess spawn works
+# even when .venv/bin is not on PATH.
+_VENV_BIN_DIR = os.path.dirname(os.path.abspath(sys.executable))
+
+
+def _resolve_bin(name: str) -> str:
+    """Return full path to a venv binary, falling back to bare name."""
+    path = os.path.join(_VENV_BIN_DIR, name)
+    if os.path.isfile(path):
+        return path
+    return name
 
 
 def _generate_token() -> str:
@@ -217,7 +230,7 @@ class LocalBwrapWorkerRunner:
         self.db = db
         self.socket_path = socket_path
         self.egress_proxy = egress_proxy or EgressProxySettings()
-        self.worker_command = worker_command or ["studio-worker"]
+        self.worker_command = worker_command or [_resolve_bin("studio-worker")]
         self.token_expiry_minutes = token_expiry_minutes
         self.ca_cert_path = ca_cert_path
         self.ca_key_path = ca_key_path
@@ -286,6 +299,7 @@ class LocalBwrapWorkerRunner:
             "SELECT id, state FROM workers WHERE bundle_id = ? AND node_id = ?",
             (bundle_id, node_id),
         )
+        reusing_pending = False
         if existing:
             terminal_states = (WorkerState.COMPLETE, WorkerState.FAILED, WorkerState.KILLED, WorkerState.CONNECTION_LOST)
             if existing["state"] in terminal_states:
@@ -298,39 +312,44 @@ class LocalBwrapWorkerRunner:
                     "DELETE FROM workers WHERE id = ?", (existing["id"],)
                 )
                 await self.db.conn.commit()
+            elif existing["state"] == WorkerState.PENDING:
+                # Previous spawn attempt inserted the worker but didn't complete
+                # (e.g. worktree creation or process spawn failed). Reuse the row.
+                reusing_pending = True
             else:
                 raise RuntimeError(
                     f"Worker {existing['id']} for bundle={bundle_id} node={node_id} "
                     f"is already in state {existing['state']} — cannot re-spawn"
                 )
 
-        # Insert worker row
-        await self.db.execute(
-            "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, manifest_json, state, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                worker_id,
-                bundle_id,
-                node_id,
-                token,
-                token_expires_at,
-                json.dumps(manifest.model_dump()),
-                WorkerState.PENDING,
-                self.now(),
-            ),
-        )
-        await self.db.conn.commit()
+        if not reusing_pending:
+            # Insert worker row
+            await self.db.execute(
+                "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, manifest_json, state, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    worker_id,
+                    bundle_id,
+                    node_id,
+                    token,
+                    token_expires_at,
+                    json.dumps(manifest.model_dump()),
+                    WorkerState.PENDING,
+                    self.now(),
+                ),
+            )
+            await self.db.conn.commit()
 
-        # Audit: worker spawn
-        await self.db.execute(
-            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            ("worker_spawned", "worker", worker_id,
-             json.dumps({"bundle_id": bundle_id, "node_id": node_id,
-                         "token_expires_at": token_expires_at}),
-             self.now()),
-        )
-        await self.db.conn.commit()
+            # Audit: worker spawn
+            await self.db.execute(
+                "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("worker_spawned", "worker", worker_id,
+                 json.dumps({"bundle_id": bundle_id, "node_id": node_id,
+                             "token_expires_at": token_expires_at}),
+                 self.now()),
+            )
+            await self.db.conn.commit()
 
         # Create git worktree or new repo
         worker_branch = f"bundle/{bundle_id}/{node_id}"
@@ -395,7 +414,7 @@ class LocalBwrapWorkerRunner:
                 self._bwrap_available = await self._check_bwrap()
         use_bwrap = self._bwrap_available
 
-        worker_cmd = ["studio-review"] if worker_type == "review" else self.worker_command
+        worker_cmd = [_resolve_bin("studio-review")] if worker_type == "review" else self.worker_command
         # Build bwrap args or run directly
         if use_bwrap:
             bwrap_args = capability_to_bwrap_args(manifest, worktree_path, self.socket_path, proxy_socket)
@@ -746,7 +765,7 @@ class RemoteSSHWorkerRunner:
         self.db = db
         self.fleet = fleet
         self.egress_proxy = egress_proxy or EgressProxySettings()
-        self.worker_command = worker_command or ["studio-worker"]
+        self.worker_command = worker_command or [_resolve_bin("studio-worker")]
         self.token_expiry_minutes = token_expiry_minutes
         self.ca_cert_path = ca_cert_path
         self.ca_key_path = ca_key_path
@@ -929,7 +948,7 @@ class RemoteSSHWorkerRunner:
                 worker_env["STUDIO_WORKER_KEY"] = f"{workdir}/worker.key"
                 worker_env["STUDIO_ORCHESTRATOR_CA"] = f"{workdir}/ca.crt"
 
-            worker_cmd = ["studio-review"] if worker_type == "review" else self.worker_command
+            worker_cmd = [_resolve_bin("studio-review")] if worker_type == "review" else self.worker_command
             cmd_parts = bwrap_args + worker_cmd
             cmd_str = " ".join(cmd_parts)
 
@@ -1429,7 +1448,7 @@ class K8sJobWorkerRunner:
         self.db = db
         self.settings = settings
         self.egress_proxy = egress_proxy or EgressProxySettings()
-        self.worker_command = worker_command or ["studio-worker"]
+        self.worker_command = worker_command or [_resolve_bin("studio-worker")]
         self.token_expiry_minutes = token_expiry_minutes
         self.ca_cert_path = ca_cert_path
         self.ca_key_path = ca_key_path

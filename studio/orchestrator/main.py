@@ -1648,7 +1648,7 @@ async def _spawn_bundler(app: Orchestrator, bundle_id: str, bundle_input: dict) 
     }
 
     process = await asyncio.create_subprocess_exec(
-        "studio-bundler",
+        sys.executable, "-m", "studio.workers.bundler",
         env=worker_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -1726,7 +1726,7 @@ async def _spawn_qa_worker(app: Orchestrator, bundle_id: str) -> None:
     }
 
     process = await asyncio.create_subprocess_exec(
-        "studio-qa",
+        sys.executable, "-m", "studio.workers.qa",
         env=worker_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

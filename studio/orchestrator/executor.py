@@ -543,14 +543,22 @@ class DagExecutor:
                     if proc.returncode != 0:
                         err = stderr.decode("utf-8", errors="replace")[:500]
                         _logger.warning("gh repo create failed for %s: %s", repo_name, err)
+                        # Keep worktree so code is not lost
+                        _logger.warning("Preserving worktree at %s (gh push failed)", worktree_path)
                     else:
                         _logger.info("Created and pushed repo %s", repo_name)
-
-                # Clean up temp directory
-                try:
-                    shutil.rmtree(worktree_path)
-                except Exception:
-                    pass
+                        # Clean up temp directory only on successful push
+                        try:
+                            shutil.rmtree(worktree_path)
+                        except Exception:
+                            pass
+                else:
+                    # No actual repo name; preserve worktree so generated code is not lost
+                    _logger.warning(
+                        "new-repo target has no repo_name (got %r); "
+                        "preserving worktree at %s",
+                        repo_name, worktree_path,
+                    )
             else:
                 # Push worktree branch to origin
                 worker_branch = f"bundle/{bundle_id}/" + worker_id.replace("w_", "", 1).rsplit("_", 1)[-1] if "_" in worker_id else ""

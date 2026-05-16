@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -202,21 +203,30 @@ class DeveloperWorker:
             "message": f"Starting task: {objective[:100]}",
         })
 
-        # Kill any existing opencode servers so we start a fresh server
-        # bound to the worktree. Without this, opencode run auto-discovers
-        # an existing server for the main project and writes files there.
-        await self._kill_opencode_servers()
+        # Ensure the worktree has a .git/opencode file so opencode treats it
+        # as a distinct project and starts a fresh server bound to this directory.
+        self._init_opencode_project()
 
-        # Build opencode command
-        cmd = [_OPencode_BIN, "run", "--model", model, "--print-logs", full_prompt]
-        self._log(f"Running: {' '.join(cmd[:4])} ...")
+        # opencode uses the grandparent process info for project detection
+        # when stdout is not a TTY. Wrap in bash -c so its parent is a shell
+        # whose cwd is the worktree, not the Python worker process.
+        saved_cwd = os.getcwd()
+        chdir_done = False
+        if os.path.isdir(_WORKTREE_PATH):
+            os.chdir(_WORKTREE_PATH)
+            chdir_done = True
+
+        # Build opencode command wrapped in bash so opencode inherits the
+        # shell's cwd rather than resolving via the Python parent process.
+        inner_cmd = f"{_OPencode_BIN} run --model {model} --print-logs {shlex.quote(full_prompt)}"
+        cmd = ["bash", "-c", inner_cmd]
+        self._log(f"Running: opencode run --model {model} ...")
 
         try:
             self._agent_process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=_WORKTREE_PATH,
                 env={**os.environ, "OLLAMA_CLOUD_BASE_URL": _OLLAMA_BASE_URL},
             )
 
@@ -330,6 +340,9 @@ class DeveloperWorker:
                 "summary": f"Execution error: {exc}",
                 "errors": [str(exc)],
             }
+        finally:
+            if chdir_done:
+                os.chdir(saved_cwd)
 
     async def _stream_and_detect_stuck(self) -> tuple[list[str], bytes, bool]:
         """Stream stdout from opencode, tracking rolling hash for stuck detection.
@@ -435,24 +448,29 @@ class DeveloperWorker:
 
     # ── Git operations ─────────────────────────────────────────────────────
 
-    async def _kill_opencode_servers(self) -> None:
-        """Kill any existing opencode server processes.
+    def _init_opencode_project(self) -> None:
+        """Create a .git/opencode file in the worktree if it doesn't exist.
 
-        Without this, ``opencode run`` may auto-discover an existing server
-        bound to a different project and write files to the wrong directory.
-        Workers run sequentially so this is safe — the next run will start
-        a fresh server bound to the worktree.
+        Without this, the first ``opencode run`` invocation may fail to identify
+        the worktree as a distinct project and fall back to an auto-discovered
+        server bound to the main project directory.
         """
+        if not _WORKTREE_PATH:
+            return
+        opencode_file = os.path.join(_WORKTREE_PATH, ".git", "opencode")
+        if os.path.exists(opencode_file):
+            return
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "pkill", "-f", "opencode",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            # Get the git repo's initial commit SHA to use as project key
+            proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=_WORKTREE_PATH, capture_output=True, text=True,
             )
-            await proc.wait()
-            # Give servers a moment to shut down
-            await asyncio.sleep(1.0)
-            self._log("Killed any existing opencode servers")
+            commit_sha = proc.stdout.strip()
+            if commit_sha:
+                with open(opencode_file, "w") as f:
+                    f.write(commit_sha + "\n")
+                self._log(f"Initialized opencode project: {commit_sha[:16]}...")
         except Exception:
             pass
 
