@@ -202,6 +202,11 @@ class DeveloperWorker:
             "message": f"Starting task: {objective[:100]}",
         })
 
+        # Kill any existing opencode servers so we start a fresh server
+        # bound to the worktree. Without this, opencode run auto-discovers
+        # an existing server for the main project and writes files there.
+        await self._kill_opencode_servers()
+
         # Build opencode command
         cmd = [_OPencode_BIN, "run", "--model", model, "--print-logs", full_prompt]
         self._log(f"Running: {' '.join(cmd[:4])} ...")
@@ -429,6 +434,27 @@ class DeveloperWorker:
         return None
 
     # ── Git operations ─────────────────────────────────────────────────────
+
+    async def _kill_opencode_servers(self) -> None:
+        """Kill any existing opencode server processes.
+
+        Without this, ``opencode run`` may auto-discover an existing server
+        bound to a different project and write files to the wrong directory.
+        Workers run sequentially so this is safe — the next run will start
+        a fresh server bound to the worktree.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pkill", "-f", "opencode",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+            # Give servers a moment to shut down
+            await asyncio.sleep(1.0)
+            self._log("Killed any existing opencode servers")
+        except Exception:
+            pass
 
     def _setup_git_identity(self) -> None:
         """Set git author identity in the worktree."""
