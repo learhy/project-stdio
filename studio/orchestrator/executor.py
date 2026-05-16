@@ -686,6 +686,14 @@ class DagExecutor:
                         normalized["artifact_type"] = bundler["artifact_type"]
                     if bundler.get("verification_strategy"):
                         normalized["verification_strategy"] = bundler["verification_strategy"]
+                # Enrich QA worker task spec with verification strategy and developer attempts
+                if worker_type == "review" and node.get("node_id") == "qa":
+                    if bundler.get("verification_strategy"):
+                        normalized["verification_strategy"] = bundler["verification_strategy"]
+                    if bundler.get("requirements_summary"):
+                        normalized["bundle_requirements"] = bundler["requirements_summary"]
+                    max_attempts = await self._get_max_developer_attempts(bundle_id)
+                    normalized["developer_verification_attempts"] = max_attempts
         except Exception:
             pass
 
@@ -980,6 +988,22 @@ class DagExecutor:
             "SELECT COUNT(*) as cnt FROM workers WHERE state = ?", (WorkerState.RUNNING,)
         )
         return row["cnt"] if row else 0
+
+    async def _get_max_developer_attempts(self, bundle_id: str) -> int:
+        rows = await self.db.fetch_all(
+            "SELECT output_json FROM dag_nodes WHERE bundle_id = ? AND kind = 'worker'",
+            (bundle_id,),
+        )
+        max_attempts = 1
+        for r in rows or []:
+            try:
+                output = json.loads(r["output_json"] or "{}")
+                attempts = output.get("attempts", 1)
+                if isinstance(attempts, int) and attempts > max_attempts:
+                    max_attempts = attempts
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return max_attempts
 
     @staticmethod
     def _drain_worker_pipes(process: asyncio.subprocess.Process, worker_id: str) -> None:

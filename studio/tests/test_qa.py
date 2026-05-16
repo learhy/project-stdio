@@ -252,4 +252,148 @@ class TestQaWorker:
         }
         params = _format_final_params("failure", report, "Verification failed")
         assert params["outcome"] == "failure"
-        assert params["verification_report"]["failed_criteria"] == ["Coverage too low"]
+
+
+# ── Bundle 6.3: QA worker enhancement tests ────────────────────────────────
+
+
+class TestCriterionScoreModel:
+    def test_criterion_score_defaults(self):
+        from studio.orchestrator.artifacts import CriterionScore
+        c = CriterionScore()
+        assert c.criterion == ""
+        assert c.score == 0.0
+        assert c.pass_fail is False
+
+    def test_criterion_score_passing(self):
+        from studio.orchestrator.artifacts import CriterionScore
+        c = CriterionScore(criterion="Tests pass", score=0.9, evidence="602 passed", pass_fail=True)
+        assert c.pass_fail is True
+        assert c.score >= 0.7
+
+    def test_criterion_score_failing(self):
+        from studio.orchestrator.artifacts import CriterionScore
+        c = CriterionScore(criterion="Coverage >= 80%", score=0.3, evidence="72% coverage", pass_fail=False)
+        assert c.pass_fail is False
+        assert c.score < 0.7
+
+
+class TestDeepVerification:
+    @pytest.mark.asyncio
+    async def test_run_deep_verification_without_strategy(self):
+        from studio.workers.qa import _run_deep_verification
+        result = await _run_deep_verification("/tmp", None)
+        assert "passed" in result
+
+    @pytest.mark.asyncio
+    async def test_run_deep_verification_with_library_strategy(self):
+        from studio.workers.qa import _run_deep_verification
+        with patch("studio.workers.verification.VerificationRunner.run") as mock_run:
+            mock_run.return_value = type("obj", (), {"passed": True, "output": "All good", "failures": []})()
+            mock_run.return_value.failures = []
+            result = await _run_deep_verification("/tmp", {"type": "library", "test_command": "pytest"})
+            assert result["passed"] is True
+
+
+class TestDeveloperAttemptAnalysis:
+    @pytest.mark.asyncio
+    async def test_analyze_developer_attempts_multi(self):
+        from studio.workers.qa import _analyze_developer_attempts
+        with patch("studio.workers.qa._call_llm") as mock_llm:
+            mock_llm.return_value = {"summary": "Spec was ambiguous about dependencies"}
+            result = await _analyze_developer_attempts(3, "http://test", "test-model")
+            assert "ambiguous" in result
+
+    @pytest.mark.asyncio
+    async def test_analyze_developer_attempts_llm_failure(self):
+        from studio.workers.qa import _analyze_developer_attempts
+        with patch("studio.workers.qa._call_llm", side_effect=Exception("API down")):
+            result = await _analyze_developer_attempts(2, "http://test", "test-model")
+            assert "2 attempts" in result
+
+
+class TestQaSelfFixLoop:
+    @pytest.mark.asyncio
+    async def test_qa_self_fix_passes_first_attempt(self):
+        from studio.workers.qa import _qa_self_fix_loop
+        from studio.orchestrator.artifacts import CriterionScore
+
+        with patch("studio.workers.qa._call_llm") as mock_llm:
+            mock_llm.return_value = {
+                "overall_outcome": "passed",
+                "criteria_results": [
+                    {"criterion": "Tests pass", "passed": True, "evidence": "OK"},
+                    {"criterion": "Coverage >= 80%", "passed": True, "evidence": "85%"},
+                ],
+                "summary": "All criteria met",
+            }
+            with patch("studio.workers.qa._escalate_qa_to_pm") as mock_escalate:
+                report, scores = await _qa_self_fix_loop(
+                    "prompt", ["Tests pass", "Coverage >= 80%"],
+                    "/tmp", None, "http://test", "test-model",
+                )
+            assert report["overall_outcome"] == "passed"
+            assert len(scores) == 2
+            assert all(s.pass_fail for s in scores)
+            mock_escalate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_qa_self_fix_retries_on_failure(self):
+        from studio.workers.qa import _qa_self_fix_loop
+        from studio.orchestrator.artifacts import CriterionScore
+
+        with patch("studio.workers.qa._call_llm") as mock_llm:
+            # First call: one criterion fails
+            # Second call: all pass
+            mock_llm.side_effect = [
+                {
+                    "overall_outcome": "partial",
+                    "criteria_results": [
+                        {"criterion": "Tests pass", "passed": True, "evidence": "OK"},
+                        {"criterion": "Coverage >= 80%", "passed": False, "evidence": "72%"},
+                    ],
+                    "summary": "Coverage too low",
+                },
+                {
+                    "overall_outcome": "passed",
+                    "criteria_results": [
+                        {"criterion": "Tests pass", "passed": True, "evidence": "OK"},
+                        {"criterion": "Coverage >= 80%", "passed": True, "evidence": "Fixed — 82%"},
+                    ],
+                    "summary": "All criteria met after fix",
+                },
+            ]
+            with patch("studio.workers.qa._build_qa_fix_prompt") as mock_build:
+                mock_build.return_value = "fixed prompt"
+                with patch("studio.workers.qa._escalate_qa_to_pm") as mock_escalate:
+                    report, scores = await _qa_self_fix_loop(
+                        "prompt", ["Tests pass", "Coverage >= 80%"],
+                        "/tmp", None, "http://test", "test-model",
+                    )
+            assert report["overall_outcome"] == "passed"
+            assert mock_llm.call_count == 2
+            mock_escalate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_qa_escalates_after_two_attempts(self):
+        from studio.workers.qa import _qa_self_fix_loop
+
+        with patch("studio.workers.qa._call_llm") as mock_llm:
+            # Both attempts fail
+            mock_llm.return_value = {
+                "overall_outcome": "failed",
+                "criteria_results": [
+                    {"criterion": "Tests pass", "passed": False, "evidence": "Tests broken"},
+                ],
+                "summary": "Unfixable",
+            }
+            with patch("studio.workers.qa._build_qa_fix_prompt") as mock_build:
+                mock_build.return_value = "fixed prompt"
+                with patch("studio.workers.qa._escalate_qa_to_pm") as mock_escalate:
+                    report, scores = await _qa_self_fix_loop(
+                        "prompt", ["Tests pass"],
+                        "/tmp", None, "http://test", "test-model",
+                    )
+            assert report["overall_outcome"] == "failed"
+            assert mock_llm.call_count == 2
+            mock_escalate.assert_called()

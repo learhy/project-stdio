@@ -75,3 +75,13 @@ class VerificationStrategy(BaseModel):
             validate_command=d.get("validate_command"),
             review=d.get("review"),
         )
+
+
+# ── Criterion scoring ─────────────────────────────────────────────────────
+
+
+class CriterionScore(BaseModel):
+    criterion: str = ""
+    score: float = 0.0  # 0.0 to 1.0
+    evidence: str = ""
+    pass_fail: bool = False
