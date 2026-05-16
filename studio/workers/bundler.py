@@ -67,9 +67,9 @@ Respond with a single JSON object matching this schema exactly:
         "id": "<string>",
         "kind": "worker | gate | aggregator",
         "spec": {
-          "objective": "<required: exact task this worker must complete>",
+          "objective": "<required: exact task this worker must complete, with ALL endpoint paths, request/response field names, and expected behavior spelled out in full — the worker must never need to ask follow-up questions>",
           "capability": "<code | file | documentation | review>",
-          "description": "<what to produce and how>",
+          "description": "<step-by-step implementation details including exact field names, status codes, and data types — every detail the worker needs to complete the task without any clarification questions>",
           "language": "<python | markdown | etc>",
           "dependencies": ["<package names>"]
         }
@@ -128,6 +128,34 @@ Set the `target` field using this algorithm:
 You MUST populate the concerns list with at least one entry. Possible concerns: what could go wrong, what assumptions are you making, what information is missing, what would you want a second opinion on, what calibration signals are relevant.
 
 **"No concerns" on a bundle with risk_score >= 6 is forbidden** — it is a calibration signal that something is off, not confirmation the bundle is safe. If risk >= 6 and you genuinely have no concerns, write: "Risk score is high (>=6) but no specific concerns identified — this is itself a calibration signal."
+
+## Worker spec requirements — CRITICAL
+
+Every worker node spec MUST be self-contained. The worker runs in an isolated environment with no access to the original idea or other nodes' specs. It cannot ask questions (the question tool is disabled in headless mode). If the worker lacks any detail it needs, it will fail silently.
+
+**The objective and description together must include:**
+- Every endpoint path and method (e.g. POST /should-i-have-this-meeting)
+- Every request field with its exact name and type (e.g. "attendee_count": int, not "attendees": int)
+- Every response field with its exact name (e.g. returns {"answer": "yes", "reason": "..."}, not returns "a decision")
+- All required status codes and error conditions
+- Any specific behavior requirements (use random.choice, validate input types, etc.)
+
+**Example of a GOOD worker spec:**
+```
+objective: "Write app.py containing a Flask app with these exact endpoints:
+1. POST /should-i-have-this-meeting — accepts JSON {\"title\": \"...\", \"attendee_count\": N}, returns {\"answer\": \"yes\", \"reason\": \"...\"} or {\"answer\": \"no\", \"reason\": \"...\"}
+2. POST /estimate-multiplier — accepts {\"task_description\": \"...\", \"original_estimate_hours\": N}, returns {\"multiplier\": 1.5, \"revised_hours\": ..., \"explanation\": \"...\"}
+3. GET /standup-excuse — returns {\"excuse\": \"...\"}
+4. POST /prioritize — accepts {\"tasks\": [...], \"criteria\": \"...\"}, returns {\"prioritized\": [...]}
+Include proper error handling: return 400 JSON {\"error\": \"...\"} for missing parameters."
+description: "Use flask. For /should-i-have-this-meeting, use random.choice on a list of yes/no with matching reasons. For /estimate-multiplier, pick a random multiplier between 1.5-3.0 and compute revised_hours. For /standup-excuse, pick from a hardcoded list of 5-10 funny tech excuses. For /prioritize, sort the tasks array based on relevance to criteria string. Validate all input types."
+```
+
+**Example of a BAD worker spec (will cause worker failure):**
+```
+objective: "Write app.py with the four required endpoints"
+description: "Implement the endpoints as described in the requirements"
+```
 
 ## Memory context
 

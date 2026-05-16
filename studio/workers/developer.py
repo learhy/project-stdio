@@ -188,10 +188,11 @@ class DeveloperWorker:
             prompt_parts.append(f"\nUse {language}.")
         bundle_idea = self.task_spec.get("bundle_idea", "")
         if bundle_idea:
-            prompt_parts.append(f"\nFull specification from the original request:\n{bundle_idea}")
+            # Only include if not already covered by the objective+description
+            prompt_parts.append(f"\n---\nAdditional context from the original request:\n{bundle_idea}")
         bundle_requirements = self.task_spec.get("bundle_requirements", "")
-        if bundle_requirements and bundle_requirements != bundle_idea:
-            prompt_parts.append(f"\nRequirements: {bundle_requirements}")
+        if bundle_requirements:
+            prompt_parts.append(f"\nRequirements summary: {bundle_requirements}")
         full_prompt = "\n".join(prompt_parts)
 
         self._log(f"Task objective: {full_prompt[:200]}")
