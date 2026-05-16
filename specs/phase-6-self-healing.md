@@ -188,3 +188,119 @@ Verification failures:
 Fix these specific failures. Do not change code that is working correctly.
 After fixing, the verification will run again automatically."""
 ```
+
+---
+
+## Bundle 6.3: QA worker enhancement
+
+### Background
+
+With the developer worker now self-verifying before commit, the QA worker receives better input. But the QA worker itself needs updating to reflect the new world: it now knows how many fix attempts the developer needed (calibration signal), it has the verification strategy to run its own deeper version of the smoke tests, and it should evaluate whether the developer's fix attempts revealed systematic issues worth flagging.
+
+### Changes
+
+**1. Deep verification using the same strategy**
+
+The QA worker reads the `verification_strategy` from the task spec and runs it again — but with additional depth:
+- For EXECUTABLE_APP: run all smoke tests PLUS any additional tests in the project's test suite
+- For LIBRARY: run full pytest with coverage, report coverage percentage
+- For all types: check that the code matches the acceptance criteria from the plan (LLM review pass)
+
+**2. Developer attempt analysis**
+
+If `verification_attempts > 1` in the worker's final report, the QA worker does an additional analysis pass:
+
+```
+"The developer needed {N} attempts to pass verification. 
+Review the attempt log and determine:
+1. Was the original spec ambiguous in a way that caused the failures?
+2. Did the fixes address the root cause or just the symptoms?
+3. Are there likely regression risks from the fixes?"
+```
+
+This analysis is included in the QA final report and feeds into calibration.
+
+**3. Acceptance criteria scoring**
+
+The QA worker scores each acceptance criterion from the plan:
+
+```python
+@dataclass  
+class CriterionScore:
+    criterion: str
+    score: float        # 0.0 to 1.0
+    evidence: str       # what the QA worker found
+    pass_fail: bool
+```
+
+Overall pass requires all criteria scored >= 0.7. Below that, the QA worker either tries to fix (for gaps it can address) or escalates to PM with specific criterion failures.
+
+**4. QA self-fix loop**
+
+Same structure as the developer worker's loop, but scoped to acceptance criteria failures rather than smoke test failures. Max 2 attempts (QA is supposed to be verification, not development — if it needs more than 2 attempts, something is wrong with the spec or the output).
+
+### Tests
+
+- test_qa_reads_verification_strategy: QA runs smoke tests using bundler-provided strategy
+- test_qa_analyzes_developer_attempts: multi-attempt flag triggers analysis pass
+- test_qa_scores_acceptance_criteria: all criteria scored, failing criteria identified
+- test_qa_self_fix_on_criterion_failure: QA attempts fix for failing criterion
+- test_qa_escalates_after_two_attempts: exhausted QA fix attempts escalates to PM
+
+Branch: phase-6/qa-enhancement. Merge 6.2 first. Report ambiguities before coding.
+
+---
+
+## Bundle 6.4: Calibration integration and metrics
+
+### New calibration dimensions
+
+Add to the calibration scoring system:
+
+- `developer_verification_attempts`: how many fix attempts the developer needed
+- `first_attempt_pass_rate`: % of bundles where developer passed on first try (tracks spec quality over time)
+- `verification_strategy_accuracy`: did the bundler's predicted verification strategy work? (tracks bundler planning quality)
+- `qa_criterion_scores`: average score per acceptance criterion type over time
+- `failure_category_distribution`: what kinds of failures are most common (import errors, logic errors, spec deviations)
+
+### Calibration report additions
+
+New section in `studio calibration-report`:
+
+```
+## Code quality metrics
+First-attempt verification pass rate:  67% (target: >80%)
+Average fix attempts before pass:       1.8 (target: <2.0)
+QA criterion pass rate:                 91%
+Most common failure category:           Missing dependencies (38%)
+Spec clarity score:                     72% (inferred from multi-attempt patterns)
+
+Recommendations:
+- "Missing dependencies" failures suggest bundler should include explicit
+  dependency lists in task specs
+- 3 bundles needed 4+ attempts -- review those task specs for clarity
+```
+
+### Todoist integration
+
+When a bundle completes with `verification_attempts >= 4` or `qa_criterion_pass_rate < 0.7`, automatically create a Todoist task for the PM:
+
+```
+"Review: <bundle idea> needed <N> attempts and scored <X>% on QA criteria.
+Consider improving the spec template for <artifact_type> bundles."
+```
+
+This closes the human feedback loop: the calibration system notices systemic problems and surfaces them as actionable tasks rather than burying them in reports.
+
+Branch: phase-6/calibration-metrics. Merge 6.3 first. Report ambiguities before coding.
+
+---
+
+## Process
+
+Same as previous phases:
+1. Write specs/phase-6-self-healing.md to main (no PR needed for spec)
+2. Build bundles sequentially: 6.1 → 6.2 → 6.3 → 6.4
+3. For each bundle: report ALL numbered ambiguities → resolve → build → test → merge
+4. Do not begin coding until all ambiguities are resolved
+5. Do not proceed to next bundle until current bundle is merged
