@@ -700,6 +700,13 @@ class OpsSettings(BaseModel):
     worker_token_expiry_minutes: int = 15
 
 
+class DeveloperSettings(BaseModel):
+    """Developer worker self-healing configuration (Bundle 6.2)."""
+    max_fix_attempts: int = 5
+    verification_timeout_seconds: int = 60
+    skip_verification_for_types: list[str] = Field(default_factory=lambda: ["documentation"])
+
+
 class ReviewSettings(BaseModel):
     """Review scheduler and LLM evaluation configuration (Bundle 5.2)."""
     enabled: bool = True
@@ -789,6 +796,7 @@ class Settings(BaseModel):
     approval: ApprovalSettings = Field(default_factory=ApprovalSettings)
     ops: OpsSettings = Field(default_factory=OpsSettings)
     review: ReviewSettings = Field(default_factory=ReviewSettings)
+    developer: DeveloperSettings = Field(default_factory=DeveloperSettings)
     secrets_config: list[SecretsConfigEntry] = Field(default_factory=list)
 
 
