@@ -531,6 +531,21 @@ async def _migrate_v15(conn: aiosqlite.Connection) -> None:
     """)
 
 
+@migration(16)
+async def _migrate_v16(conn: aiosqlite.Connection) -> None:
+    """Add artifact_type and verification_strategy_json to bundles (Bundle 6.1)."""
+    cursor = await conn.execute("PRAGMA table_info('bundles')")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "artifact_type" not in columns:
+        await conn.execute(
+            "ALTER TABLE bundles ADD COLUMN artifact_type TEXT"
+        )
+    if "verification_strategy_json" not in columns:
+        await conn.execute(
+            "ALTER TABLE bundles ADD COLUMN verification_strategy_json TEXT"
+        )
+
+
 class Database:
     """Manages the SQLite connection pool and schema lifecycle."""
 

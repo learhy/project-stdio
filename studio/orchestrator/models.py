@@ -495,6 +495,8 @@ class BundleProposal(BaseModel):
     irreversible: bool = False
     tags: list[str] = Field(default_factory=list)
     self_escalation_tier: str | None = None
+    artifact_type: str = "mixed"
+    verification_strategy: dict | None = None
 
 
 # ── Review track models ───────────────────────────────────────────────────────

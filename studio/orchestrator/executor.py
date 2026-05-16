@@ -682,6 +682,10 @@ class DagExecutor:
                         normalized["bundle_requirements"] = bundler["requirements_summary"]
                     if bundler.get("implementation_plan"):
                         normalized["bundle_plan"] = bundler["implementation_plan"]
+                    if bundler.get("artifact_type"):
+                        normalized["artifact_type"] = bundler["artifact_type"]
+                    if bundler.get("verification_strategy"):
+                        normalized["verification_strategy"] = bundler["verification_strategy"]
         except Exception:
             pass
 

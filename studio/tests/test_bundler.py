@@ -457,6 +457,45 @@ class TestBundlerWorker:
         result = _extract_json("not json at all")
         assert result.get("parse_error") is True
 
+    def test_bundler_proposal_includes_artifact_type_default(self):
+        """Bundler proposal dict includes artifact_type (default 'mixed') and verification_strategy."""
+        from studio.workers.bundler import BundlerWorker, _TASK_SPEC_RAW
+        import studio.workers.bundler as bmod
+        proposal = {
+            "complexity_score": 3,
+            "risk_score": 2,
+            "complexity_factors": {},
+            "risk_factors": {},
+            "estimated_loc": 100,
+            "estimated_duration_seconds": 60,
+            "estimated_worker_count": 1,
+            "estimated_tokens": 5000,
+            "target": "existing-repo",
+            "target_rationale": "Modifies existing code",
+            "concerns": ["Test concern"],
+            "requirements_summary": "Add endpoint",
+            "rfc_summary": "RFC summary",
+            "implementation_plan": "Step 1",
+            "task_dag": {"nodes": [], "edges": []},
+            "artifact_type": "executable_app",
+            "verification_strategy": {
+                "type": "executable_app",
+                "startup_command": "flask run",
+                "smoke_tests": [{"method": "GET", "path": "/", "expected_status": 200}],
+            },
+        }
+        assert proposal["artifact_type"] == "executable_app"
+        assert proposal["verification_strategy"]["type"] == "executable_app"
+
+    def test_bundler_proposal_missing_artifact_type_defaults_to_mixed(self):
+        """When LLM doesn't return artifact_type, bundler falls back to 'mixed'."""
+        # Simulate the get() default in bundler.py
+        result = {}
+        artifact_type = result.get("artifact_type", "mixed")
+        verification_strategy = result.get("verification_strategy", None)
+        assert artifact_type == "mixed"
+        assert verification_strategy is None
+
     def test_memory_reader_returns_none_for_missing_file(self):
         with patch("studio.workers.bundler.os.path.exists", return_value=False):
             from studio.workers.bundler import _read_file

@@ -275,3 +275,103 @@ def test_known_version_constants_are_frozensets():
     assert "1.0" in models.KNOWN_CAPABILITY_MANIFEST_VERSIONS
     assert "1.0" in models.KNOWN_TASK_DAG_VERSIONS
     assert "1.0-phase-1" in models.KNOWN_SUBMISSION_VERSIONS
+
+
+# ── Bundle 6.1: Artifact classification tests ──────────────────────────────
+
+def test_artifact_type_enum_values():
+    from studio.orchestrator.artifacts import ArtifactType
+    assert len(ArtifactType) == 7
+    assert ArtifactType.EXECUTABLE_APP == "executable_app"
+    assert ArtifactType.LIBRARY == "library"
+    assert ArtifactType.INFRASTRUCTURE == "infrastructure"
+    assert ArtifactType.DOCUMENTATION == "documentation"
+    assert ArtifactType.DATA_SCHEMA == "data_schema"
+    assert ArtifactType.TEST_SUITE == "test_suite"
+    assert ArtifactType.MIXED == "mixed"
+
+
+def test_verification_strategy_from_dict_executable_app():
+    from studio.orchestrator.artifacts import VerificationStrategy, ArtifactType
+    d = {
+        "type": "executable_app",
+        "startup_command": "flask run --port 5000",
+        "health_check": "GET http://localhost:5000/",
+        "smoke_tests": [
+            {"method": "GET", "path": "/health", "expected_status": 200},
+            {"method": "POST", "path": "/submit", "body": {"x": 1}, "expected_status": 201},
+        ],
+    }
+    vs = VerificationStrategy.from_dict(d)
+    assert vs.type == ArtifactType.EXECUTABLE_APP
+    assert vs.startup_command == "flask run --port 5000"
+    assert vs.health_check == "GET http://localhost:5000/"
+    assert len(vs.smoke_tests) == 2
+    assert vs.smoke_tests[0].method == "GET"
+    assert vs.smoke_tests[0].path == "/health"
+    assert vs.smoke_tests[1].body == {"x": 1}
+
+
+def test_verification_strategy_from_dict_library():
+    from studio.orchestrator.artifacts import VerificationStrategy, ArtifactType
+    d = {"type": "library", "test_command": "pytest"}
+    vs = VerificationStrategy.from_dict(d)
+    assert vs.type == ArtifactType.LIBRARY
+    assert vs.test_command == "pytest"
+
+
+def test_verification_strategy_from_dict_infrastructure():
+    from studio.orchestrator.artifacts import VerificationStrategy, ArtifactType
+    d = {"type": "infrastructure", "validate_command": "helm lint ."}
+    vs = VerificationStrategy.from_dict(d)
+    assert vs.type == ArtifactType.INFRASTRUCTURE
+    assert vs.validate_command == "helm lint ."
+
+
+def test_verification_strategy_from_dict_documentation():
+    from studio.orchestrator.artifacts import VerificationStrategy, ArtifactType
+    d = {"type": "documentation", "review": "llm"}
+    vs = VerificationStrategy.from_dict(d)
+    assert vs.type == ArtifactType.DOCUMENTATION
+    assert vs.review == "llm"
+
+
+def test_verification_strategy_from_dict_data_schema():
+    from studio.orchestrator.artifacts import VerificationStrategy, ArtifactType
+    d = {"type": "data_schema", "validate_command": "python -m jsonschema schema.json"}
+    vs = VerificationStrategy.from_dict(d)
+    assert vs.type == ArtifactType.DATA_SCHEMA
+    assert vs.validate_command == "python -m jsonschema schema.json"
+
+
+def test_bundle_proposal_artifact_type_default():
+    from studio.orchestrator.models import BundleProposal
+    p = BundleProposal()
+    assert p.artifact_type == "mixed"
+    assert p.verification_strategy is None
+
+
+def test_bundle_proposal_with_artifact_classification():
+    from studio.orchestrator.models import BundleProposal
+    p = BundleProposal(
+        artifact_type="executable_app",
+        verification_strategy={
+            "type": "executable_app",
+            "startup_command": "flask run --port 5000",
+            "smoke_tests": [{"method": "GET", "path": "/", "expected_status": 200}],
+        },
+    )
+    assert p.artifact_type == "executable_app"
+    assert p.verification_strategy["type"] == "executable_app"
+    assert len(p.verification_strategy["smoke_tests"]) == 1
+
+
+def test_bundle_proposal_serialization_includes_artifact_fields():
+    from studio.orchestrator.models import BundleProposal
+    p = BundleProposal(
+        artifact_type="library",
+        verification_strategy={"type": "library", "test_command": "pytest"},
+    )
+    dumped = p.model_dump()
+    assert dumped["artifact_type"] == "library"
+    assert dumped["verification_strategy"]["test_command"] == "pytest"

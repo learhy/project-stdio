@@ -129,6 +129,72 @@ You MUST populate the concerns list with at least one entry. Possible concerns: 
 
 **"No concerns" on a bundle with risk_score >= 6 is forbidden** — it is a calibration signal that something is off, not confirmation the bundle is safe. If risk >= 6 and you genuinely have no concerns, write: "Risk score is high (>=6) but no specific concerns identified — this is itself a calibration signal."
 
+## Artifact classification
+
+You MUST include two additional top-level fields in your JSON output:
+
+- `artifact_type`: one of `executable_app`, `library`, `infrastructure`, `documentation`, `data_schema`, `test_suite`, `mixed`
+- `verification_strategy`: an object with a `type` field matching the artifact_type, plus type-specific fields
+
+### Per-type verification strategy examples
+
+**executable_app** (Flask, FastAPI, CLI, scripts):
+```json
+{
+  "type": "executable_app",
+  "startup_command": "flask run --port 5000",
+  "health_check": "GET http://localhost:5000/",
+  "smoke_tests": [
+    {"method": "GET", "path": "/should-i-have-this-meeting?title=Test", "expected_status": 200},
+    {"method": "POST", "path": "/prioritize", "body": {"tasks": ["a", "b"]}, "expected_status": 200}
+  ],
+  "teardown_command": null
+}
+```
+
+**library** (Python packages, npm packages):
+```json
+{
+  "type": "library",
+  "test_command": "pytest"
+}
+```
+
+**infrastructure** (Dockerfile, Helm, Terraform):
+```json
+{
+  "type": "infrastructure",
+  "validate_command": "helm lint ."
+}
+```
+
+**documentation** (README, API docs, specs):
+```json
+{
+  "type": "documentation",
+  "review": "llm"
+}
+```
+
+**data_schema** (SQL migrations, JSON schemas, OpenAPI specs):
+```json
+{
+  "type": "data_schema",
+  "validate_command": "python -m jsonschema schema.json"
+}
+```
+
+**mixed**: include a `sub_strategies` array with one entry per sub-type detected.
+
+Classification guidelines:
+- Flask/FastAPI/CLI/script → executable_app
+- Package with tests → library
+- Dockerfile/Helm/Terraform → infrastructure
+- Documentation-only → documentation
+- Schema/spec-only → data_schema
+- Tests-only → test_suite
+- Multiple types → mixed (describe each sub-type in sub_strategies)
+
 ## Worker spec requirements — CRITICAL
 
 Every worker node spec MUST be self-contained. The worker runs in an isolated environment with no access to the original idea or other nodes' specs. It cannot ask questions (the question tool is disabled in headless mode). If the worker lacks any detail it needs, it will fail silently.
@@ -494,6 +560,8 @@ Produce the bundle proposal JSON now. Include all required fields: complexity an
             "rfc_summary": result.get("rfc_summary", ""),
             "implementation_plan": result.get("implementation_plan", ""),
             "task_dag": result.get("task_dag", {"nodes": [], "edges": []}),
+            "artifact_type": result.get("artifact_type", "mixed"),
+            "verification_strategy": result.get("verification_strategy", None),
         }
 
         await self.rpc.notify("worker.progress_report", {

@@ -1129,3 +1129,70 @@ class TestWorkerRouting:
         task_spec = call_kwargs["task_spec"]
         assert task_spec["objective"] == "add login page"
 
+    @pytest.mark.asyncio
+    async def test_enriches_task_spec_with_artifact_type(self, executor, db_mock, runner_mock):
+        """Executor enriches task_spec with artifact_type from proposal_json."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {
+                "proposal_json": json.dumps({
+                    "proposal": {
+                        "artifact_type": "executable_app",
+                        "verification_strategy": {
+                            "type": "executable_app",
+                            "startup_command": "flask run",
+                            "smoke_tests": [{"method": "GET", "path": "/", "expected_status": 200}],
+                        },
+                    },
+                }),
+            },
+            {"cnt": 0},
+        ]
+        db_mock.fetch_all = AsyncMock()
+
+        result = MagicMock()
+        result.worker_id = "w_b1_n1"
+        result.process = MagicMock()
+        result.error = None
+        runner_mock.spawn_worker.return_value = result
+
+        node = {
+            "id": "b1:n1", "node_id": "n1", "kind": "worker",
+            "spec_json": json.dumps({"spec": {"objective": "add health endpoint"}}),
+        }
+
+        await executor._dispatch_worker("b1", node)
+
+        call_kwargs = runner_mock.spawn_worker.call_args.kwargs
+        task_spec = call_kwargs["task_spec"]
+        assert task_spec["artifact_type"] == "executable_app"
+        assert task_spec["verification_strategy"]["type"] == "executable_app"
+        assert task_spec["verification_strategy"]["startup_command"] == "flask run"
+
+    @pytest.mark.asyncio
+    async def test_no_artifact_type_when_missing_from_proposal(self, executor, db_mock, runner_mock):
+        """Executor gracefully skips artifact_type when not in proposal_json."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"proposal_json": json.dumps({"proposal": {}})},
+            {"cnt": 0},
+        ]
+        db_mock.fetch_all = AsyncMock()
+
+        result = MagicMock()
+        result.worker_id = "w_b1_n1"
+        result.process = MagicMock()
+        result.error = None
+        runner_mock.spawn_worker.return_value = result
+
+        node = {
+            "id": "b1:n1", "node_id": "n1", "kind": "worker",
+            "spec_json": json.dumps({"spec": {"objective": "add docs"}}),
+        }
+
+        await executor._dispatch_worker("b1", node)
+
+        call_kwargs = runner_mock.spawn_worker.call_args.kwargs
+        task_spec = call_kwargs["task_spec"]
+        assert "artifact_type" not in task_spec
+        assert "verification_strategy" not in task_spec

@@ -193,6 +193,8 @@ class Orchestrator:
             irreversible=bundler_proposal_raw.get("irreversible", False),
             tags=bundler_proposal_raw.get("tags", []),
             self_escalation_tier=bundler_proposal_raw.get("self_escalation_tier"),
+            artifact_type=bundler_proposal_raw.get("artifact_type", "mixed"),
+            verification_strategy=bundler_proposal_raw.get("verification_strategy"),
         )
 
         # Parse mandatory-review triggers from settings

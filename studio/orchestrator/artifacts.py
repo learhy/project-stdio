@@ -1,0 +1,60 @@
+"""Artifact classification and verification strategy models.
+
+Separate from artifact.py (storage/GC layer). ArtifactType and VerificationStrategy
+are metadata models for the bundler → developer worker pipeline.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class ArtifactType(StrEnum):
+    EXECUTABLE_APP = "executable_app"      # Flask, FastAPI, CLI tools, scripts
+    LIBRARY = "library"                     # Python packages, npm packages
+    INFRASTRUCTURE = "infrastructure"       # Dockerfile, Helm chart, Terraform
+    DOCUMENTATION = "documentation"         # README, API docs, specs
+    DATA_SCHEMA = "data_schema"            # SQL migrations, JSON schemas, OpenAPI specs
+    TEST_SUITE = "test_suite"              # Tests only (no production code)
+    MIXED = "mixed"                        # Multiple types in one bundle
+
+
+# ── Verification strategy models ──────────────────────────────────────────────
+
+class SmokeTest(BaseModel):
+    method: str = "GET"
+    path: str
+    body: dict[str, Any] | None = None
+    expected_status: int = 200
+
+
+class VerificationStrategy(BaseModel):
+    type: ArtifactType
+    # EXECUTABLE_APP
+    startup_command: str | None = None
+    health_check: str | None = None
+    smoke_tests: list[SmokeTest] = Field(default_factory=list)
+    teardown_command: str | None = None
+    # LIBRARY / general
+    test_command: str | None = None
+    # INFRASTRUCTURE / DATA_SCHEMA
+    validate_command: str | None = None
+    # DOCUMENTATION
+    review: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> VerificationStrategy:
+        smoke = [SmokeTest(**s) for s in d.get("smoke_tests", [])]
+        return cls(
+            type=ArtifactType(d.get("type", "executable_app")),
+            startup_command=d.get("startup_command"),
+            health_check=d.get("health_check"),
+            smoke_tests=smoke,
+            teardown_command=d.get("teardown_command"),
+            test_command=d.get("test_command"),
+            validate_command=d.get("validate_command"),
+            review=d.get("review"),
+        )
