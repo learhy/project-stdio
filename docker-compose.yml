@@ -1,0 +1,20 @@
+version: "3"
+
+services:
+  situation-room:
+    build: ./situation-room
+    ports:
+      - "5001:5001"
+
+  metric-massager:
+    build: ./metric-massager
+    ports:
+      - "5002:5002"
+
+  war-room:
+    build: ./war-room-dashboard
+    ports:
+      - "3000:3000"
+    depends_on:
+      - situation-room
+      - metric-massager
