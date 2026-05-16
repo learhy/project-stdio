@@ -169,14 +169,113 @@ class DeveloperWorker:
         objective = self.task_spec.get("objective", self.task_spec.get("idea", "execute task"))
         model = self.task_spec.get("model", "ollama-cloud/deepseek-v4-pro")
         gates: list[str] = self.task_spec.get("gates", [])
+        artifact_type = self.task_spec.get("artifact_type", "mixed")
+        verification_strategy = self.task_spec.get("verification_strategy")
+        max_attempts = self.task_spec.get("max_fix_attempts", 5)
+        skip_verification_types = self.task_spec.get("skip_verification_for_types", ["documentation"])
 
-        # Set up git identity in worktree
         self._log(f"Worktree: {_WORKTREE_PATH}, base branch: {_BASE_BRANCH}")
         self._setup_git_identity()
+        self._init_opencode_project()
 
-        # Build a rich prompt so opencode has full context, not just the terse objective.
-        # The bundler often puts critical details (endpoint paths, payloads, etc.) in
-        # the description field rather than the objective.
+        initial_prompt = self._build_initial_prompt(objective)
+        self._log(f"Task objective: {initial_prompt[:200]}")
+        await self.rpc.notify("worker.progress_report", {
+            "stage": "starting",
+            "percent": 0,
+            "message": f"Starting task: {objective[:100]}",
+        })
+
+        last_result = None
+        opencode_errors: list[str] = []
+
+        for attempt in range(1, max_attempts + 1):
+            # Step 1: Write (or fix) the code
+            if attempt == 1:
+                prompt = initial_prompt
+            elif last_result is not None:
+                prompt = self._build_fix_prompt(objective, last_result.failures, attempt)
+            else:
+                prompt = self._build_opencode_retry_prompt(objective, opencode_errors, attempt)
+
+            self._log(f"Attempt {attempt}/{max_attempts}: running opencode")
+            opencode_result = await self._run_opencode(prompt, model)
+            opencode_errors = opencode_result.get("errors", [])
+
+            if opencode_result.get("stuck"):
+                await self._commit_worktree(objective, failed=True)
+                return opencode_result
+            if not opencode_result.get("success"):
+                self._log(f"OpenCode failed on attempt {attempt}: {opencode_result.get('summary', '')}")
+                await self._report_checkpoint(
+                    phase_completed=f"Attempt {attempt}: opencode failed",
+                    phase_starting=f"Attempt {attempt + 1}: retrying" if attempt < max_attempts else "All attempts exhausted",
+                    concerns=[opencode_result.get("summary", "opencode failure")],
+                )
+                if attempt < max_attempts:
+                    continue
+                await self._escalate_to_pm(objective, [], max_attempts)
+                await self._commit_worktree(objective, failed=True)
+                return {"outcome": "failure", "summary": f"OpenCode failed after {max_attempts} attempts",
+                        "errors": opencode_result.get("errors", [])}
+
+            # Step 2: Verify
+            self._current_phase = "running-tests"
+            verify_result = await self._run_verification(verification_strategy, skip_verification_types)
+            verify_result.attempt = attempt
+            last_result = verify_result
+
+            if verify_result.passed:
+                # Step 3: Commit and run gates
+                self._log(f"Verification passed on attempt {attempt}")
+                committed = await self._commit_worktree(objective, failed=False)
+                if not committed:
+                    return {
+                        "outcome": "failure",
+                        "node_state": "failed",
+                        "summary": "No output produced — worker completed but generated zero code changes",
+                        "errors": ["no_output_produced"],
+                    }
+                gate_result = await self._run_gates(gates)
+                if not gate_result["passed"]:
+                    await self._commit_worktree(objective, failed=True)
+                    return {
+                        "outcome": "failure",
+                        "summary": f"Pre-merge gates failed: {gate_result['failed_gate']}",
+                        "errors": [gate_result["output"]],
+                        "tests_run": len(gates),
+                        "tests_failed": 1,
+                    }
+                return {
+                    "outcome": "success",
+                    "summary": f"Task completed on attempt {attempt}: {objective[:200]}",
+                    "attempts": attempt,
+                    "tests_run": len(gates),
+                    "tests_passed": len(gates),
+                    "files_changed": len(await self._get_files_changed()),
+                }
+
+            # Step 4: Build fix prompt from failure output (used in next iteration)
+            self._log(f"Verification failed on attempt {attempt}: {len(verify_result.failures)} failures")
+            await self._report_checkpoint(
+                phase_completed=f"Attempt {attempt} failed verification",
+                phase_starting=f"Attempt {attempt + 1}: fixing {len(verify_result.failures)} failures",
+                concerns=[f.summary for f in verify_result.failures],
+            )
+
+        # All attempts exhausted
+        await self._escalate_to_pm(objective, last_result.failures if last_result else [], max_attempts)
+        await self._commit_worktree(objective, failed=True)
+        return {
+            "outcome": "failure",
+            "summary": f"Verification failed after {max_attempts} attempts",
+            "attempts": max_attempts,
+            "errors": [f.summary for f in (last_result.failures if last_result else [])],
+        }
+
+    # ── Initial prompt construction ─────────────────────────────────────────
+
+    def _build_initial_prompt(self, objective: str) -> str:
         prompt_parts = [objective]
         description = self.task_spec.get("description", "")
         if description:
@@ -189,38 +288,24 @@ class DeveloperWorker:
             prompt_parts.append(f"\nUse {language}.")
         bundle_idea = self.task_spec.get("bundle_idea", "")
         if bundle_idea:
-            # Only include if not already covered by the objective+description
             prompt_parts.append(f"\n---\nAdditional context from the original request:\n{bundle_idea}")
         bundle_requirements = self.task_spec.get("bundle_requirements", "")
         if bundle_requirements:
             prompt_parts.append(f"\nRequirements summary: {bundle_requirements}")
-        full_prompt = "\n".join(prompt_parts)
+        return "\n".join(prompt_parts)
 
-        self._log(f"Task objective: {full_prompt[:200]}")
-        await self.rpc.notify("worker.progress_report", {
-            "stage": "starting",
-            "percent": 0,
-            "message": f"Starting task: {objective[:100]}",
-        })
+    # ── OpenCode execution ──────────────────────────────────────────────────
 
-        # Ensure the worktree has a .git/opencode file so opencode treats it
-        # as a distinct project and starts a fresh server bound to this directory.
-        self._init_opencode_project()
-
-        # opencode uses the grandparent process info for project detection
-        # when stdout is not a TTY. Wrap in bash -c so its parent is a shell
-        # whose cwd is the worktree, not the Python worker process.
+    async def _run_opencode(self, prompt: str, model: str) -> dict:
+        """Run opencode and return result dict. Does not commit."""
         saved_cwd = os.getcwd()
         chdir_done = False
         if os.path.isdir(_WORKTREE_PATH):
             os.chdir(_WORKTREE_PATH)
             chdir_done = True
 
-        # Build opencode command wrapped in bash so opencode inherits the
-        # shell's cwd rather than resolving via the Python parent process.
-        inner_cmd = f"{_OPencode_BIN} run --model {model} --print-logs {shlex.quote(full_prompt)}"
+        inner_cmd = f"{_OPencode_BIN} run --model {model} --print-logs {shlex.quote(prompt)}"
         cmd = ["bash", "-c", inner_cmd]
-        self._log(f"Running: opencode run --model {model} ...")
 
         try:
             self._agent_process = await asyncio.create_subprocess_exec(
@@ -236,34 +321,22 @@ class DeveloperWorker:
                 "message": "OpenCode is working...",
             })
 
-            # Stream stdout and detect stuckness
             stdout_lines, stderr_data, stuck = await self._stream_and_detect_stuck()
-
             returncode = await self._agent_process.wait()
 
             if stuck:
                 self._log("OpenCode appears stuck — requesting human input")
                 human_response = await self._request_human_input(
-                    f"OpenCode appears stuck on task: {objective[:200]}",
+                    f"OpenCode appears stuck on task: {prompt[:200]}",
                     "\n".join(stdout_lines[-20:]),
                 )
                 if human_response:
-                    self._log(f"Human response received: {human_response[:200]}")
-                    # Resume with context — for v1, commit WIP and report
-                    await self._commit_worktree(objective, failed=True)
-                    return {
-                        "outcome": "failure",
-                        "summary": f"Stuck — human responded: {human_response[:200]}",
-                        "errors": ["stuck-after-human-input"],
-                    }
-                else:
-                    # No human response after timeout — fail
-                    await self._commit_worktree(objective, failed=True)
-                    return {
-                        "outcome": "failure",
+                    return {"success": False, "stuck": True,
+                            "summary": f"Stuck — human responded: {human_response[:200]}",
+                            "errors": ["stuck-after-human-input"]}
+                return {"success": False, "stuck": True,
                         "summary": "Stuck — no human response within poll window",
-                        "errors": ["stuck-no-human-response"],
-                    }
+                        "errors": ["stuck-no-human-response"]}
 
             # Log output
             for line in stdout_lines[-30:]:
@@ -280,69 +353,124 @@ class DeveloperWorker:
                         "message": line[:500],
                     })
 
-            # Also write to stderr so orchestrator captures it via pipe draining
             print(f"[developer] opencode exit={returncode} stdout_lines={len(stdout_lines)} stderr_bytes={len(stderr_data)}", file=sys.stderr, flush=True)
-            for i, line in enumerate(stdout_lines):
-                print(f"[developer] stdout[{i}]: {line[:300]}", file=sys.stderr, flush=True)
 
             if returncode == 0:
-                # Run pre-merge gates
-                gate_result = await self._run_gates(gates)
-                if not gate_result["passed"]:
-                    await self._commit_worktree(objective, failed=True)
-                    return {
-                        "outcome": "failure",
-                        "summary": f"Pre-merge gates failed: {gate_result['failed_gate']}",
-                        "errors": [gate_result["output"]],
-                        "tests_run": len(gates),
-                        "tests_failed": 1,
-                    }
-
-                committed = await self._commit_worktree(objective, failed=False)
-                if not committed:
-                    return {
-                        "outcome": "failure",
-                        "node_state": "failed",
-                        "summary": "No output produced — worker completed but generated zero code changes",
-                        "errors": ["no_output_produced"],
-                        "tests_run": len(gates),
-                        "tests_passed": len(gates),
-                    }
-                return {
-                    "outcome": "success",
-                    "summary": f"Task completed: {objective[:200]}",
-                    "tests_run": len(gates),
-                    "tests_passed": len(gates),
-                    "files_changed": len(await self._get_files_changed()),
-                }
+                return {"success": True, "stuck": False, "stdout_lines": stdout_lines}
             else:
-                await self._commit_worktree(objective, failed=True)
-                return {
-                    "outcome": "failure",
-                    "summary": f"OpenCode exited with code {returncode}",
-                    "errors": [f"exit_code={returncode}"],
-                }
+                return {"success": False, "stuck": False,
+                        "summary": f"OpenCode exited with code {returncode}",
+                        "errors": [f"exit_code={returncode}"]}
 
         except asyncio.TimeoutError:
             if self._agent_process:
                 self._agent_process.kill()
                 await self._agent_process.wait()
-            await self._commit_worktree(objective, failed=True)
-            return {
-                "outcome": "timeout",
-                "summary": "OpenCode exceeded time limit",
-                "errors": ["timeout"],
-            }
+            return {"success": False, "stuck": False,
+                    "summary": "OpenCode exceeded time limit",
+                    "errors": ["timeout"]}
         except Exception as exc:
-            await self._commit_worktree(objective, failed=True)
-            return {
-                "outcome": "failure",
-                "summary": f"Execution error: {exc}",
-                "errors": [str(exc)],
-            }
+            return {"success": False, "stuck": False,
+                    "summary": f"Execution error: {exc}",
+                    "errors": [str(exc)]}
         finally:
             if chdir_done:
                 os.chdir(saved_cwd)
+
+    # ── Verification ────────────────────────────────────────────────────────
+
+    async def _run_verification(self, strategy: dict | None, skip_types: list[str]) -> "VerificationResult":
+        from .verification import VerificationRunner
+        from studio.orchestrator.artifacts import VerificationResult
+
+        timeout = self.task_spec.get("verification_timeout_seconds", 60)
+        runner = VerificationRunner(_WORKTREE_PATH, timeout_seconds=timeout)
+        try:
+            return await runner.run(strategy, skip_types)
+        except Exception as exc:
+            from studio.orchestrator.artifacts import VerificationFailure
+            return VerificationResult(
+                passed=False,
+                output=str(exc),
+                failures=[VerificationFailure(test_name="verification_runner", summary=str(exc))],
+            )
+
+    # ── Fix prompt construction ─────────────────────────────────────────────
+
+    def _build_fix_prompt(self, original_objective: str, failures: list, attempt: int) -> str:
+        failure_text = "\n".join([
+            f"FAILURE {i+1}: {f.test_name}\n"
+            f"  Expected: {f.expected}\n"
+            f"  Got: {f.actual}\n"
+            f"  Error: {f.error_output}"
+            for i, f in enumerate(failures)
+        ])
+
+        return f"""The code you wrote failed verification on attempt {attempt}.
+
+Original objective: {original_objective}
+
+Verification failures:
+{failure_text}
+
+Fix these specific failures. Do not change code that is working correctly.
+After fixing, the verification will run again automatically."""
+
+    def _build_opencode_retry_prompt(self, original_objective: str, errors: list[str], attempt: int) -> str:
+        error_text = "\n".join(f"- {e}" for e in errors) if errors else "Unknown error"
+        return f"""The previous attempt to execute this task failed with errors:
+
+{error_text}
+
+Original objective: {original_objective}
+
+Fix the error and complete the task. Do not repeat the same approach that caused the failure."""
+
+    # ── Escalation ──────────────────────────────────────────────────────────
+
+    async def _report_checkpoint(self, phase_completed: str, phase_starting: str, concerns: list[str]) -> None:
+        try:
+            await self.rpc.call("worker.report_checkpoint", {
+                "checkpoint_id": f"{_WORKER_ID}-{_now()}",
+                "phase_completed": phase_completed,
+                "phase_starting": phase_starting,
+                "summary": phase_completed,
+                "concerns": concerns,
+                "estimated_remaining": {},
+            })
+        except Exception:
+            pass
+
+    async def _escalate_to_pm(self, objective: str, failures: list, attempts: int) -> None:
+        from studio.orchestrator.artifacts import VerificationFailure
+
+        failure_lines = []
+        for f in failures:
+            if isinstance(f, VerificationFailure):
+                failure_lines.append(f"- {f.test_name}: {f.summary}")
+            else:
+                failure_lines.append(f"- {f}")
+
+        context = f"""Task: {objective[:500]}
+
+All {attempts} verification attempts exhausted.
+
+Failures:
+{chr(10).join(failure_lines) if failure_lines else 'OpenCode execution failure on every attempt'}"""
+
+        self._log(f"Escalating to PM after {attempts} attempts")
+        try:
+            await self.rpc.notify("worker.progress_report", {
+                "stage": "escalating",
+                "percent": 100,
+                "message": f"Escalating after {attempts} failed attempts",
+            })
+            await self._request_human_input(
+                f"All {attempts} verification attempts exhausted for task",
+                context,
+            )
+        except Exception:
+            pass
 
     async def _stream_and_detect_stuck(self) -> tuple[list[str], bytes, bool]:
         """Stream stdout from opencode, tracking rolling hash for stuck detection.

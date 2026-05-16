@@ -424,3 +424,250 @@ class TestHumanInput:
 
         resp = await w._request_human_input("What should I do?", "Context here")
         assert resp == "Try a different approach"
+
+
+# ── Bundle 6.2: Self-healing inner loop tests ──────────────────────────────
+
+class TestFixPromptConstruction:
+    def test_build_fix_prompt_from_failures(self):
+        from studio.orchestrator.artifacts import VerificationFailure
+        w = DeveloperWorker()
+        failures = [
+            VerificationFailure(test_name="GET /health", expected="status 200", actual="status 500",
+                               error_output="Internal Server Error", summary="Health check failed"),
+            VerificationFailure(test_name="POST /submit", expected="status 201", actual="status 400",
+                               error_output="Bad Request", summary="Submit failed"),
+        ]
+        prompt = w._build_fix_prompt("Build health API", failures, 2)
+        assert "failed verification on attempt 2" in prompt
+        assert "FAILURE 1: GET /health" in prompt
+        assert "Expected: status 200" in prompt
+        assert "Got: status 500" in prompt
+        assert "FAILURE 2: POST /submit" in prompt
+        assert "Do not change code that is working correctly" in prompt
+
+    def test_build_fix_prompt_empty_failures(self):
+        w = DeveloperWorker()
+        prompt = w._build_fix_prompt("Build API", [], 3)
+        assert "failed verification on attempt 3" in prompt
+        assert "Fix these specific failures" in prompt
+
+    def test_build_opencode_retry_prompt(self):
+        w = DeveloperWorker()
+        prompt = w._build_opencode_retry_prompt("Build API", ["exit_code=1", "timeout"], 2)
+        assert "previous attempt" in prompt
+        assert "exit_code=1" in prompt
+        assert "Do not repeat the same approach" in prompt
+
+
+class TestVerificationIntegration:
+    """Tests that verification runs as part of _execute_task inner loop."""
+
+    @pytest.mark.asyncio
+    async def test_loop_passes_on_first_attempt(self):
+        """Verification passes on first attempt → commit → gates → success."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {
+                "objective": "Build API",
+                "verification_strategy": {"type": "library", "test_command": "pytest"},
+            }
+            w.rpc.notify = AsyncMock()
+            w.rpc.call = AsyncMock()
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch.object(w, "_init_opencode_project"):
+                    with patch.object(w, "_run_opencode") as mock_opencode:
+                        mock_opencode.return_value = {"success": True, "stuck": False, "stdout_lines": ["Done"]}
+                        with patch.object(w, "_run_verification") as mock_verify:
+                            from studio.orchestrator.artifacts import VerificationResult
+                            mock_verify.return_value = VerificationResult(passed=True, output="All good")
+                            with patch.object(w, "_commit_worktree") as mock_commit:
+                                mock_commit.return_value = True
+                                with patch.object(w, "_get_files_changed") as mock_files:
+                                    mock_files.return_value = ["main.py"]
+                                    with patch.object(w, "_run_gates") as mock_gates:
+                                        mock_gates.return_value = {"passed": True, "failed_gate": "", "output": ""}
+
+                                        result = await w._execute_task()
+
+            assert result["outcome"] == "success"
+            assert result["attempts"] == 1
+            mock_opencode.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_loop_retries_on_verification_failure(self):
+        """Verification fails on attempt 1 → fix → passes on attempt 2."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {
+                "objective": "Build API",
+                "verification_strategy": {"type": "library", "test_command": "pytest"},
+                "max_fix_attempts": 5,
+            }
+            w.rpc.notify = AsyncMock()
+            w.rpc.call = AsyncMock()
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch.object(w, "_init_opencode_project"):
+                    with patch.object(w, "_run_opencode") as mock_opencode:
+                        mock_opencode.return_value = {"success": True, "stuck": False, "stdout_lines": ["Done"]}
+                        with patch.object(w, "_run_verification") as mock_verify:
+                            from studio.orchestrator.artifacts import VerificationResult, VerificationFailure
+                            # Fail first, pass second
+                            mock_verify.side_effect = [
+                                VerificationResult(passed=False, output="Tests failed",
+                                                   failures=[VerificationFailure(test_name="pytest",
+                                                                                 summary="1 test failed")]),
+                                VerificationResult(passed=True, output="All passing"),
+                            ]
+                            with patch.object(w, "_commit_worktree") as mock_commit:
+                                mock_commit.return_value = True
+                                with patch.object(w, "_get_files_changed") as mock_files:
+                                    mock_files.return_value = ["main.py"]
+                                    with patch.object(w, "_run_gates") as mock_gates:
+                                        mock_gates.return_value = {"passed": True, "failed_gate": "", "output": ""}
+                                        with patch.object(w, "_report_checkpoint") as mock_checkpoint:
+
+                                            result = await w._execute_task()
+
+            assert result["outcome"] == "success"
+            assert result["attempts"] == 2
+            assert mock_opencode.call_count == 2
+            mock_checkpoint.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_loop_exhausts_attempts_and_fails(self):
+        """All attempts fail verification → escalate → return failure."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {
+                "objective": "Build API",
+                "verification_strategy": {"type": "library", "test_command": "pytest"},
+                "max_fix_attempts": 2,
+            }
+            w.rpc.notify = AsyncMock()
+            w.rpc.call = AsyncMock()
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch.object(w, "_init_opencode_project"):
+                    with patch.object(w, "_run_opencode") as mock_opencode:
+                        mock_opencode.return_value = {"success": True, "stuck": False, "stdout_lines": ["Done"]}
+                        with patch.object(w, "_run_verification") as mock_verify:
+                            from studio.orchestrator.artifacts import VerificationResult, VerificationFailure
+                            mock_verify.return_value = VerificationResult(
+                                passed=False, output="Tests failed",
+                                failures=[VerificationFailure(test_name="pytest", summary="3 tests failed")],
+                            )
+                            with patch.object(w, "_escalate_to_pm") as mock_escalate:
+                                with patch.object(w, "_commit_worktree") as mock_commit:
+                                    mock_commit.return_value = True
+
+                                    result = await w._execute_task()
+
+            assert result["outcome"] == "failure"
+            assert result["attempts"] == 2
+            assert mock_opencode.call_count == 2
+            mock_escalate.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_gates_run_after_loop_passes(self):
+        """Gates run after verification passes, not during the loop."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {
+                "objective": "Build API",
+                "verification_strategy": {"type": "library", "test_command": "pytest"},
+            }
+            w.rpc.notify = AsyncMock()
+            w.rpc.call = AsyncMock()
+
+            call_order = []
+
+            async def tracking_verify(*args, **kwargs):
+                call_order.append("verify")
+                from studio.orchestrator.artifacts import VerificationResult
+                return VerificationResult(passed=True, output="OK")
+
+            async def tracking_commit(*args, **kwargs):
+                call_order.append("commit")
+                return True
+
+            async def tracking_gates(*args, **kwargs):
+                call_order.append("gates")
+                return {"passed": True, "failed_gate": "", "output": ""}
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch.object(w, "_init_opencode_project"):
+                    with patch.object(w, "_run_opencode") as mock_opencode:
+                        mock_opencode.return_value = {"success": True, "stuck": False, "stdout_lines": ["Done"]}
+                        with patch.object(w, "_run_verification", side_effect=tracking_verify):
+                            with patch.object(w, "_commit_worktree", side_effect=tracking_commit):
+                                with patch.object(w, "_get_files_changed") as mock_files:
+                                    mock_files.return_value = ["main.py"]
+                                    with patch.object(w, "_run_gates", side_effect=tracking_gates):
+                                        await w._execute_task()
+
+            assert call_order == ["verify", "commit", "gates"]
+
+    @pytest.mark.asyncio
+    async def test_documentation_type_skips_verification(self):
+        """Documentation artifact type in skip list → verification skipped."""
+        from studio.workers import developer
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {
+                "objective": "Write docs",
+                "artifact_type": "documentation",
+                "verification_strategy": {"type": "documentation", "review": "llm"},
+                "skip_verification_for_types": ["documentation"],
+            }
+            w.rpc.notify = AsyncMock()
+            w.rpc.call = AsyncMock()
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch.object(w, "_init_opencode_project"):
+                    with patch.object(w, "_run_opencode") as mock_opencode:
+                        mock_opencode.return_value = {"success": True, "stuck": False, "stdout_lines": ["Done"]}
+                        with patch.object(w, "_run_verification") as mock_verify:
+                            from studio.orchestrator.artifacts import VerificationResult
+                            mock_verify.return_value = VerificationResult(passed=True, output="Skipped")
+                            with patch.object(w, "_commit_worktree") as mock_commit:
+                                mock_commit.return_value = True
+                                with patch.object(w, "_get_files_changed") as mock_files:
+                                    mock_files.return_value = ["README.md"]
+                                    with patch.object(w, "_run_gates") as mock_gates:
+                                        mock_gates.return_value = {"passed": True, "failed_gate": "", "output": ""}
+
+                                        result = await w._execute_task()
+
+            assert result["outcome"] == "success"

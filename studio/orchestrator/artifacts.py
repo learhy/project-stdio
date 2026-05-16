@@ -12,6 +12,23 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+# ── Verification result models ──────────────────────────────────────────────
+
+class VerificationFailure(BaseModel):
+    test_name: str = ""
+    expected: str = ""
+    actual: str = ""
+    error_output: str = ""
+    summary: str = ""
+
+
+class VerificationResult(BaseModel):
+    passed: bool = False
+    failures: list[VerificationFailure] = Field(default_factory=list)
+    output: str = ""
+    attempt: int = 1
+
+
 class ArtifactType(StrEnum):
     EXECUTABLE_APP = "executable_app"      # Flask, FastAPI, CLI tools, scripts
     LIBRARY = "library"                     # Python packages, npm packages
