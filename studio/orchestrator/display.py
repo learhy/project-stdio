@@ -475,6 +475,45 @@ def format_calibration(data: dict[str, Any]) -> str:
             lines.append("  Consider lowering review.confidence_threshold (missed rate: "
                          f"{missed_rate:.0%})")
 
+    # ── Bundle 6.4: Code quality metrics ──────────────────────────────────
+
+    cq = data.get("code_quality")
+    if cq:
+        lines.append("")
+        lines.append("Code quality:")
+        fapr = cq.get("first_attempt_pass_rate")
+        if fapr is not None:
+            lines.append(f"  First-attempt verification pass rate: {fapr}% (target: >80%)")
+        else:
+            lines.append("  First-attempt verification pass rate: N/A")
+        afa = cq.get("avg_fix_attempts")
+        if afa is not None:
+            lines.append(f"  Average fix attempts before pass: {afa} (target: <2.0)")
+
+        qac = cq.get("qa_criterion_pass_rate")
+        if qac is not None:
+            lines.append(f"  QA criterion pass rate: {qac}%")
+
+        mcf = cq.get("most_common_failure_category")
+        mcfp = cq.get("most_common_failure_pct", 0)
+        if mcf is not None:
+            cat_label = mcf.replace("_", " ").title()
+            lines.append(f"  Most common failure category: {cat_label} ({mcfp}%)")
+
+        scs = cq.get("spec_clarity_score")
+        tv = cq.get("total_verified", 0)
+        if scs is not None:
+            lines.append(f"  Spec clarity score: {scs}% (based on {tv} bundles)")
+        elif tv > 0:
+            lines.append(f"  Spec clarity score: N/A (need 5+ bundles, have {tv})")
+
+        recs = cq.get("recommendations", [])
+        if recs:
+            lines.append("")
+            lines.append("Recommendations:")
+            for r in recs:
+                lines.append(f"  - {r}")
+
     return "\n".join(lines)
 
 

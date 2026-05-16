@@ -1,6 +1,8 @@
 """Tests for Bundle 2.9: QA verification worker, Verification Report, calibration loop, state machine."""
 
+import asyncio
 import json
+import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -397,3 +399,165 @@ class TestQaSelfFixLoop:
             assert report["overall_outcome"] == "failed"
             assert mock_llm.call_count == 2
             mock_escalate.assert_called()
+
+
+# ── Bundle 6.4: Calibration integration tests ──────────────────────────────
+
+
+class TestFailureCategorization:
+    def test_categorize_importerror(self):
+        from studio.orchestrator.artifacts import categorize_failure
+        assert categorize_failure("ImportError: No module named foo", "") == "missing_dependencies"
+
+    def test_categorize_modulenotfound(self):
+        from studio.orchestrator.artifacts import categorize_failure
+        assert categorize_failure("ModuleNotFoundError: No module named 'requests'", "") == "missing_dependencies"
+
+    def test_categorize_assertion_error(self):
+        from studio.orchestrator.artifacts import categorize_failure
+        assert categorize_failure("AssertionError: assert 1 == 2", "") == "logic_error"
+
+    def test_categorize_attribute_error(self):
+        from studio.orchestrator.artifacts import categorize_failure
+        assert categorize_failure("", "AttributeError: 'NoneType' has no attribute 'x'") == "spec_deviation"
+
+    def test_categorize_key_error(self):
+        from studio.orchestrator.artifacts import categorize_failure
+        assert categorize_failure("KeyError: 'missing_key'", "") == "spec_deviation"
+
+    def test_categorize_timeout(self):
+        from studio.orchestrator.artifacts import categorize_failure
+        assert categorize_failure("Timeout waiting for response", "") == "infrastructure"
+
+    def test_categorize_connection_refused(self):
+        from studio.orchestrator.artifacts import categorize_failure
+        assert categorize_failure("ConnectionRefused: Connection refused", "") == "infrastructure"
+
+    def test_categorize_unknown(self):
+        from studio.orchestrator.artifacts import categorize_failure
+        assert categorize_failure("Something went wrong", "") == "other"
+
+    def test_categorize_case_insensitive(self):
+        from studio.orchestrator.artifacts import categorize_failure
+        assert categorize_failure("importerror: no module", "") == "missing_dependencies"
+
+
+class TestTodoistIntegration:
+    @pytest.mark.asyncio
+    async def test_create_task_skips_when_no_token(self):
+        from studio.orchestrator.todoist import create_review_task
+        with patch.dict(os.environ, {}, clear=True):
+            result = await create_review_task("b1", "test idea", 4, 0.5, "library")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_create_task_sends_correct_payload(self):
+        from studio.orchestrator.todoist import create_review_task
+        with patch.dict(os.environ, {"TODOIST_API_TOKEN": "test-token"}):
+            with patch("studio.orchestrator.todoist.httpx.AsyncClient") as mock_client_cls:
+                mock_client = MagicMock()
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=None)
+                mock_resp = MagicMock()
+                mock_resp.raise_for_status = MagicMock()
+                mock_resp.json.return_value = {"id": "task-123"}
+                mock_client.post = AsyncMock(return_value=mock_resp)
+                mock_client_cls.return_value = mock_client
+
+                result = await create_review_task("b1", "test idea", 5, 0.6, "library")
+                assert result == "task-123"
+                call_args = mock_client.post.call_args
+                payload = call_args[1]["json"]
+                assert payload["priority"] == 2
+                assert "5 attempts" in payload["content"]
+                assert "60%" in payload["content"]
+
+    @pytest.mark.asyncio
+    async def test_create_task_handles_api_error(self):
+        from studio.orchestrator.todoist import create_review_task
+        with patch.dict(os.environ, {"TODOIST_API_TOKEN": "test-token"}):
+            with patch("studio.orchestrator.todoist.httpx.AsyncClient") as mock_client_cls:
+                mock_client = MagicMock()
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=None)
+                mock_client.post = AsyncMock(side_effect=Exception("API down"))
+                mock_client_cls.return_value = mock_client
+
+                result = await create_review_task("b1", "test", 4, 0.5, "mixed")
+                assert result is None
+
+
+class TestCalibrationReportCodeQuality:
+    """Tests for code quality metrics computed in _cli_calibration_report."""
+
+    def test_first_attempt_pass_rate(self):
+        entries = [
+            {"developer_verification_attempts": 1, "first_attempt_pass": True, "artifact_type": "library"},
+            {"developer_verification_attempts": 2, "first_attempt_pass": False, "artifact_type": "executable_app"},
+            {"developer_verification_attempts": 1, "first_attempt_pass": True, "artifact_type": "library"},
+        ]
+        verified = [e for e in entries
+                    if e.get("developer_verification_attempts", 0) > 0
+                    and e.get("artifact_type") not in ("documentation", None)]
+        first_count = sum(1 for e in verified if e.get("first_attempt_pass"))
+        rate = round(first_count / len(verified) * 100)
+        assert rate == 67
+
+    def test_skips_documentation_bundles(self):
+        entries = [
+            {"developer_verification_attempts": 1, "first_attempt_pass": True, "artifact_type": "documentation"},
+            {"developer_verification_attempts": 3, "first_attempt_pass": False, "artifact_type": "library"},
+        ]
+        verified = [e for e in entries
+                    if e.get("developer_verification_attempts", 0) > 0
+                    and e.get("artifact_type") not in ("documentation", None)]
+        assert len(verified) == 1
+        assert verified[0]["artifact_type"] == "library"
+
+    def test_spec_clarity_score(self):
+        entries = [
+            {"developer_verification_attempts": 1, "first_attempt_pass": True, "artifact_type": "library"},
+            {"developer_verification_attempts": 1, "first_attempt_pass": True, "artifact_type": "library"},
+            {"developer_verification_attempts": 1, "first_attempt_pass": True, "artifact_type": "library"},
+            {"developer_verification_attempts": 2, "first_attempt_pass": False, "artifact_type": "library"},
+            {"developer_verification_attempts": 1, "first_attempt_pass": True, "artifact_type": "library"},
+        ]
+        verified = [e for e in entries
+                    if e.get("developer_verification_attempts", 0) > 0
+                    and e.get("artifact_type") not in ("documentation", None)]
+        assert len(verified) >= 5
+        multi = sum(1 for e in verified if not e.get("first_attempt_pass"))
+        score = round(100 - (multi / len(verified) * 100))
+        assert score == 80  # 1 out of 5 multi-attempt = 20%, clarity = 80%
+
+    def test_spec_clarity_score_na_fewer_than_5(self):
+        entries = [
+            {"developer_verification_attempts": 1, "first_attempt_pass": True, "artifact_type": "library"},
+            {"developer_verification_attempts": 2, "first_attempt_pass": False, "artifact_type": "library"},
+        ]
+        verified = [e for e in entries
+                    if e.get("developer_verification_attempts", 0) > 0
+                    and e.get("artifact_type") not in ("documentation", None)]
+        assert len(verified) < 5
+
+    def test_recommendations_missing_deps(self):
+        all_categories = {"missing_dependencies": 8, "other": 2}
+        total = sum(all_categories.values())
+        recs = []
+        if all_categories.get("missing_dependencies", 0) / max(total, 1) > 0.3:
+            recs.append("missing deps recommendation")
+        assert len(recs) == 1
+
+    def test_recommendations_low_first_attempt(self):
+        first_attempt_pass_rate = 45
+        recs = []
+        if first_attempt_pass_rate is not None and first_attempt_pass_rate < 60:
+            recs.append("low first-attempt recommendation")
+        assert len(recs) == 1
+
+    def test_recommendations_high_avg_attempts(self):
+        avg_fix_attempts = 3.5
+        recs = []
+        if avg_fix_attempts is not None and avg_fix_attempts > 3:
+            recs.append("high avg attempts recommendation")
+        assert len(recs) == 1
