@@ -94,6 +94,10 @@ class Orchestrator:
         self._review_scheduler: ReviewScheduler | None = None
         self._review_task: asyncio.Task | None = None
         self._running = False
+        # Stale code detection
+        self._startup_code_hash: str = ""
+        self._code_stale: bool = False
+        self._code_check_task: asyncio.Task | None = None
 
     async def _on_bundler_report(self, bundle_id: str, proposal: dict) -> None:
         """Callback from RpcHandlers when a bundler worker sends final_report."""
@@ -101,6 +105,75 @@ class Orchestrator:
         logger.info("Bundler planning complete for bundle %s: C=%s R=%s target=%s",
                      bundle_id, proposal.get("complexity_score"),
                      proposal.get("risk_score"), proposal.get("target"))
+
+    # ── Stale code detection ──────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_code_hash() -> str:
+        """Hash all .py files under the studio/ package directory.
+
+        Returns a hex digest that changes when any source file is modified,
+        added, or removed. Walks deterministically (sorted paths) so the
+        hash is stable for identical trees.
+        """
+        import hashlib as _hashlib
+        studio_root = Path(__file__).resolve().parent.parent
+        h = _hashlib.sha256()
+        py_files = sorted(studio_root.rglob("*.py"))
+        for fp in py_files:
+            try:
+                h.update(fp.read_bytes())
+            except Exception:
+                h.update(fp.name.encode())
+        return h.hexdigest()
+
+    async def _check_code_hash(self) -> None:
+        """Compare current code hash to startup hash. Flag if stale."""
+        current = self._compute_code_hash()
+        if current != self._startup_code_hash:
+            if not self._code_stale:
+                self._code_stale = True
+                logger.warning(
+                    "Code change detected -- orchestrator running stale code. "
+                    "Restart required. (startup_hash=%s, current_hash=%s)",
+                    self._startup_code_hash[:12], current[:12],
+                )
+                await self._ntfy_alert(
+                    "Orchestrator code stale",
+                    f"Source files changed on disk but orchestrator has not been "
+                    f"restarted. Workers may see old behavior. Restart required.",
+                    priority=4,
+                )
+
+    async def _code_check_loop(self) -> None:
+        """Background task: re-check code hash every 60 seconds."""
+        while self._running:
+            try:
+                await self._check_code_hash()
+            except Exception as exc:
+                logger.debug("Code hash check failed: %s", exc)
+            await asyncio.sleep(60)
+
+    async def _ntfy_alert(self, title: str, message: str, priority: int = 4) -> None:
+        """Send a push notification via ntfy if configured."""
+        ntfy_url = self.settings.orchestrator.ntfy_url
+        if not ntfy_url:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                await client.post(
+                    ntfy_url,
+                    json={
+                        "topic": ntfy_url.rsplit("/", 1)[-1],
+                        "title": title,
+                        "message": message,
+                        "priority": priority,
+                        "tags": ["warning"],
+                    },
+                )
+        except Exception as exc:
+            logger.debug("ntfy alert failed: %s", exc)
         # Dispatch review track workers (adversarial, security, qa)
         if self.executor:
             await self.executor.start_bundle(bundle_id)
@@ -684,6 +757,10 @@ class Orchestrator:
         """Initialize all subsystems, recover state, and begin serving."""
         cfg = self.settings.orchestrator
 
+        # 0. Compute code hash at startup for stale-code detection
+        self._startup_code_hash = self._compute_code_hash()
+        logger.info("Startup code hash: %s", self._startup_code_hash[:16])
+
         # 1. Database
         self.db = await create_database(cfg.db_path)
 
@@ -863,6 +940,10 @@ class Orchestrator:
                      self.settings.ops.stall_threshold_hours,
                      self.settings.ops.recall_window_hours)
 
+        # 9.6.5. Stale code detection (poll every 60s)
+        self._code_check_task = asyncio.create_task(self._code_check_loop())
+        logger.info("Stale code detection started")
+
         # 9.7. Fleet health monitoring (Bundle 4.2)
         if self._ssh_runner is not None:
             self._fleet_health_task = asyncio.create_task(self._run_fleet_health_loop(self._ssh_runner))
@@ -964,6 +1045,13 @@ class Orchestrator:
             self._fleet_health_task.cancel()
             try:
                 await self._fleet_health_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._code_check_task:
+            self._code_check_task.cancel()
+            try:
+                await self._code_check_task
             except asyncio.CancelledError:
                 pass
 
@@ -2155,11 +2243,24 @@ async def _cli_status(app: Orchestrator, params: dict) -> dict:
     if app.settings.remote_workers.enabled:
         listeners.append(f"tcp:{app.settings.remote_workers.listen_addr}")
 
-    return {
+    result = {
         "uptime": uptime,
         "worker_count": worker_count,
         "queue_depth": queue_depth,
         "listeners": listeners,
+    }
+    if app._code_stale:
+        result["warning"] = "Code updated since last restart. Restart required."
+    return result
+
+
+async def _cli_version(app: Orchestrator, params: dict) -> dict:
+    installed_hash = Orchestrator._compute_code_hash()
+    return {
+        "installed_code_hash": installed_hash[:16],
+        "running_code_hash": app._startup_code_hash[:16],
+        "running_stale": installed_hash != app._startup_code_hash,
+        "running": True,
     }
 
 
@@ -2658,6 +2759,7 @@ _CLI_HANDLERS = {
     "studio.show_worker": _cli_show_worker,
     "studio.kill": _cli_kill,
     "studio.status": _cli_status,
+    "studio.version": _cli_version,
     "studio.calibration_report": _cli_calibration_report,
     "studio.recall": _cli_recall,
     "studio.health": _cli_health,

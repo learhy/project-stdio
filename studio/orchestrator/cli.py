@@ -470,8 +470,33 @@ async def cmd_docker_images() -> int:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def cmd_version() -> int:
+    """Show installed version and whether running orchestrator is current."""
+    resp = await _send_rpc(_get_socket_path(), "studio.version", {})
+    if "error" in resp:
+        r = resp["error"]["message"]
+        if "not running" in r.lower() or "no socket" in r.lower():
+            from studio.orchestrator.main import Orchestrator
+            installed = Orchestrator._compute_code_hash()
+            print(f"Installed code:  {installed[:16]}")
+            print("Running orchestrator: NOT RUNNING")
+            return 0
+        print(f"Error: {r}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    print(f"Installed code:  {data.get('installed_code_hash', 'unknown')}")
+    print(f"Running code:    {data.get('running_code_hash', 'unknown')}")
+    if data.get("running_stale"):
+        print("WARNING: Running orchestrator is on different code than installed.")
+    else:
+        print("Running orchestrator is current.")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="studio", description="Studio kernel CLI")
+    parser.add_argument("--version", "-V", action="store_true", help="Show installed version")
     sub = parser.add_subparsers(dest="command")
 
     # submit
@@ -509,6 +534,9 @@ def main() -> None:
 
     # status
     sub.add_parser("status", help="Show orchestrator status")
+
+    # version
+    sub.add_parser("version", help="Show installed and running code version")
 
     # recall
     p_recall = sub.add_parser("recall", help="Recall a COMPLETE bundle (48h window)")
@@ -555,6 +583,14 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.version:
+        loop = asyncio.new_event_loop()
+        try:
+            exit_code = loop.run_until_complete(cmd_version())
+        finally:
+            loop.close()
+        sys.exit(exit_code)
+
     if args.command is None:
         parser.print_help()
         sys.exit(1)
@@ -577,6 +613,8 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_kill(args.bundle_id))
         elif args.command == "status":
             exit_code = loop.run_until_complete(cmd_status())
+        elif args.command == "version":
+            exit_code = loop.run_until_complete(cmd_version())
         elif args.command == "recall":
             exit_code = loop.run_until_complete(cmd_recall(args.bundle_id))
         elif args.command == "health":

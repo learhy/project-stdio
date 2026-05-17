@@ -3,6 +3,8 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from pathlib import Path
+
 from studio.orchestrator.main import (
     Orchestrator,
     _cli_submit,
@@ -13,6 +15,7 @@ from studio.orchestrator.main import (
     _cli_show_worker,
     _cli_kill,
     _cli_status,
+    _cli_version,
     _format_age,
 )
 
@@ -595,3 +598,127 @@ class TestConnectionRouting:
         write_calls = [c for c in writer.write.call_args_list
                        if b"Parse error" in c[0][0]]
         assert len(write_calls) >= 1
+
+
+class TestCodeHash:
+    """Tests for _compute_code_hash: deterministic, stable for identical trees."""
+
+    def test_hash_is_non_empty_hex(self):
+        from studio.orchestrator.main import Orchestrator
+        h = Orchestrator._compute_code_hash()
+        assert len(h) == 64
+        assert all(c in "0123456789abcdef" for c in h)
+
+    def test_hash_is_deterministic(self):
+        from studio.orchestrator.main import Orchestrator
+        h1 = Orchestrator._compute_code_hash()
+        h2 = Orchestrator._compute_code_hash()
+        assert h1 == h2
+
+    def test_hash_changes_when_file_changes(self, tmp_path):
+        from studio.orchestrator.main import Orchestrator
+        with patch.object(Path, "rglob") as mock_rglob:
+            mock_file = MagicMock()
+            mock_file.read_bytes.return_value = b"def foo(): pass"
+            mock_rglob.return_value = [mock_file]
+
+            h1 = Orchestrator._compute_code_hash()
+            mock_file.read_bytes.return_value = b"def foo(): return 1"
+            h2 = Orchestrator._compute_code_hash()
+            assert h1 != h2
+
+
+class TestStaleCodeDetection:
+    """Tests for _check_code_hash and stale code flagging."""
+
+    @pytest.fixture
+    def app(self):
+        app = Orchestrator()
+        app.settings = MagicMock()
+        app.settings.orchestrator = MagicMock()
+        app.settings.orchestrator.ntfy_url = ""
+        app._startup_code_hash = "abc123"
+        app._code_stale = False
+        return app
+
+    @pytest.mark.asyncio
+    async def test_check_code_hash_no_change(self, app):
+        with patch.object(Orchestrator, "_compute_code_hash", return_value="abc123"):
+            await app._check_code_hash()
+        assert app._code_stale is False
+
+    @pytest.mark.asyncio
+    async def test_check_code_hash_detects_stale(self, app):
+        with patch.object(Orchestrator, "_compute_code_hash", return_value="def456"):
+            await app._check_code_hash()
+        assert app._code_stale is True
+
+    @pytest.mark.asyncio
+    async def test_check_code_hash_no_ntfy_when_not_configured(self, app):
+        with patch.object(Orchestrator, "_compute_code_hash", return_value="def456"):
+            await app._check_code_hash()
+        assert app._code_stale is True
+        # ntfy_alert should have been called but the method bails early when ntfy_url is empty
+
+
+class TestCliVersion:
+    """Tests for _cli_version: installed vs running code hash."""
+
+    @pytest.fixture
+    def app_mock(self):
+        app = MagicMock()
+        app._startup_code_hash = "aaaa111122223333"
+        app.settings = MagicMock()
+        app.settings.orchestrator = MagicMock()
+        app.settings.orchestrator.ntfy_url = ""
+        return app
+
+    @pytest.mark.asyncio
+    async def test_version_shows_both_hashes(self, app_mock):
+        with patch.object(Orchestrator, "_compute_code_hash",
+                          return_value="aaaa111122223333"):
+            result = await _cli_version(app_mock, {})
+        assert result["installed_code_hash"] == "aaaa111122223333"
+        assert result["running_code_hash"] == "aaaa111122223333"
+        assert result["running_stale"] is False
+        assert result["running"] is True
+
+    @pytest.mark.asyncio
+    async def test_version_detects_stale(self, app_mock):
+        with patch.object(Orchestrator, "_compute_code_hash",
+                          return_value="bbbb444455556666"):
+            result = await _cli_version(app_mock, {})
+        assert result["running_stale"] is True
+        assert result["installed_code_hash"] == "bbbb444455556666"
+        assert result["running_code_hash"] == "aaaa111122223333"
+
+
+class TestCliStatusStale:
+    """Tests for _cli_status: stale code warning in status output."""
+
+    @pytest.fixture
+    def app_mock(self):
+        app = MagicMock()
+        app._code_stale = False
+        app.settings = MagicMock()
+        app.settings.orchestrator = MagicMock()
+        app.settings.orchestrator.socket_path = "/tmp/test.sock"
+        app.settings.remote_workers = MagicMock()
+        app.settings.remote_workers.enabled = False
+        app.db = MagicMock()
+        app.db.fetch_one = AsyncMock(return_value={"cnt": 0})
+        app.ops = MagicMock()
+        app.ops._start_time = 1700000000.0
+        return app
+
+    @pytest.mark.asyncio
+    async def test_status_no_warning_when_current(self, app_mock):
+        result = await _cli_status(app_mock, {})
+        assert "warning" not in result
+
+    @pytest.mark.asyncio
+    async def test_status_includes_warning_when_stale(self, app_mock):
+        app_mock._code_stale = True
+        result = await _cli_status(app_mock, {})
+        assert "warning" in result
+        assert "Code updated" in result["warning"]

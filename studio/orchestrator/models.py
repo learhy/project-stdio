@@ -644,6 +644,7 @@ class OrchestratorSettings(BaseModel):
     socket_owner: str = "studio:studio"
     memory_root: str = "memory/"
     http_port: int = 7810
+    ntfy_url: str = ""  # optional push notification URL for alerts (e.g. ntfy.sh/topic)
 
 
 class ArtifactsSettings(BaseModel):
