@@ -173,6 +173,33 @@ class GitHubClient:
         data = await self._request("PATCH", path, {"labels": labels})
         return data is not None
 
+    async def create_repo(self, name: str, private: bool = True, description: str = "") -> dict | None:
+        """Create a new GitHub repository under the configured owner. Returns repo data or None."""
+        if self._client is None:
+            return None
+        owner = self._settings.owner
+        payload: dict[str, Any] = {"name": name, "private": private}
+        if description:
+            payload["description"] = description
+        path = f"/orgs/{owner}/repos"
+        data = await self._request("POST", path, payload)
+        if data is None:
+            # Fallback to user endpoint
+            data = await self._request("POST", "/user/repos", payload)
+        return data
+
+    async def create_pr(
+        self, owner: str, repo: str, title: str, head: str, base: str = "main", body: str = ""
+    ) -> dict | None:
+        """Create a pull request. Returns PR data or None on failure."""
+        if self._client is None:
+            return None
+        payload: dict[str, Any] = {"title": title, "head": head, "base": base}
+        if body:
+            payload["body"] = body
+        path = f"/repos/{owner}/{repo}/pulls"
+        return await self._request("POST", path, payload)
+
     # ── Internal helpers ───────────────────────────────────────────────────
 
     def _make_jwt(self) -> str:

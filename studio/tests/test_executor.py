@@ -687,9 +687,12 @@ class TestAcceptanceParallelBranches:
     @pytest.mark.asyncio
     async def test_parallel_ready_nodes_all_dispatched(self, executor, db_mock, runner_mock):
         """Both ready nodes in parallel branches should be dispatched."""
+        proposal = json.dumps({"proposal": {"target": "existing-repo", "target_repo": "learhy/test"}})
         db_mock.fetch_one = AsyncMock()
         db_mock.fetch_one.side_effect = [
-            {"cnt": 0},  # running count
+            {"cnt": 0},  # _count_running_workers
+            {"proposal_json": proposal},  # _dispatch_worker node 1
+            {"proposal_json": proposal},  # _dispatch_worker node 2
         ]
         db_mock.fetch_all = AsyncMock()
         db_mock.fetch_all.return_value = [
@@ -1046,7 +1049,7 @@ class TestWorkerRouting:
         """Regular worker kind passes worker_type='developer' to runner.spawn_worker."""
         db_mock.fetch_one = AsyncMock()
         db_mock.fetch_one.side_effect = [
-            {"proposal_json": "{}"},  # bundle proposal
+            {"proposal_json": json.dumps({"proposal": {"target_repo": "learhy/test"}})},  # bundle proposal
             {"cnt": 0},  # _count_running_workers
         ]
         db_mock.fetch_all = AsyncMock()
@@ -1107,7 +1110,7 @@ class TestWorkerRouting:
         """Developer worker extracts objective from the 'spec' wrapper."""
         db_mock.fetch_one = AsyncMock()
         db_mock.fetch_one.side_effect = [
-            {"proposal_json": "{}"},  # bundle proposal
+            {"proposal_json": json.dumps({"proposal": {"target_repo": "learhy/test"}})},  # bundle proposal
             {"cnt": 0},  # _count_running_workers
         ]
         db_mock.fetch_all = AsyncMock()
@@ -1137,6 +1140,7 @@ class TestWorkerRouting:
             {
                 "proposal_json": json.dumps({
                     "proposal": {
+                        "target_repo": "learhy/test",
                         "artifact_type": "executable_app",
                         "verification_strategy": {
                             "type": "executable_app",
@@ -1174,7 +1178,7 @@ class TestWorkerRouting:
         """Executor gracefully skips artifact_type when not in proposal_json."""
         db_mock.fetch_one = AsyncMock()
         db_mock.fetch_one.side_effect = [
-            {"proposal_json": json.dumps({"proposal": {}})},
+            {"proposal_json": json.dumps({"proposal": {"target_repo": "learhy/test"}})},
             {"cnt": 0},
         ]
         db_mock.fetch_all = AsyncMock()
@@ -1196,3 +1200,204 @@ class TestWorkerRouting:
         task_spec = call_kwargs["task_spec"]
         assert "artifact_type" not in task_spec
         assert "verification_strategy" not in task_spec
+
+
+class TestTargetRepoGovernanceDispatch:
+    """Tests for target_repo validation during worker dispatch."""
+
+    @pytest.fixture
+    def executor(self, db_mock, sm_mock, runner_mock, rpc_handlers_mock, conn_mgr_mock):
+        return DagExecutor(
+            db=db_mock, sm=sm_mock, runner=runner_mock,
+            rpc_handlers=rpc_handlers_mock, conn_mgr=conn_mgr_mock,
+        )
+
+    @pytest.mark.asyncio
+    async def test_executor_rejects_missing_target_repo(self, executor, db_mock):
+        """Node dispatch fails with clear error if no target_repo in proposal."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"proposal_json": json.dumps({"proposal": {"target": "new-repo"}})},
+            {"cnt": 0},
+        ]
+        db_mock.fetch_all = AsyncMock(return_value=[])
+
+        node = {
+            "id": "b1:n1", "node_id": "n1", "kind": "worker",
+            "spec_json": json.dumps({"spec": {"objective": "write code"}}),
+        }
+
+        with patch.object(executor, '_fail_bundle', new=AsyncMock()) as mock_fail:
+            await executor._dispatch_worker("b1", node)
+
+            mock_fail.assert_called_once()
+            fail_args = mock_fail.call_args[0]
+            assert "missing required target_repo" in fail_args[3].lower()
+
+        # Node should be marked FAILED
+        fail_updates = [c for c in db_mock.execute.call_args_list
+                        if "UPDATE dag_nodes" in str(c[0][0])
+                        and NodeState.FAILED in str(c[0][1])]
+        assert len(fail_updates) == 1
+
+    @pytest.mark.asyncio
+    async def test_executor_rejects_empty_target_repo(self, executor, db_mock):
+        """Node dispatch fails when target_repo is empty string."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"proposal_json": json.dumps({"proposal": {"target": "new-repo", "target_repo": ""}})},
+            {"cnt": 0},
+        ]
+        db_mock.fetch_all = AsyncMock(return_value=[])
+
+        node = {
+            "id": "b1:n1", "node_id": "n1", "kind": "worker",
+            "spec_json": json.dumps({"spec": {"objective": "write code"}}),
+        }
+
+        with patch.object(executor, '_fail_bundle', new=AsyncMock()) as mock_fail:
+            await executor._dispatch_worker("b1", node)
+            mock_fail.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_review_worker_not_blocked_by_missing_target_repo(self, executor, db_mock, runner_mock):
+        """Review workers dispatch successfully even without target_repo."""
+        db_mock.fetch_one = AsyncMock()
+        db_mock.fetch_one.side_effect = [
+            {"proposal_json": json.dumps({"proposal": {"target": "new-repo"}})},
+            {"cnt": 0},
+        ]
+        db_mock.fetch_all = AsyncMock()
+
+        result = MagicMock()
+        result.worker_id = "w_b1_review"
+        result.process = MagicMock()
+        result.error = None
+        runner_mock.spawn_worker.return_value = result
+
+        node = {
+            "id": "b1:review", "node_id": "review", "kind": "review_worker",
+            "spec_json": json.dumps({"role": "security"}),
+        }
+
+        with patch.object(executor, '_fail_bundle', new=AsyncMock()) as mock_fail:
+            await executor._dispatch_worker("b1", node)
+            mock_fail.assert_not_called()
+
+        runner_mock.spawn_worker.assert_called_once()
+
+
+class TestPushWorkerChanges:
+    """Tests for _push_worker_changes: orchestrator manages all GitHub ops."""
+
+    @pytest.fixture
+    def github_mock(self):
+        gh = MagicMock()
+        gh.create_repo = AsyncMock()
+        gh.create_pr = AsyncMock()
+        return gh
+
+    @pytest.fixture
+    def settings_mock(self):
+        s = MagicMock()
+        s.github.enabled = True
+        return s
+
+    @pytest.fixture
+    def executor(self, db_mock, sm_mock, runner_mock, rpc_handlers_mock, conn_mgr_mock,
+                 github_mock, settings_mock):
+        return DagExecutor(
+            db=db_mock, sm=sm_mock, runner=runner_mock,
+            rpc_handlers=rpc_handlers_mock, conn_mgr=conn_mgr_mock,
+            github_client=github_mock, settings=settings_mock,
+        )
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_creates_new_repo(self, executor, db_mock, github_mock):
+        """_push_worker_changes calls create_repo for new-repo:<name> target."""
+        with patch("os.path.exists", return_value=True):
+            executor._worker_target_repos["w1"] = "new-repo:test-service"
+            executor._worker_worktree_paths["w1"] = "/tmp/worktrees/b1/n1"
+
+            github_mock.create_repo.return_value = {
+                "ssh_url": "git@github.com:learhy/test-service.git",
+                "html_url": "https://github.com/learhy/test-service",
+            }
+
+            # Mock subprocess calls for git operations
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_proc.returncode = 0
+                mock_proc.communicate = AsyncMock(return_value=(b"master\n", b""))
+                mock_spawn.return_value = mock_proc
+
+                await executor._push_worker_changes("w1", "b1")
+
+            github_mock.create_repo.assert_called_once()
+            call_kwargs = github_mock.create_repo.call_args.kwargs
+            assert call_kwargs["name"] == "test-service"
+            assert call_kwargs["private"] is True
+
+            # Should store outcome in db
+            outcome_calls = [c for c in db_mock.execute.call_args_list
+                             if "UPDATE bundles SET outcome_json" in str(c[0][0])]
+            assert len(outcome_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_pushes_existing_repo(self, executor, db_mock, github_mock):
+        """_push_worker_changes pushes branch and opens PR for owner/repo target."""
+        with patch("os.path.exists", return_value=True):
+            executor._worker_target_repos["w1"] = "learhy/existing-service"
+            executor._worker_worktree_paths["w1"] = "/tmp/worktrees/b1/n1"
+
+            db_mock.fetch_one = AsyncMock(return_value={"node_id": "n1"})
+
+            github_mock.create_pr.return_value = {
+                "html_url": "https://github.com/learhy/existing-service/pull/42",
+            }
+
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_proc.returncode = 0
+                mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+                mock_spawn.return_value = mock_proc
+
+                await executor._push_worker_changes("w1", "b1")
+
+            github_mock.create_pr.assert_called_once()
+            call_kwargs = github_mock.create_pr.call_args.kwargs
+            assert call_kwargs["owner"] == "learhy"
+            assert call_kwargs["repo"] == "existing-service"
+            assert call_kwargs["head"] == "bundle/b1/n1"
+
+            # Should store PR URL in db
+            outcome_calls = [c for c in db_mock.execute.call_args_list
+                             if "UPDATE bundles SET outcome_json" in str(c[0][0])]
+            assert len(outcome_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_github_app_graceful(self, executor, db_mock):
+        """No GitHub App configured: _push_worker_changes logs warning and returns."""
+        executor.github_client = None
+
+        with patch("os.path.exists", return_value=True):
+            executor._worker_target_repos["w1"] = "new-repo:test"
+            executor._worker_worktree_paths["w1"] = "/tmp/worktrees/b1/n1"
+
+            await executor._push_worker_changes("w1", "b1")
+
+        # Should NOT try to create repo or push
+        outcome_calls = [c for c in db_mock.execute.call_args_list
+                         if "UPDATE bundles SET outcome_json" in str(c[0][0])]
+        assert len(outcome_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_push_worker_changes_missing_worktree_skips(self, executor, github_mock):
+        """_push_worker_changes skips when worktree path is empty or missing."""
+        executor._worker_target_repos["w1"] = "new-repo:test"
+        executor._worker_worktree_paths["w1"] = ""
+
+        await executor._push_worker_changes("w1", "b1")
+
+        github_mock.create_repo.assert_not_called()
+        github_mock.create_pr.assert_not_called()

@@ -804,6 +804,8 @@ class Orchestrator:
             self.conn_mgr,
             global_concurrency=self.settings.worker.global_concurrency,
             heartbeat_timeout_multiplier=self.settings.worker.heartbeat_timeout_multiplier,
+            github_client=self.github_client,
+            settings=self.settings,
         )
         self.executor._on_review_aggregator_complete = self._on_review_aggregator_complete
         self.executor._on_bundle_verifying = self._on_bundle_verifying

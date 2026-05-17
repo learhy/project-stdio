@@ -136,6 +136,10 @@ You MUST include two additional top-level fields in your JSON output:
 - `artifact_type`: one of `executable_app`, `library`, `infrastructure`, `documentation`, `data_schema`, `test_suite`, `mixed`
 - `verification_strategy`: an object with a `type` field matching the artifact_type, plus type-specific fields
 
+## target_repo — REQUIRED
+
+You MUST include a `target_repo` field in every proposal. Use `new-repo:<name>` for new projects (use a short kebab-case name based on the project idea) or `owner/repo` for modifications to existing repos. Never omit this field.
+
 ### Per-type verification strategy examples
 
 **executable_app** (Flask, FastAPI, CLI, scripts):

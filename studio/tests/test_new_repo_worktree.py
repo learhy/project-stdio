@@ -193,7 +193,7 @@ class TestDispatchWorkerTarget:
 
         db = _make_async_db()
         db.fetch_one = AsyncMock(return_value={
-            "proposal_json": json.dumps({"proposal": {"target": "new-repo", "target_name": "my-api"}}),
+            "proposal_json": json.dumps({"proposal": {"target": "new-repo", "target_name": "my-api", "target_repo": "new-repo:my-api"}}),
         })
 
         mock_proc = MagicMock()
@@ -230,7 +230,7 @@ class TestDispatchWorkerTarget:
 
         db = _make_async_db()
         db.fetch_one = AsyncMock(return_value={
-            "proposal_json": json.dumps({"other": "data"}),
+            "proposal_json": json.dumps({"proposal": {"target_repo": "learhy/test"}}),
         })
 
         mock_proc = MagicMock()
@@ -269,8 +269,14 @@ class TestPushWorkerChanges:
         db = _make_async_db()
         db.fetch_one = AsyncMock(return_value={"node_id": "n1"})
 
-        executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock())
-        executor._worker_targets["w1"] = "existing-repo"
+        settings = MagicMock()
+        settings.github.enabled = True
+        gh = MagicMock()
+        gh.create_pr = AsyncMock(return_value={"html_url": "https://github.com/learhy/test/pull/1"})
+
+        executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                               github_client=gh, settings=settings)
+        executor._worker_target_repos["w1"] = "learhy/test"
         executor._worker_worktree_paths["w1"] = "/tmp/studio-worktrees/b1/n1"
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
@@ -282,40 +288,43 @@ class TestPushWorkerChanges:
 
                 await executor._push_worker_changes("w1", "b1")
 
-                mock_exec.assert_called_once()
-                call_args = mock_exec.call_args[0]
-                assert call_args[0] == "git"
-                assert "-C" in call_args
-                assert "push" in call_args
+                gh.create_pr.assert_called_once()
+                call_kwargs = gh.create_pr.call_args.kwargs
+                assert call_kwargs["owner"] == "learhy"
+                assert call_kwargs["repo"] == "test"
 
     @pytest.mark.asyncio
     async def test_push_new_repo_creates_github_repo(self):
         from studio.orchestrator.executor import DagExecutor
 
         db = _make_async_db()
-        db.fetch_one = AsyncMock(return_value={
-            "proposal_json": json.dumps({"proposal": {"target": "new-repo", "target_name": "pm-sanity-api"}}),
+
+        settings = MagicMock()
+        settings.github.enabled = True
+        gh = MagicMock()
+        gh.create_repo = AsyncMock(return_value={
+            "ssh_url": "git@github.com:learhy/pm-sanity-api.git",
+            "html_url": "https://github.com/learhy/pm-sanity-api",
         })
 
-        executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock())
-        executor._worker_targets["w2"] = "new-repo"
+        executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                               github_client=gh, settings=settings)
+        executor._worker_target_repos["w2"] = "new-repo:pm-sanity-api"
         executor._worker_worktree_paths["w2"] = "/tmp/studio-worktrees/b2/n2"
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
-            with patch("shutil.rmtree"):
-                with patch("os.path.exists", return_value=True):
-                    mock_proc = AsyncMock()
-                    mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-                    mock_proc.returncode = 0
-                    mock_exec.return_value = mock_proc
+            with patch("os.path.exists", return_value=True):
+                mock_proc = AsyncMock()
+                mock_proc.communicate = AsyncMock(return_value=(b"master\n", b""))
+                mock_proc.returncode = 0
+                mock_exec.return_value = mock_proc
 
-                    await executor._push_worker_changes("w2", "b2")
+                await executor._push_worker_changes("w2", "b2")
 
-                    mock_exec.assert_called_once()
-                    call_args = mock_exec.call_args[0]
-                    assert call_args[0] == "gh"
-                    assert "repo" in call_args
-                    assert "create" in call_args
+                gh.create_repo.assert_called_once()
+                call_kwargs = gh.create_repo.call_args.kwargs
+                assert call_kwargs["name"] == "pm-sanity-api"
+                assert call_kwargs["private"] is True
 
     @pytest.mark.asyncio
     async def test_push_cleans_up_state(self):
@@ -324,8 +333,14 @@ class TestPushWorkerChanges:
         db = _make_async_db()
         db.fetch_one = AsyncMock(return_value={"node_id": "n3"})
 
-        executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock())
-        executor._worker_targets["w3"] = "existing-repo"
+        settings = MagicMock()
+        settings.github.enabled = True
+        gh = MagicMock()
+        gh.create_pr = AsyncMock(return_value={"html_url": "https://github.com/learhy/test/pull/3"})
+
+        executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                               github_client=gh, settings=settings)
+        executor._worker_target_repos["w3"] = "learhy/test"
         executor._worker_worktree_paths["w3"] = "/tmp/studio-worktrees/b3/n3"
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
@@ -337,7 +352,7 @@ class TestPushWorkerChanges:
 
                 await executor._push_worker_changes("w3", "b3")
 
-        assert "w3" not in executor._worker_targets
+        assert "w3" not in executor._worker_target_repos
         assert "w3" not in executor._worker_worktree_paths
 
     @pytest.mark.asyncio
@@ -350,29 +365,39 @@ class TestPushWorkerChanges:
         await executor._push_worker_changes("nonexistent", "b1")
 
     @pytest.mark.asyncio
-    async def test_new_repo_cleanup_removes_temp_dir(self):
+    async def test_new_repo_create_repo_stores_outcome(self):
         from studio.orchestrator.executor import DagExecutor
 
         db = _make_async_db()
-        db.fetch_one = AsyncMock(return_value={
-            "proposal_json": json.dumps({"proposal": {"target": "new-repo", "target_name": "test-repo"}}),
+        settings = MagicMock()
+        settings.github.enabled = True
+        gh = MagicMock()
+        gh.create_repo = AsyncMock(return_value={
+            "ssh_url": "git@github.com:learhy/test-repo.git",
+            "html_url": "https://github.com/learhy/test-repo",
         })
 
-        executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock())
-        executor._worker_targets["w4"] = "new-repo"
+        executor = DagExecutor(db, MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                               github_client=gh, settings=settings)
+        executor._worker_target_repos["w4"] = "new-repo:test-repo"
         executor._worker_worktree_paths["w4"] = "/tmp/studio-worktrees/b4/n4"
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
-            with patch("shutil.rmtree") as mock_rmtree:
-                with patch("os.path.exists", return_value=True):
-                    mock_proc = AsyncMock()
-                    mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-                    mock_proc.returncode = 0
-                    mock_exec.return_value = mock_proc
+            with patch("os.path.exists", return_value=True):
+                mock_proc = AsyncMock()
+                mock_proc.communicate = AsyncMock(return_value=(b"master\n", b""))
+                mock_proc.returncode = 0
+                mock_exec.return_value = mock_proc
 
-                    await executor._push_worker_changes("w4", "b4")
+                await executor._push_worker_changes("w4", "b4")
 
-                    mock_rmtree.assert_called_once_with("/tmp/studio-worktrees/b4/n4")
+        gh.create_repo.assert_called_once_with(
+            name="test-repo", private=True, description="Studio bundle b4"
+        )
+        # Should store outcome in db
+        outcome_calls = [c for c in db.execute.call_args_list
+                         if "UPDATE bundles SET outcome_json" in str(c[0][0])]
+        assert len(outcome_calls) == 1
 
 
 class TestOnFinalReportPush:

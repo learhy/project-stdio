@@ -436,6 +436,12 @@ class LocalBwrapWorkerRunner:
             "OLLAMA_CLOUD_BASE_URL": os.environ.get("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/v1"),
         }
 
+        # Remove GitHub credentials from worker environment so workers
+        # cannot accidentally push to remote repositories. The orchestrator
+        # manages all GitHub operations post-completion.
+        for cred_var in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
+            worker_env.pop(cred_var, None)
+
         if proxy_socket:
             proxy_url = f"http+unix://{proxy_socket.replace('/', '%2F')}"
             worker_env.update({
@@ -492,7 +498,11 @@ class LocalBwrapWorkerRunner:
         )
 
     async def _create_worktree(self, path: str, branch: str, base_branch: str) -> None:
-        """Create a git worktree at path on branch, based off base_branch."""
+        """Create a git worktree at path on branch, based off base_branch.
+
+        After creation, strips any inherited remote and configures local-only
+        git identity so workers cannot accidentally push to the host's remotes.
+        """
         import os as _os
         _os.makedirs(_os.path.dirname(path) if _os.path.dirname(path) else path, exist_ok=True)
 
@@ -506,6 +516,9 @@ class LocalBwrapWorkerRunner:
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"git worktree add failed: {err}")
+
+        # Strip any inherited remote to prevent accidental pushes
+        await self._strip_remotes(path)
 
         # Set bot author identity so commits are attributed correctly
         for key, value in [("user.name", "studio-agents[bot]"), ("user.email", "studio-agents@learhy.net")]:
@@ -523,6 +536,8 @@ class LocalBwrapWorkerRunner:
         worktree gets a unique SHA.  OpenCode keys its session cache by
         git commit SHA; duplicate SHAs cause it to reuse stale state and
         skip file creation.
+
+        No remote is added — the orchestrator manages all remote operations.
         """
         import os as _os
         _os.makedirs(path, exist_ok=True)
@@ -537,8 +552,14 @@ class LocalBwrapWorkerRunner:
             err = stderr.decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"git init failed: {err}")
 
-        # Set bot author identity
-        for key, value in [("user.name", "studio-agents[bot]"), ("user.email", "studio-agents@learhy.net")]:
+        # Remove any default remote (e.g., from template dir)
+        await self._strip_remotes(path)
+
+        # Set bot author identity and disable credential helpers
+        for key, value in [
+            ("user.name", "studio-agents[bot]"),
+            ("user.email", "studio-agents@learhy.net"),
+        ]:
             proc = await asyncio.create_subprocess_exec(
                 "git", "-C", path, "config", key, value,
                 stdout=asyncio.subprocess.PIPE,
@@ -557,6 +578,42 @@ class LocalBwrapWorkerRunner:
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"git commit failed: {err}")
+
+    @staticmethod
+    async def _strip_remotes(path: str) -> None:
+        """Remove all git remotes and disable credential helpers.
+
+        Workers must never push to remote repositories. The orchestrator
+        manages all GitHub operations post-completion.
+        """
+        # Remove all existing remotes
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", path, "remote",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        remotes = stdout.decode().strip().split("\n")
+        for remote in remotes:
+            if remote.strip():
+                rm_proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", path, "remote", "remove", remote.strip(),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await rm_proc.communicate()
+
+        # Disable credential helpers so global git config won't leak credentials
+        for key, value in [
+            ("credential.helper", ""),
+            ("credential.useHttpPath", "false"),
+        ]:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", path, "config", "--local", key, value,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
 
     async def kill_worker(
         self,
@@ -928,6 +985,9 @@ class RemoteSSHWorkerRunner:
                 "https_proxy": f"http+unix://{proxy_socket.replace('/', '%2F')}",
                 "no_proxy": "",
             }
+            # Remove GitHub credentials (defense-in-depth for remote workers too)
+            for cred_var in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
+                worker_env.pop(cred_var, None)
 
             if task_spec:
                 worker_env["STUDIO_TASK_SPEC"] = task_json

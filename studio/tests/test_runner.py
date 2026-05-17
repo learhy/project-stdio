@@ -472,3 +472,136 @@ class TestWorkerTypeRouting:
         assert "bwrap" in cmd
         assert any("studio-review" in c for c in cmd)
         assert not any("studio-worker" in c for c in cmd)
+
+
+class TestStripRemotes:
+    """Tests for _strip_remotes: workers must never have git remotes."""
+
+    @pytest.fixture
+    def db_mock(self):
+        db = MagicMock()
+        db.execute = AsyncMock()
+        db.fetch_one = AsyncMock(return_value=None)
+        db.conn = MagicMock()
+        db.conn.commit = AsyncMock()
+        return db
+
+    @pytest.fixture
+    def runner(self, db_mock):
+        return LocalBwrapWorkerRunner(db_mock, "/run/studio/test.sock")
+
+    @pytest.mark.asyncio
+    async def test_strip_remotes_removes_all_remotes(self, runner):
+        """_strip_remotes removes all existing git remotes."""
+        call_args_list = []
+
+        async def mock_spawn(*args, **kwargs):
+            call_args_list.append(args)
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            # args: ("git", "-C", path, subcommand, ...)
+            if len(args) >= 4 and args[3] == "remote" and len(args) == 4:
+                # git remote (list)
+                mock_proc.communicate = AsyncMock(return_value=(b"origin\nupstream\n", b""))
+            else:
+                mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+            mock_proc.wait = AsyncMock(return_value=0)
+            return mock_proc
+
+        with patch("asyncio.create_subprocess_exec", new=mock_spawn):
+            await runner._strip_remotes("/tmp/wt")
+
+        # Should have called git remote, then git remote remove for each
+        remote_list_calls = [a for a in call_args_list
+                            if len(a) >= 4 and a[3] == "remote" and len(a) == 4]
+        remove_calls = [a for a in call_args_list
+                       if len(a) >= 5 and a[3] == "remote" and a[4] == "remove"]
+        config_calls = [a for a in call_args_list
+                       if len(a) >= 4 and a[3] == "config"]
+
+        assert len(remote_list_calls) == 1
+        assert len(remove_calls) == 2  # origin and upstream
+        assert any(a[5] == "origin" for a in remove_calls)
+        assert any(a[5] == "upstream" for a in remove_calls)
+        # Should disable credential helpers
+        assert len(config_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_strip_remotes_no_remotes_graceful(self, runner):
+        """_strip_remotes handles repos with no remotes gracefully."""
+        call_args_list = []
+
+        async def mock_spawn(*args, **kwargs):
+            call_args_list.append(args)
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            if len(args) >= 4 and args[3] == "remote" and len(args) == 4:
+                mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+            else:
+                mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+            mock_proc.wait = AsyncMock(return_value=0)
+            return mock_proc
+
+        with patch("asyncio.create_subprocess_exec", new=mock_spawn):
+            await runner._strip_remotes("/tmp/wt")
+
+        remove_calls = [a for a in call_args_list
+                       if len(a) >= 5 and a[3] == "remote" and a[4] == "remove"]
+        assert len(remove_calls) == 0
+
+
+class TestWorkerNoGitHubCredentials:
+    """Workers must not receive GitHub credentials in their environment."""
+
+    @pytest.fixture
+    def db_mock(self):
+        db = MagicMock()
+        db.execute = AsyncMock()
+        db.fetch_one = AsyncMock(return_value=None)
+        db.conn = MagicMock()
+        db.conn.commit = AsyncMock()
+        return db
+
+    @pytest.fixture
+    def runner(self, db_mock):
+        return LocalBwrapWorkerRunner(db_mock, "/run/studio/test.sock")
+
+    @pytest.mark.asyncio
+    async def test_worker_env_has_no_github_tokens(self, runner, db_mock):
+        """Worker env contains no GH_TOKEN, GITHUB_TOKEN, or SSH_AUTH_SOCK."""
+        manifest = make_manifest()
+        with patch.dict("os.environ", {
+            "STUDIO_TEST_MODE": "1",
+            "GH_TOKEN": "ghp_fake_token",
+            "GITHUB_TOKEN": "github_fake_token",
+            "SSH_AUTH_SOCK": "/tmp/fake-ssh-agent.sock",
+        }):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
+
+            _, _, kwargs = mock_spawn.mock_calls[0]
+            env = kwargs["env"]
+            assert "GH_TOKEN" not in env
+            assert "GITHUB_TOKEN" not in env
+            assert "SSH_AUTH_SOCK" not in env
+
+    @pytest.mark.asyncio
+    async def test_worker_env_has_no_github_tokens_when_not_set(self, runner, db_mock):
+        """Worker env is clean even when host doesn't have GitHub creds set."""
+        manifest = make_manifest()
+        clean_env = {"STUDIO_TEST_MODE": "1", "PATH": "/usr/bin", "HOME": "/tmp"}
+        with patch.dict("os.environ", clean_env, clear=True):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_spawn:
+                mock_proc = MagicMock()
+                mock_spawn.return_value = mock_proc
+
+                await runner.spawn_worker("w1", "b1", "n1", manifest, "/tmp/wt")
+
+            _, _, kwargs = mock_spawn.mock_calls[0]
+            env = kwargs["env"]
+            assert "GH_TOKEN" not in env
+            assert "GITHUB_TOKEN" not in env
+            assert "SSH_AUTH_SOCK" not in env

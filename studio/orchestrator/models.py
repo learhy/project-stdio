@@ -487,6 +487,7 @@ class BundleProposal(BaseModel):
     estimated_tokens: int = 0
     target: str = "control-plane"
     target_rationale: str = ""
+    target_repo: str = ""
     concerns: list[str] = Field(default_factory=list)
     requirements_summary: str = ""
     rfc_summary: str = ""

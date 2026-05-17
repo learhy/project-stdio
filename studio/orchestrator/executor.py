@@ -42,6 +42,8 @@ class DagExecutor:
         conn_mgr: Any,  # ConnectionManager
         global_concurrency: int = 4,
         heartbeat_timeout_multiplier: float = 2.0,
+        github_client: Any = None,  # GitHubClient or None
+        settings: Any = None,  # Settings
     ) -> None:
         self.db = db
         self.sm = sm
@@ -50,11 +52,14 @@ class DagExecutor:
         self.conn_mgr = conn_mgr
         self.global_concurrency = global_concurrency
         self.heartbeat_timeout_multiplier = heartbeat_timeout_multiplier
+        self.github_client = github_client
+        self.settings = settings
 
         # Active tracking
         self._running_workers: dict[str, asyncio.subprocess.Process | Any] = {}
         self._worker_targets: dict[str, str] = {}
         self._worker_worktree_paths: dict[str, str] = {}
+        self._worker_target_repos: dict[str, str] = {}
         self._active_bundles: set[str] = set()
         self._artifact_events: asyncio.Queue[Any] = asyncio.Queue()
         self._artifact_store: Any = None
@@ -504,83 +509,147 @@ class DagExecutor:
         await self.db.conn.commit()
 
     async def _push_worker_changes(self, worker_id: str, bundle_id: str) -> None:
-        """Push worktree changes after worker completes successfully.
+        """Handle GitHub operations after worker completes successfully.
 
-        For new-repo targets: creates a GitHub repo and pushes the worktree.
-        For existing-repo targets: pushes the worktree branch to origin.
+        For new-repo: target_repo (e.g., new-repo:pm-war-room) triggers repo creation
+        via the GitHub App, then the worktree is pushed to the new repo.
+        For owner/repo: the worktree branch is pushed and a PR is opened.
+
+        When no GitHub App is configured, logs a warning and preserves the worktree.
+        Workers NEVER push — all GitHub operations happen here in the orchestrator.
         """
         import logging
-        import shutil
         _logger = logging.getLogger(__name__)
 
-        target = self._worker_targets.pop(worker_id, "existing-repo")
+        target_repo = self._worker_target_repos.pop(worker_id, "")
         worktree_path = self._worker_worktree_paths.pop(worker_id, "")
+        self._worker_targets.pop(worker_id, None)
 
         if not worktree_path or not os.path.exists(worktree_path):
             return
 
-        try:
-            if target == "new-repo":
-                # Read repo name from bundle proposal
-                bundle_row = await self.db.fetch_one(
-                    "SELECT proposal_json FROM bundles WHERE id = ?", (bundle_id,)
-                )
-                repo_name = ""
-                if bundle_row:
-                    proposal = json.loads(bundle_row["proposal_json"] or "{}")
-                    bundler = proposal.get("proposal", {})
-                    repo_name = bundler.get("target_name", bundler.get("target", ""))
+        if not self.github_client or not self.settings or not self.settings.github.enabled:
+            _logger.warning(
+                "GitHub App not configured -- skipping remote push. "
+                "Code is available at %s", worktree_path
+            )
+            return
 
-                if repo_name and repo_name != "new-repo":
-                    _logger.info("Creating GitHub repo %s from worktree %s", repo_name, worktree_path)
+        try:
+            if target_repo.startswith("new-repo:"):
+                repo_name = target_repo.split(":", 1)[1].strip()
+                if not repo_name:
+                    repo_name = f"studio-bundle-{bundle_id}"
+
+                _logger.info("Creating GitHub repo %s for bundle %s", repo_name, bundle_id)
+                result = await self.github_client.create_repo(
+                    name=repo_name,
+                    private=True,
+                    description=f"Studio bundle {bundle_id}",
+                )
+
+                if result and result.get("ssh_url"):
+                    ssh_url = result["ssh_url"]
+                    html_url = result.get("html_url", "")
+
+                    # Add remote and push
                     proc = await asyncio.create_subprocess_exec(
-                        "gh", "repo", "create", repo_name,
-                        "--private", "--source=" + worktree_path, "--push",
+                        "git", "-C", worktree_path, "remote", "add", "origin", ssh_url,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    stdout, stderr = await proc.communicate()
-                    if proc.returncode != 0:
+                    await proc.communicate()
+
+                    # Push the worktree branch
+                    branch_proc = await asyncio.create_subprocess_exec(
+                        "git", "-C", worktree_path, "rev-parse", "--abbrev-ref", "HEAD",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    branch_out, _ = await branch_proc.communicate()
+                    branch = branch_out.decode().strip() or "master"
+
+                    push_proc = await asyncio.create_subprocess_exec(
+                        "git", "-C", worktree_path, "push", "-u", "origin", branch,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await push_proc.communicate()
+                    if push_proc.returncode != 0:
                         err = stderr.decode("utf-8", errors="replace")[:500]
-                        _logger.warning("gh repo create failed for %s: %s", repo_name, err)
-                        # Keep worktree so code is not lost
-                        _logger.warning("Preserving worktree at %s (gh push failed)", worktree_path)
+                        _logger.warning("git push failed for new repo %s: %s", repo_name, err)
                     else:
-                        _logger.info("Created and pushed repo %s", repo_name)
-                        # Clean up temp directory only on successful push
-                        try:
-                            shutil.rmtree(worktree_path)
-                        except Exception:
-                            pass
+                        _logger.info("Pushed %s to %s", branch, html_url or ssh_url)
+
+                    # Store outcome
+                    await self.db.execute(
+                        "UPDATE bundles SET outcome_json = ? WHERE id = ?",
+                        (json.dumps({"repo_url": html_url, "repo_name": repo_name}), bundle_id),
+                    )
+                    await self.db.conn.commit()
                 else:
-                    # No actual repo name; preserve worktree so generated code is not lost
                     _logger.warning(
-                        "new-repo target has no repo_name (got %r); "
-                        "preserving worktree at %s",
+                        "Failed to create GitHub repo %s. Preserving worktree at %s",
                         repo_name, worktree_path,
                     )
-            else:
-                # Push worktree branch to origin
-                worker_branch = f"bundle/{bundle_id}/" + worker_id.replace("w_", "", 1).rsplit("_", 1)[-1] if "_" in worker_id else ""
-                # Re-derive the branch name from the node info
+
+            elif "/" in target_repo:
+                # owner/repo format — push branch and open PR
+                parts = target_repo.split("/", 1)
+                owner, repo = parts[0].strip(), parts[1].strip()
+
                 node_row = await self.db.fetch_one(
                     "SELECT node_id FROM workers WHERE id = ?", (worker_id,)
                 )
-                if node_row:
-                    worker_branch = f"bundle/{bundle_id}/{node_row['node_id']}"
+                worker_branch = f"bundle/{bundle_id}/{node_row['node_id']}" if node_row else f"bundle/{bundle_id}"
 
-                _logger.info("Pushing branch %s from worktree %s", worker_branch, worktree_path)
+                _logger.info("Pushing branch %s to %s/%s", worker_branch, owner, repo)
+
+                # Add remote
+                remote_url = f"git@github.com:{owner}/{repo}.git"
                 proc = await asyncio.create_subprocess_exec(
-                    "git", "-C", worktree_path, "push", "origin", worker_branch,
+                    "git", "-C", worktree_path, "remote", "add", "origin", remote_url,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode != 0:
+                await proc.communicate()
+
+                # Push branch
+                push_proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", worktree_path, "push", "origin", f"HEAD:{worker_branch}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await push_proc.communicate()
+                if push_proc.returncode != 0:
                     err = stderr.decode("utf-8", errors="replace")[:500]
-                    _logger.warning("git push failed for %s: %s", worker_branch, err)
-                else:
-                    _logger.info("Pushed branch %s to origin", worker_branch)
+                    _logger.warning("git push failed for %s/%s: %s", owner, repo, err)
+                    return
+
+                _logger.info("Pushed branch %s to %s/%s", worker_branch, owner, repo)
+
+                # Open PR
+                pr_result = await self.github_client.create_pr(
+                    owner=owner,
+                    repo=repo,
+                    title=f"Studio bundle {bundle_id}",
+                    head=worker_branch,
+                    base="main",
+                    body=f"Automated PR from Studio bundle {bundle_id}.",
+                )
+                if pr_result and pr_result.get("html_url"):
+                    pr_url = pr_result["html_url"]
+                    _logger.info("Opened PR %s", pr_url)
+                    await self.db.execute(
+                        "UPDATE bundles SET outcome_json = ? WHERE id = ?",
+                        (json.dumps({"pr_url": pr_url, "repo": target_repo}), bundle_id),
+                    )
+                    await self.db.conn.commit()
+            else:
+                _logger.warning(
+                    "target_repo %r is neither new-repo:<name> nor owner/repo. "
+                    "Preserving worktree at %s", target_repo, worktree_path,
+                )
         except Exception as exc:
             _logger.warning("_push_worker_changes failed for %s: %s", worker_id, exc)
 
@@ -661,7 +730,7 @@ class DagExecutor:
 
         worktree_path = f"/tmp/studio-worktrees/{bundle_id}/{node['node_id']}"
 
-        # Read bundle target from proposal_json
+        # Read bundle target and target_repo from proposal_json
         target = "existing-repo"
         try:
             bundle_row = await self.db.fetch_one(
@@ -671,6 +740,24 @@ class DagExecutor:
                 proposal = json.loads(bundle_row["proposal_json"] or "{}")
                 bundler = proposal.get("proposal", {})
                 target = bundler.get("target", "existing-repo")
+                target_repo = bundler.get("target_repo", "")
+
+                # Validate target_repo for developer workers
+                if worker_type == "developer" and not target_repo:
+                    error_msg = (
+                        "Bundle proposal missing required target_repo field. "
+                        "Cannot dispatch developer worker without explicit target repo."
+                    )
+                    import logging
+                    _logger = logging.getLogger(__name__)
+                    _logger.error("Worker spawn failed for %s: %s", worker_id, error_msg)
+                    await self.db.execute(
+                        "UPDATE dag_nodes SET state = ?, failure_reason = ? WHERE id = ?",
+                        (NodeState.FAILED, error_msg, node["id"]),
+                    )
+                    await self.db.conn.commit()
+                    await self._fail_bundle(bundle_id, node["node_id"], worker_id, error_msg)
+                    return
                 # Enrich developer worker task spec with full bundle context so
                 # opencode has enough detail to produce correct output even when
                 # the bundler writes abbreviated node objectives.
@@ -699,6 +786,7 @@ class DagExecutor:
 
         self._worker_targets[worker_id] = target
         self._worker_worktree_paths[worker_id] = worktree_path
+        self._worker_target_repos[worker_id] = target_repo if target_repo else ""
 
         result = await self.runner.spawn_worker(
             worker_id=worker_id,

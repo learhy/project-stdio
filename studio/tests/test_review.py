@@ -607,11 +607,13 @@ class TestApprovalMatrixStub:
 
         # Mock DB to return a low-score bundle proposal
         app.db = MagicMock()
+        from studio.orchestrator.state_machine import BundleState
         app.db.fetch_one = AsyncMock(return_value={
             "proposal_json": json.dumps({"proposal": {"complexity_score": 1, "risk_score": 1}}),
             "complexity_score": 1,
             "risk_score": 1,
             "tier": "full_review",
+            "state": BundleState.IN_REVIEW,
         })
         app.db.execute = AsyncMock()
         app.db.conn = MagicMock()
