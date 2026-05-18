@@ -1,0 +1,160 @@
+2026-05-18 04:36:46,952 [INFO] __main__: Startup code hash: d2019f550dbb33b3
+2026-05-18 04:36:46,952 [INFO] __main__: Startup code hash: d2019f550dbb33b3
+2026-05-18 04:36:46,955 [INFO] studio.orchestrator.db: Database connected: /tmp/studio-fire.db (WAL mode, schema v15)
+2026-05-18 04:36:46,955 [INFO] studio.orchestrator.db: Database connected: /tmp/studio-fire.db (WAL mode, schema v15)
+2026-05-18 04:36:47,043 [INFO] __main__: GitHub client initialized for learhy/project-stdio
+2026-05-18 04:36:47,043 [INFO] __main__: GitHub client initialized for learhy/project-stdio
+2026-05-18 04:36:47,043 [INFO] __main__: Secret store initialized (memory_root=memory/)
+2026-05-18 04:36:47,043 [INFO] __main__: Secret store initialized (memory_root=memory/)
+2026-05-18 04:36:47,044 [INFO] __main__: RunnerSelector: local
+2026-05-18 04:36:47,044 [INFO] __main__: RunnerSelector: local
+2026-05-18 04:36:47,049 [INFO] __main__: Reconciliation complete: {'workers_killed': 0, 'nodes_failed': 0, 'bundles_recovered': 0}
+2026-05-18 04:36:47,049 [INFO] __main__: Reconciliation complete: {'workers_killed': 0, 'nodes_failed': 0, 'bundles_recovered': 0}
+2026-05-18 04:36:47,049 [INFO] __main__: Scheduler started
+2026-05-18 04:36:47,049 [INFO] __main__: Scheduler started
+2026-05-18 04:36:47,049 [INFO] studio.orchestrator.review: ReviewScheduler started (interval=10min, divergence=1.5x, silence=15min)
+2026-05-18 04:36:47,049 [INFO] studio.orchestrator.review: ReviewScheduler started (interval=10min, divergence=1.5x, silence=15min)
+2026-05-18 04:36:47,049 [INFO] __main__: ReviewScheduler started
+2026-05-18 04:36:47,049 [INFO] __main__: ReviewScheduler started
+2026-05-18 04:36:47,050 [INFO] __main__: HTTP server + GitHub polling started
+2026-05-18 04:36:47,050 [INFO] __main__: HTTP server + GitHub polling started
+2026-05-18 04:36:47,050 [INFO] __main__: Ops tooling started (stall threshold=8h, recall=48h)
+2026-05-18 04:36:47,050 [INFO] __main__: Ops tooling started (stall threshold=8h, recall=48h)
+2026-05-18 04:36:47,050 [INFO] __main__: Stale code detection started
+2026-05-18 04:36:47,050 [INFO] __main__: Stale code detection started
+2026-05-18 04:36:47,099 [INFO] __main__: Orchestrator listening on /tmp/studio-fire.sock
+2026-05-18 04:36:47,099 [INFO] __main__: Orchestrator listening on /tmp/studio-fire.sock
+[31mERROR[0m:    [Errno 98] error while attempting to bind on address ('127.0.0.1', 7810): address already in use
+[31mERROR[0m:    [Errno 98] error while attempting to bind on address ('127.0.0.1', 7810): address already in use
+Exception in thread Thread-1 (_connection_worker_thread):
+Traceback (most recent call last):
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/aiosqlite/core.py", line 66, in _connection_worker_thread
+Exception in thread Thread-1 (_connection_worker_thread):
+Traceback (most recent call last):
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/aiosqlite/core.py", line 66, in _connection_worker_thread
+    future.get_loop().call_soon_threadsafe(set_result, future, result)
+    future.get_loop().call_soon_threadsafe(set_result, future, result)
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 840, in call_soon_threadsafe
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 840, in call_soon_threadsafe
+    self._check_closed()
+    self._check_closed()
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 541, in _check_closed
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 541, in _check_closed
+    raise RuntimeError('Event loop is closed')
+    raise RuntimeError('Event loop is closed')
+RuntimeError: Event loop is closed
+
+During handling of the above exception, another exception occurred:
+RuntimeError: Event loop is closed
+
+During handling of the above exception, another exception occurred:
+
+
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/threading.py", line 1073, in _bootstrap_inner
+  File "/usr/lib/python3.12/threading.py", line 1073, in _bootstrap_inner
+    self.run()
+  File "/usr/lib/python3.12/threading.py", line 1010, in run
+    self.run()
+  File "/usr/lib/python3.12/threading.py", line 1010, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/aiosqlite/core.py", line 75, in _connection_worker_thread
+    self._target(*self._args, **self._kwargs)
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/aiosqlite/core.py", line 75, in _connection_worker_thread
+    future.get_loop().call_soon_threadsafe(set_exception, future, e)
+    future.get_loop().call_soon_threadsafe(set_exception, future, e)
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 840, in call_soon_threadsafe
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 840, in call_soon_threadsafe
+    self._check_closed()
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 541, in _check_closed
+    self._check_closed()
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 541, in _check_closed
+    raise RuntimeError('Event loop is closed')
+RuntimeError: Event loop is closed
+    raise RuntimeError('Event loop is closed')
+RuntimeError: Event loop is closed
+2026-05-18 04:36:47,156 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-4' coro=<ReviewScheduler._review_loop() running at /home/dan.rohan/software/project-stdio/studio/orchestrator/review.py:70> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-05-18 04:36:47,156 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-4' coro=<ReviewScheduler._review_loop() running at /home/dan.rohan/software/project-stdio/studio/orchestrator/review.py:70> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-05-18 04:36:47,157 [ERROR] asyncio: Task exception was never retrieved
+future: <Task finished name='Task-5' coro=<Orchestrator._run_http_server() done, defined at /home/dan.rohan/software/project-stdio/studio/orchestrator/main.py:1101> exception=SystemExit(1)>
+Traceback (most recent call last):
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 172, in startup
+    server = await loop.create_server(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 1572, in create_server
+    raise OSError(err.errno, msg) from None
+OSError: [Errno 98] error while attempting to bind on address ('127.0.0.1', 7810): address already in use
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/dan.rohan/software/project-stdio/studio/orchestrator/main.py", line 2863, in <module>
+    main()
+  File "/home/dan.rohan/software/project-stdio/studio/orchestrator/main.py", line 2846, in main
+    loop.run_until_complete(_run())
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 674, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 641, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 1987, in _run_once
+    handle._run()
+  File "/usr/lib/python3.12/asyncio/events.py", line 88, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/dan.rohan/software/project-stdio/studio/orchestrator/main.py", line 1158, in _run_http_server
+    await self._http_server.serve()
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 79, in serve
+    await self._serve(sockets)
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 94, in _serve
+    await self.startup(sockets=sockets)
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 182, in startup
+    sys.exit(1)
+SystemExit: 1
+2026-05-18 04:36:47,157 [ERROR] asyncio: Task exception was never retrieved
+future: <Task finished name='Task-5' coro=<Orchestrator._run_http_server() done, defined at /home/dan.rohan/software/project-stdio/studio/orchestrator/main.py:1101> exception=SystemExit(1)>
+Traceback (most recent call last):
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 172, in startup
+    server = await loop.create_server(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 1572, in create_server
+    raise OSError(err.errno, msg) from None
+OSError: [Errno 98] error while attempting to bind on address ('127.0.0.1', 7810): address already in use
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/dan.rohan/software/project-stdio/studio/orchestrator/main.py", line 2863, in <module>
+    main()
+  File "/home/dan.rohan/software/project-stdio/studio/orchestrator/main.py", line 2846, in main
+    loop.run_until_complete(_run())
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 674, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 641, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 1987, in _run_once
+    handle._run()
+  File "/usr/lib/python3.12/asyncio/events.py", line 88, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/dan.rohan/software/project-stdio/studio/orchestrator/main.py", line 1158, in _run_http_server
+    await self._http_server.serve()
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 79, in serve
+    await self._serve(sockets)
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 94, in _serve
+    await self.startup(sockets=sockets)
+  File "/home/dan.rohan/software/project-stdio/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 182, in startup
+    sys.exit(1)
+SystemExit: 1
+2026-05-18 04:36:47,161 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-3' coro=<Scheduler._heartbeat_loop() running at /home/dan.rohan/software/project-stdio/studio/orchestrator/scheduler.py:74> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-05-18 04:36:47,161 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-3' coro=<Scheduler._heartbeat_loop() running at /home/dan.rohan/software/project-stdio/studio/orchestrator/scheduler.py:74> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-05-18 04:36:47,161 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-2' coro=<Scheduler._dispatch_loop() running at /home/dan.rohan/software/project-stdio/studio/orchestrator/scheduler.py:68> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-05-18 04:36:47,161 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-2' coro=<Scheduler._dispatch_loop() running at /home/dan.rohan/software/project-stdio/studio/orchestrator/scheduler.py:68> wait_for=<Future pending cb=[Task.task_wakeup()]>>

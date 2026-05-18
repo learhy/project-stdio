@@ -56,6 +56,7 @@ Respond with a single JSON object matching this schema exactly:
   "estimated_worker_count": <int>,
   "estimated_tokens": <int>,
   "target": "<new-repo | existing-repo:<name> | control-plane>",
+  "target_repo": "<new-repo:<kebab-case-name> | owner/repo>",
   "target_rationale": "<one-sentence explanation>",
   "concerns": ["<concern 1>", "<concern 2>", ...],
   "requirements_summary": "<paragraph>",
@@ -594,6 +595,15 @@ Produce the bundle proposal JSON now. Include all required fields: complexity an
             }
 
         def _build_proposal(r: dict) -> dict:
+            target = r.get("target", "control-plane")
+            target_repo = r.get("target_repo", "")
+            if not target_repo:
+                if target.startswith("existing-repo:"):
+                    target_repo = target.split(":", 1)[1]
+                elif target == "new-repo":
+                    import re
+                    slug = re.sub(r'[^a-z0-9]+', '-', idea.lower()).strip('-')[:40]
+                    target_repo = f"new-repo:{slug}"
             return {
                 "complexity_score": r.get("complexity_score", 0),
                 "risk_score": r.get("risk_score", 0),
@@ -603,7 +613,8 @@ Produce the bundle proposal JSON now. Include all required fields: complexity an
                 "estimated_duration_seconds": r.get("estimated_duration_seconds", 0),
                 "estimated_worker_count": r.get("estimated_worker_count", 0),
                 "estimated_tokens": r.get("estimated_tokens", 0),
-                "target": r.get("target", "control-plane"),
+                "target": target,
+                "target_repo": target_repo,
                 "target_rationale": r.get("target_rationale", ""),
                 "concerns": r.get("concerns", ["(bundler did not populate concerns)"]),
                 "requirements_summary": r.get("requirements_summary", ""),
