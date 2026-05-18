@@ -655,6 +655,101 @@ class DagExecutor:
 
     # ── Dispatch ──────────────────────────────────────────────────────────
 
+    # ── Dispatch ──────────────────────────────────────────────────────────
+
+    async def _compute_worker_timeout(self, bundle_id: str) -> int:
+        """Compute dynamic worker timeout from bundle's estimated_duration_seconds.
+
+        Returns timeout = max(min_timeout, estimated_duration * multiplier).
+        Falls back to default_timeout if no estimate is available.
+        """
+        min_timeout = 1800
+        default_timeout = 7200
+        multiplier = 3.0
+
+        if self.settings:
+            ops = getattr(self.settings, 'ops', None)
+            if ops:
+                min_timeout = getattr(ops, 'min_worker_timeout_seconds', 1800)
+                default_timeout = getattr(ops, 'default_worker_timeout_seconds', 7200)
+                multiplier = getattr(ops, 'timeout_multiplier', 3.0)
+
+        # Read estimated_duration_seconds from bundle proposal
+        estimated = 0
+        try:
+            row = await self.db.fetch_one(
+                "SELECT proposal_json FROM bundles WHERE id = ?", (bundle_id,)
+            )
+            if row:
+                proposal = json.loads(row["proposal_json"] or "{}")
+                bundler = proposal.get("proposal", {})
+                estimated = bundler.get("estimated_duration_seconds", 0)
+        except Exception:
+            pass
+
+        if estimated > 0:
+            return max(min_timeout, int(estimated * multiplier))
+        return default_timeout
+
+    async def _check_worktree_for_commits(self, worker_id: str, worktree_path: str, last_heartbeat: int) -> str | None:
+        """Check if a worktree has commits newer than last_heartbeat.
+
+        Returns the latest commit hash if commits exist after last_heartbeat, None otherwise.
+        """
+        if not worktree_path or not os.path.exists(worktree_path):
+            return None
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", worktree_path, "log", "--oneline", "--after",
+                str(last_heartbeat), "--format=%H",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            output = stdout.decode("utf-8", errors="replace").strip()
+            if output:
+                return output.split("\n")[-1]  # latest commit hash
+        except Exception:
+            pass
+        return None
+
+    async def _synthetic_completion(
+        self, bundle_id: str, node_id: str, worker_id: str, commit_hash: str
+    ) -> None:
+        """Transition a worker to COMPLETED with a synthetic final_report."""
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.info(
+            "Synthetic completion for worker %s (node %s): commits found at %s",
+            worker_id, node_id, commit_hash,
+        )
+
+        now = self.now()
+        node_db_id = f"{bundle_id}:{node_id}"
+
+        # Mark worker as completed
+        await self.db.execute(
+            "UPDATE workers SET state = ?, ended_at = ?, exit_reason = ? WHERE id = ?",
+            (WorkerState.COMPLETE, now, "synthetic_completion", worker_id),
+        )
+        await self.db.conn.commit()
+
+        synthetic_outcome = {
+            "node_state": NodeState.COMPLETED,
+            "files_changed": [],
+            "tests_run": 0,
+            "tests_passed": 0,
+            "tests_failed": 0,
+            "artifacts_produced": [],
+            "errors": [],
+            "summary": (
+                f"Worker completed work but did not send final_report (heartbeat timeout). "
+                f"Code committed at {commit_hash}."
+            ),
+        }
+        await self._on_final_report(bundle_id, node_id, worker_id, synthetic_outcome)
+
     async def _dispatch_ready(self, bundle_id: str) -> int:
         """Dispatch ready nodes up to the global concurrency cap. Returns number dispatched."""
         running_count = await self._count_running_workers()
@@ -732,6 +827,7 @@ class DagExecutor:
 
         # Read bundle target and target_repo from proposal_json
         target = "existing-repo"
+        target_repo = ""
         try:
             bundle_row = await self.db.fetch_one(
                 "SELECT proposal_json FROM bundles WHERE id = ?", (bundle_id,)
@@ -786,7 +882,7 @@ class DagExecutor:
 
         self._worker_targets[worker_id] = target
         self._worker_worktree_paths[worker_id] = worktree_path
-        self._worker_target_repos[worker_id] = target_repo if target_repo else ""
+        self._worker_target_repos[worker_id] = target_repo
 
         result = await self.runner.spawn_worker(
             worker_id=worker_id,
@@ -812,9 +908,18 @@ class DagExecutor:
             return
 
         now = self.now()
+
+        # Compute dynamic worker timeout from bundle estimate
+        worker_timeout = await self._compute_worker_timeout(bundle_id)
+
         await self.db.execute(
             "UPDATE dag_nodes SET state = ?, worker_id = ?, started_at = ? WHERE id = ?",
             (NodeState.RUNNING, worker_id, now, node["id"]),
+        )
+        # Store computed timeout on worker row
+        await self.db.execute(
+            "UPDATE workers SET worker_timeout_seconds = ?, started_at = ? WHERE id = ?",
+            (worker_timeout, now, worker_id),
         )
         # Increment ref_count on declared input artifacts
         await self._adjust_artifact_refs(spec, bundle_id, node["node_id"], +1)
@@ -1140,12 +1245,19 @@ class DagExecutor:
     # ── Heartbeat monitoring ──────────────────────────────────────────────
 
     async def check_heartbeat_timeouts(self) -> list[str]:
-        """Check for wedged workers. Returns list of timed-out worker IDs."""
+        """Check for wedged workers. Uses dynamic timeout from bundle estimates.
+
+        Before killing a worker:
+        1. Checks worktree for commits newer than the last heartbeat -- if found,
+           the worker completed work but failed to report; transition to COMPLETED.
+        2. Only kills workers with no commits and no recent heartbeat.
+        """
         now = self.now()
         timed_out: list[str] = []
 
         workers = await self.db.fetch_all(
-            "SELECT id, bundle_id, node_id, last_heartbeat, manifest_json FROM workers WHERE state = ?",
+            "SELECT id, bundle_id, node_id, last_heartbeat, manifest_json, "
+            "worker_timeout_seconds FROM workers WHERE state = ?",
             (WorkerState.RUNNING,),
         )
 
@@ -1154,28 +1266,38 @@ class DagExecutor:
             if last_hb is None:
                 continue
 
-            # Get wall_time_limit from manifest
-            timeout = 3600  # default 1 hour
-            if w["manifest_json"]:
-                try:
-                    mf = json.loads(w["manifest_json"])
-                    timeout = (
-                        mf.get("grants", {})
-                        .get("resources", {})
-                        .get("wall_time_limit", 3600)
-                    )
-                except Exception:
-                    pass
+            # Use stored dynamic timeout, or compute from bundle estimate as fallback
+            timeout = w.get("worker_timeout_seconds")
+            if timeout is None:
+                timeout = await self._compute_worker_timeout(w["bundle_id"])
 
-            threshold = timeout * self.heartbeat_timeout_multiplier
+            threshold = timeout
             if now - last_hb > threshold:
-                timed_out.append(w["id"])
-                node_db_id = f"{w['bundle_id']}:{w['node_id']}"
+                worker_id = w["id"]
+                bundle_id = w["bundle_id"]
+                node_id = w["node_id"]
+                node_db_id = f"{bundle_id}:{node_id}"
+
+                # Check worktree for commits completed after the last heartbeat
+                worktree_path = self._worker_worktree_paths.get(worker_id, "")
+                commit_hash = await self._check_worktree_for_commits(
+                    worker_id, worktree_path, last_hb
+                )
+
+                if commit_hash:
+                    # Worker completed work but missed sending final_report
+                    await self._synthetic_completion(
+                        bundle_id, node_id, worker_id, commit_hash,
+                    )
+                    continue
+
+                # Genuinely stalled: no commits, no heartbeat
+                timed_out.append(worker_id)
 
                 # Kill the worker process
-                proc = self._running_workers.pop(w["id"], None)
+                proc = self._running_workers.pop(worker_id, None)
                 if proc and proc.returncode is None:
-                    await self.runner.kill_worker(proc, w["id"])
+                    await self.runner.kill_worker(proc, worker_id)
 
                 # Mark node and worker as failed
                 await self.db.execute(
@@ -1184,13 +1306,13 @@ class DagExecutor:
                 )
                 await self.db.execute(
                     "UPDATE workers SET state = ?, exit_reason = ? WHERE id = ?",
-                    (WorkerState.FAILED, "heartbeat_timeout", w["id"]),
+                    (WorkerState.FAILED, "heartbeat_timeout", worker_id),
                 )
                 await self.db.conn.commit()
 
                 # Fail the bundle
                 await self._fail_bundle(
-                    w["bundle_id"], w["node_id"], w["id"], "heartbeat_timeout"
+                    bundle_id, node_id, worker_id, "heartbeat_timeout"
                 )
 
         return timed_out

@@ -1401,3 +1401,156 @@ class TestPushWorkerChanges:
 
         github_mock.create_repo.assert_not_called()
         github_mock.create_pr.assert_not_called()
+
+
+class TestComputeWorkerTimeout:
+    """Tests for dynamic worker timeout based on bundle estimates."""
+
+    @pytest.fixture
+    def executor(self, db_mock, sm_mock, runner_mock, rpc_handlers_mock, conn_mgr_mock):
+        from studio.orchestrator.models import Settings, OpsSettings
+        settings = Settings()
+        settings.ops = OpsSettings(
+            timeout_multiplier=3.0,
+            min_worker_timeout_seconds=1800,
+            default_worker_timeout_seconds=7200,
+        )
+        return DagExecutor(
+            db=db_mock,
+            sm=sm_mock,
+            runner=runner_mock,
+            rpc_handlers=rpc_handlers_mock,
+            conn_mgr=conn_mgr_mock,
+            global_concurrency=4,
+            settings=settings,
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_from_estimate(self, executor, db_mock):
+        """Bundle with 3600s estimate gets 10800s timeout (3600 * 3.0)."""
+        db_mock.fetch_one.return_value = {
+            "proposal_json": json.dumps({
+                "proposal": {"estimated_duration_seconds": 3600}
+            }),
+        }
+        timeout = await executor._compute_worker_timeout("b1")
+        assert timeout == 10800  # 3600 * 3.0
+
+    @pytest.mark.asyncio
+    async def test_timeout_floor(self, executor, db_mock):
+        """Bundle with 100s estimate (below floor of 1800) still gets 1800."""
+        db_mock.fetch_one.return_value = {
+            "proposal_json": json.dumps({
+                "proposal": {"estimated_duration_seconds": 100}
+            }),
+        }
+        timeout = await executor._compute_worker_timeout("b1")
+        assert timeout == 1800  # max(1800, 100 * 3.0) = 1800
+
+    @pytest.mark.asyncio
+    async def test_timeout_no_estimate(self, executor, db_mock):
+        """Bundle with no estimate gets default_worker_timeout_seconds (7200)."""
+        db_mock.fetch_one.return_value = {
+            "proposal_json": json.dumps({
+                "proposal": {}  # no estimated_duration_seconds
+            }),
+        }
+        timeout = await executor._compute_worker_timeout("b1")
+        assert timeout == 7200  # default
+
+    @pytest.mark.asyncio
+    async def test_timeout_small_estimate_floor(self, executor, db_mock):
+        """Bundle with very small estimate (100s) still gets floor of 1800."""
+        db_mock.fetch_one.return_value = {
+            "proposal_json": json.dumps({
+                "proposal": {"estimated_duration_seconds": 100}
+            }),
+        }
+        timeout = await executor._compute_worker_timeout("b1")
+        assert timeout == 1800  # max(1800, 300)
+
+
+class TestStallDetection:
+    """Tests for smarter stall detection with worktree commit checks."""
+
+    @pytest.fixture
+    def executor(self, db_mock, sm_mock, runner_mock, rpc_handlers_mock, conn_mgr_mock):
+        return DagExecutor(
+            db=db_mock,
+            sm=sm_mock,
+            runner=runner_mock,
+            rpc_handlers=rpc_handlers_mock,
+            conn_mgr=conn_mgr_mock,
+            global_concurrency=4,
+        )
+
+    @pytest.mark.asyncio
+    @patch("os.path.exists", return_value=True)
+    @patch("studio.orchestrator.executor.asyncio.create_subprocess_exec")
+    async def test_stall_check_committed_work(self, mock_subprocess, mock_exists, executor, db_mock):
+        """Worker with commits but late heartbeat gets synthetic completion, not killed."""
+        now = executor.now()
+        worker = {
+            "id": "w1", "bundle_id": "b1", "node_id": "n1",
+            "last_heartbeat": now - 10000,
+            "manifest_json": "{}",
+            "worker_timeout_seconds": 1800,
+        }
+
+        # First call: fetch_all for workers
+        # _compute_worker_timeout is never needed since worker_timeout_seconds is set
+        db_mock.fetch_all = AsyncMock(return_value=[worker])
+        db_mock.fetch_one = AsyncMock()
+
+        # Simulate git log returning a commit hash
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"abc123\ndef456\n", b""))
+        mock_subprocess.return_value = mock_proc
+
+        # Track worktree path so _check_worktree_for_commits works
+        executor._worker_worktree_paths["w1"] = "/tmp/test-worktree"
+
+        # Mock _synthetic_completion to verify it's called
+        executor._synthetic_completion = AsyncMock()
+        executor._fail_bundle = AsyncMock()
+
+        timed_out = await executor.check_heartbeat_timeouts()
+
+        assert "w1" not in timed_out
+        executor._synthetic_completion.assert_called_once_with(
+            "b1", "n1", "w1", "def456",
+        )
+        executor._fail_bundle.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("studio.orchestrator.executor.asyncio.create_subprocess_exec")
+    async def test_stall_check_no_work(self, mock_subprocess, executor, db_mock):
+        """Worker with no commits and late heartbeat gets killed."""
+        now = executor.now()
+        worker = {
+            "id": "w1", "bundle_id": "b1", "node_id": "n1",
+            "last_heartbeat": now - 10000,
+            "manifest_json": "{}",
+            "worker_timeout_seconds": 1,  # very short timeout to trigger
+        }
+
+        # For _skip_downstream and stop_bundle calls
+        db_mock.fetch_all = AsyncMock()
+        db_mock.fetch_all.side_effect = [
+            [worker],  # running workers
+            [],  # _skip_downstream: no edges
+            [],  # stop_bundle: running workers
+        ]
+        db_mock.fetch_one = AsyncMock(return_value=None)
+
+        # Simulate git log returning nothing (no commits)
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+        mock_subprocess.return_value = mock_proc
+
+        # Track worktree path
+        executor._worker_worktree_paths["w1"] = "/tmp/test-worktree"
+
+        timed_out = await executor.check_heartbeat_timeouts()
+
+        assert "w1" in timed_out

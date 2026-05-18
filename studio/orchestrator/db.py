@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 
 
 class DatabaseVersionError(RuntimeError):
@@ -543,6 +543,17 @@ async def _migrate_v16(conn: aiosqlite.Connection) -> None:
     if "verification_strategy_json" not in columns:
         await conn.execute(
             "ALTER TABLE bundles ADD COLUMN verification_strategy_json TEXT"
+        )
+
+
+@migration(17)
+async def _migrate_v17(conn: aiosqlite.Connection) -> None:
+    """Add worker_timeout_seconds to workers for dynamic timeout (Bundle 6.2)."""
+    cursor = await conn.execute("PRAGMA table_info('workers')")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "worker_timeout_seconds" not in columns:
+        await conn.execute(
+            "ALTER TABLE workers ADD COLUMN worker_timeout_seconds INTEGER"
         )
 
 

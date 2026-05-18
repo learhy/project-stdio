@@ -700,6 +700,9 @@ class OpsSettings(BaseModel):
     recall_window_hours: int = 48
     acting_soon_hours: int = 12
     worker_token_expiry_minutes: int = 15
+    timeout_multiplier: float = 3.0
+    min_worker_timeout_seconds: int = 1800
+    default_worker_timeout_seconds: int = 7200
 
 
 class DeveloperSettings(BaseModel):
