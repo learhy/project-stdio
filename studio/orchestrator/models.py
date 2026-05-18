@@ -778,6 +778,20 @@ class DockerRunnerSettings(BaseModel):
     pull_policy: str = "if_not_present"
 
 
+class FirecrackerSettings(BaseModel):
+    """Firecracker microVM runner configuration (Phase 7)."""
+    enabled: bool = False
+    kernel_path: str = "/var/lib/studio/firecracker/vmlinux"
+    rootfs_path: str = "/var/lib/studio/firecracker/rootfs.ext4"
+    pool_size: int = 3
+    default_vcpus: int = 1
+    default_memory_mb: int = 512
+    tap_bridge: str = "studio-fc-br0"
+    ip_range: str = "172.16.0.0/24"
+    jailer_enabled: bool = False
+    reset_mode: Literal["reboot", "overlay_only"] = "reboot"
+
+
 class RunnerSelectorSettings(BaseModel):
     """Runner selection policy configuration (Bundle 4.4)."""
     allow_unenforced_grants: bool = False
@@ -794,6 +808,7 @@ class Settings(BaseModel):
     remote_fleet: RemoteFleetSettings = Field(default_factory=RemoteFleetSettings)
     k8s_runner: K8sRunnerSettings = Field(default_factory=K8sRunnerSettings)
     docker_runner: DockerRunnerSettings = Field(default_factory=DockerRunnerSettings)
+    firecracker: FirecrackerSettings = Field(default_factory=FirecrackerSettings)
     runner_selector: RunnerSelectorSettings = Field(default_factory=RunnerSelectorSettings)
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)

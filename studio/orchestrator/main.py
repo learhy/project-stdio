@@ -2623,6 +2623,37 @@ async def _cli_docker_images(app: Orchestrator, params: dict) -> dict:
         return {"error": f"Failed to list Docker images: {exc}"}
 
 
+async def _cli_vm_status(app: Orchestrator, params: dict) -> dict:
+    """Show Firecracker VM pool status (Phase 7.1)."""
+    from studio.orchestrator.firecracker import check_firecracker_available
+
+    fc_settings = app.settings.firecracker
+    check = check_firecracker_available(
+        kernel_path=fc_settings.kernel_path,
+        firecracker_binary="firecracker",
+    )
+
+    result: dict[str, Any] = {
+        "available": check["available"],
+        "reason": check.get("reason", ""),
+        "kvm": check.get("kvm", False),
+        "kernel": check.get("kernel", False),
+        "binary": check.get("binary", False),
+        "enabled": fc_settings.enabled,
+        "pool_size": fc_settings.pool_size,
+        "sandbox": "firecracker (active)" if (fc_settings.enabled and check["available"]) else "bubblewrap",
+    }
+
+    if hasattr(app, "_vm_pool") and app._vm_pool is not None:
+        result["available_vms"] = app._vm_pool._available.qsize()
+        result["total_spawned"] = len(app._vm_pool._all_vms)
+    else:
+        result["available_vms"] = 0
+        result["total_spawned"] = 0
+
+    return result
+
+
 async def _cli_review_worker(app: Orchestrator, params: dict) -> dict:
     """PM-initiated review of a specific worker (Bundle 5.2)."""
     worker_id = params.get("worker_id", "")
@@ -2756,6 +2787,7 @@ _CLI_HANDLERS = {
     "studio.k8s_status": _cli_k8s_status,
     "studio.docker_status": _cli_docker_status,
     "studio.docker_images": _cli_docker_images,
+    "studio.vm_status": _cli_vm_status,
     "studio.review_worker": _cli_review_worker,
     "studio.answer_question": _cli_answer_question,
     "studio.resume_worker": _cli_resume_worker,

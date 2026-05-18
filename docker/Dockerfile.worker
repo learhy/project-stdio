@@ -1,6 +1,15 @@
-# Unified worker image for all runners (k8s, Docker, local)
+# Unified worker image for all runners (k8s, Docker, local, Firecracker)
 # k8s/Docker runner: requires Python, git, curl
 # Docker runner: also requires bubblewrap and opencode for certain tasks
+# Firecracker runner: includes fc-agent and init script for microVM boot
+
+# ── Stage 1: Build fc-agent Go binary ──────────────────────────────────────
+FROM golang:bookworm AS fc-agent-builder
+WORKDIR /build
+COPY studio/fc-agent/ .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /studio-fc-agent .
+
+# ── Stage 2: Worker image ──────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
@@ -17,6 +26,13 @@ RUN curl -fsSL https://opencode.ai/install | bash
 # Install studio-worker only (not the full orchestrator)
 COPY . /build
 RUN cd /build && uv pip install --system -e ".[worker]"
+
+# Copy fc-agent from builder stage (Firecracker runner)
+COPY --from=fc-agent-builder /studio-fc-agent /sbin/studio-fc-agent
+
+# Init script for Firecracker microVM boot
+COPY docker/init.sh /sbin/init
+RUN chmod +x /sbin/init /sbin/studio-fc-agent
 
 # Non-root user
 RUN useradd -u 10000 -m studio

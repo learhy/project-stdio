@@ -473,6 +473,68 @@ async def cmd_docker_images() -> int:
     return 0
 
 
+# ── Firecracker CLI commands (Phase 7.1) ──────────────────────────────────────
+
+async def cmd_build_worker_image(output: str, no_cache: bool = False) -> int:
+    """Build the Firecracker worker rootfs ext4 image."""
+    from studio.orchestrator.firecracker import build_rootfs
+
+    try:
+        result = await build_rootfs(output, no_cache=no_cache)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Rootfs built: {result['path']}")
+    print(f"  Size:  {result['size_bytes']:,} bytes")
+    print(f"  SHA256: {result['sha256']}")
+    return 0
+
+
+async def cmd_download_kernel(output: str, version: str = "v1.7") -> int:
+    """Download a Firecracker-compatible kernel binary."""
+    from studio.orchestrator.firecracker import download_kernel
+
+    try:
+        result = await download_kernel(output, version=version)
+    except Exception as e:
+        print(f"Error downloading kernel: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Kernel downloaded: {result['path']}")
+    print(f"  Size:  {result['size_bytes']:,} bytes")
+    print(f"  SHA256: {result['sha256']}")
+    return 0
+
+
+async def cmd_vm_status() -> int:
+    """Show Firecracker VM pool status."""
+    resp = await _send_rpc(_get_socket_path(), "studio.vm_status", {})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    if "error" in data:
+        print(f"Error: {data['error']}", file=sys.stderr)
+        return 1
+
+    available = data.get("available", False)
+    print(f"Firecracker available: {available}")
+    if not available:
+        print(f"  Reason: {data.get('reason', 'unknown')}")
+        return 0
+
+    print(f"  Pool size:      {data.get('pool_size', 0)}")
+    print(f"  Available VMs:  {data.get('available_vms', 0)}")
+    print(f"  Total spawned:  {data.get('total_spawned', 0)}")
+    print(f"  Sandbox:        {data.get('sandbox', 'unknown')}")
+    return 0
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def cmd_version() -> int:
@@ -573,6 +635,21 @@ def main() -> None:
     # docker-images (Bundle 4.5)
     sub.add_parser("docker-images", help="Show worker and proxy Docker images")
 
+    # build-worker-image (Phase 7.1)
+    p_build = sub.add_parser("build-worker-image", help="Build Firecracker worker rootfs ext4 image")
+    p_build.add_argument("--output", "-o", default="/var/lib/studio/firecracker/rootfs.ext4",
+                         help="Output path for ext4 image")
+    p_build.add_argument("--no-cache", action="store_true", help="Rebuild Docker image from scratch")
+
+    # download-kernel (Phase 7.1)
+    p_dlkernel = sub.add_parser("download-kernel", help="Download Firecracker-compatible kernel")
+    p_dlkernel.add_argument("--output", "-o", default="/var/lib/studio/firecracker/vmlinux",
+                            help="Output path for kernel image")
+    p_dlkernel.add_argument("--version", default="v1.7", help="Firecracker version (default: v1.7)")
+
+    # vm-status (Phase 7.1)
+    sub.add_parser("vm-status", help="Show Firecracker VM pool status")
+
     # fleet-add (Bundle 4.2)
     p_fadd = sub.add_parser("fleet-add", help="Add a host to the remote fleet")
     p_fadd.add_argument("name", help="Host name")
@@ -642,6 +719,12 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_fleet_add(args.name, args.addr, args))
         elif args.command == "fleet-remove":
             exit_code = loop.run_until_complete(cmd_fleet_remove(args.name))
+        elif args.command == "build-worker-image":
+            exit_code = loop.run_until_complete(cmd_build_worker_image(args.output, args.no_cache))
+        elif args.command == "download-kernel":
+            exit_code = loop.run_until_complete(cmd_download_kernel(args.output, args.version))
+        elif args.command == "vm-status":
+            exit_code = loop.run_until_complete(cmd_vm_status())
         else:
             print(f"Unknown command: {args.command}", file=sys.stderr)
             exit_code = 1

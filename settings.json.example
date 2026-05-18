@@ -76,6 +76,18 @@
     "registry": null,
     "pull_policy": "if_not_present"
   },
+  "firecracker": {
+    "enabled": false,
+    "kernel_path": "/var/lib/studio/firecracker/vmlinux",
+    "rootfs_path": "/var/lib/studio/firecracker/rootfs.ext4",
+    "pool_size": 3,
+    "default_vcpus": 1,
+    "default_memory_mb": 512,
+    "tap_bridge": "studio-fc-br0",
+    "ip_range": "172.16.0.0/24",
+    "jailer_enabled": false,
+    "reset_mode": "reboot"
+  },
   "runner_selector": {
     "allow_unenforced_grants": false,
     "default_preference": "any"
