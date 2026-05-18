@@ -238,6 +238,10 @@ class LocalBwrapWorkerRunner:
         # Track proxy processes for cleanup
         self._proxy_processes: dict[str, asyncio.subprocess.Process] = {}
 
+    @property
+    def bwrap_available(self) -> bool | None:
+        return self._bwrap_available
+
     @staticmethod
     def now() -> int:
         return int(time.time())
@@ -258,8 +262,18 @@ class LocalBwrapWorkerRunner:
             _, stderr = await proc.communicate()
             ok = proc.returncode == 0
             if not ok:
-                _logger.warning("bwrap not available, workers run without container isolation: %s",
-                                stderr.decode(errors="replace").strip().split("\n")[0] if stderr else "unknown error")
+                stderr_text = stderr.decode(errors="replace").strip() if stderr else "unknown error"
+                if "Permission denied" in stderr_text:
+                    _logger.warning(
+                        "bubblewrap isolation unavailable -- running worker without sandbox isolation. "
+                        "Install Firecracker for full isolation or run: "
+                        "sudo sysctl kernel.unprivileged_userns_clone=1"
+                    )
+                else:
+                    _logger.warning(
+                        "bwrap not available, workers run without container isolation: %s",
+                        stderr_text.split("\n")[0],
+                    )
             return ok
         except FileNotFoundError:
             _logger.warning("bwrap not installed, workers run without container isolation")

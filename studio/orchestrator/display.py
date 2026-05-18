@@ -46,6 +46,7 @@ def format_bundle_show(
     audit_entries: list[dict[str, Any]],
     artifacts: list[dict[str, Any]],
     verbose: bool = False,
+    outcome_json: dict[str, Any] | None = None,
 ) -> str:
     """Format a bundle for the review deck display."""
     lines: list[str] = []
@@ -108,6 +109,33 @@ def format_bundle_show(
             name = art.get("name", "")
             if name in ("adversarial-findings", "security-findings", "verification-plan"):
                 lines.append(f"  {name}: present ({art.get('size_bytes', 0)} bytes)")
+        lines.append("")
+
+    # Quality metrics (from outcome_json, verbose only)
+    if verbose and outcome_json:
+        lines.append("Quality metrics:")
+        verification = outcome_json.get("verification", {})
+        va = verification.get("verification_attempts")
+        if va is not None:
+            lines.append(f"  Verification attempts: {va}")
+        qa_scores = verification.get("criterion_scores", [])
+        if qa_scores:
+            passing = sum(1 for s in qa_scores if s.get("pass_fail"))
+            lines.append(f"  QA criterion scores: {passing}/{len(qa_scores)} passing")
+            for s in qa_scores:
+                name = s.get("criterion_name", s.get("name", "unknown"))
+                pf = "PASS" if s.get("pass_fail") else "FAIL"
+                lines.append(f"    {pf}  {name}")
+        daa = outcome_json.get("developer_attempts_analysis")
+        if daa:
+            if isinstance(daa, list):
+                for note in daa:
+                    lines.append(f"  Developer note: {note}")
+            else:
+                lines.append(f"  Developer analysis: {daa}")
+        dev_attempts = outcome_json.get("developer_verification_attempts")
+        if dev_attempts is not None:
+            lines.append(f"  Build verification attempts: {dev_attempts}")
         lines.append("")
 
     # DAG summary
@@ -390,10 +418,13 @@ def format_health(snap: dict[str, Any]) -> str:
 # ── studio status ──────────────────────────────────────────────────────────────
 
 def format_status(uptime: float, worker_count: int, queue_depth: int,
-                  listeners: list[str] | None = None) -> str:
+                  listeners: list[str] | None = None,
+                  sandbox: str | None = None) -> str:
     """Format terse status line."""
     uptime_str = _format_duration(int(uptime)) if uptime else "0s"
     base = f"Orchestrator: running | Uptime: {uptime_str} | Workers: {worker_count} running | Queue: {queue_depth}"
+    if sandbox:
+        base += f" | Sandbox: {sandbox}"
     if listeners:
         base += "\nListeners: " + ", ".join(listeners)
     return base
@@ -482,8 +513,11 @@ def format_calibration(data: dict[str, Any]) -> str:
         lines.append("")
         lines.append("Code quality:")
         fapr = cq.get("first_attempt_pass_rate")
+        total_verified = cq.get("total_verified", 0)
         if fapr is not None:
             lines.append(f"  First-attempt verification pass rate: {fapr}% (target: >80%)")
+        elif total_verified == 0:
+            lines.append("  First-attempt verification pass rate: N/A (no verification data yet)")
         else:
             lines.append("  First-attempt verification pass rate: N/A")
         afa = cq.get("avg_fix_attempts")

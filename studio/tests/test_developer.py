@@ -578,6 +578,7 @@ class TestVerificationIntegration:
                                 failures=[VerificationFailure(test_name="pytest", summary="3 tests failed")],
                             )
                             with patch.object(w, "_escalate_to_pm") as mock_escalate:
+                                mock_escalate.return_value = None  # No PM response
                                 with patch.object(w, "_commit_worktree") as mock_commit:
                                     mock_commit.return_value = True
 
@@ -671,3 +672,136 @@ class TestVerificationIntegration:
                                         result = await w._execute_task()
 
             assert result["outcome"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_escalation_pm_response_resumes_worker(self):
+        """PM response to escalation overrides verification failure and succeeds."""
+        from studio.workers import developer
+        from studio.orchestrator.artifacts import VerificationResult, VerificationFailure
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {
+                "objective": "Build API",
+                "verification_strategy": {"type": "library", "test_command": "pytest"},
+            }
+            w.rpc.notify = AsyncMock()
+            w.rpc.call = AsyncMock()
+
+            async def mock_escalate(*args, **kwargs):
+                return "Proceed with current implementation. The code is correct."
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch.object(w, "_init_opencode_project"):
+                    with patch.object(w, "_run_opencode") as mock_opencode:
+                        mock_opencode.return_value = {
+                            "success": True, "stuck": False,
+                            "stdout_lines": ["Done"],
+                        }
+                        with patch.object(w, "_run_verification") as mock_verify:
+                            mock_verify.return_value = VerificationResult(
+                                passed=False, output="Bug in verification",
+                                failures=[VerificationFailure(
+                                    test_name="smoke", summary="Pydantic error",
+                                )],
+                            )
+                            with patch.object(w, "_escalate_to_pm", mock_escalate):
+                                with patch.object(w, "_commit_worktree") as mock_commit:
+                                    mock_commit.return_value = True
+
+                                    result = await w._execute_task()
+
+            assert result["outcome"] == "success"
+            assert result.get("pm_override") is True
+
+    @pytest.mark.asyncio
+    async def test_escalation_pm_kill_aborts_worker(self):
+        """PM /kill response to escalation still results in failure."""
+        from studio.workers import developer
+        from studio.orchestrator.artifacts import VerificationResult, VerificationFailure
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {
+                "objective": "Build API",
+                "verification_strategy": {"type": "library", "test_command": "pytest"},
+            }
+            w.rpc.notify = AsyncMock()
+            w.rpc.call = AsyncMock()
+
+            async def mock_escalate(*args, **kwargs):
+                return "/kill"
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch.object(w, "_init_opencode_project"):
+                    with patch.object(w, "_run_opencode") as mock_opencode:
+                        mock_opencode.return_value = {
+                            "success": True, "stuck": False,
+                            "stdout_lines": ["Done"],
+                        }
+                        with patch.object(w, "_run_verification") as mock_verify:
+                            mock_verify.return_value = VerificationResult(
+                                passed=False, output="Tests failed",
+                                failures=[VerificationFailure(
+                                    test_name="pytest", summary="3 tests failed",
+                                )],
+                            )
+                            with patch.object(w, "_escalate_to_pm", mock_escalate):
+                                with patch.object(w, "_commit_worktree") as mock_commit:
+                                    mock_commit.return_value = True
+
+                                    result = await w._execute_task()
+
+            assert result["outcome"] == "failure"
+
+    @pytest.mark.asyncio
+    async def test_escalation_pm_empty_response_fails(self):
+        """Empty PM response (no answer) still results in failure."""
+        from studio.workers import developer
+        from studio.orchestrator.artifacts import VerificationResult, VerificationFailure
+
+        with patch.dict("os.environ", {
+            "STUDIO_WORKTREE_PATH": "/tmp/test-wt",
+            "STUDIO_BASE_BRANCH": "main",
+        }):
+            importlib.reload(developer)
+            w = developer.DeveloperWorker()
+            w.task_spec = {
+                "objective": "Build API",
+                "verification_strategy": {"type": "library", "test_command": "pytest"},
+            }
+            w.rpc.notify = AsyncMock()
+            w.rpc.call = AsyncMock()
+
+            async def mock_escalate(*args, **kwargs):
+                return None
+
+            with patch.object(w, "_setup_git_identity"):
+                with patch.object(w, "_init_opencode_project"):
+                    with patch.object(w, "_run_opencode") as mock_opencode:
+                        mock_opencode.return_value = {
+                            "success": True, "stuck": False,
+                            "stdout_lines": ["Done"],
+                        }
+                        with patch.object(w, "_run_verification") as mock_verify:
+                            mock_verify.return_value = VerificationResult(
+                                passed=False, output="Tests failed",
+                                failures=[VerificationFailure(
+                                    test_name="pytest", summary="3 tests failed",
+                                )],
+                            )
+                            with patch.object(w, "_escalate_to_pm", mock_escalate):
+                                with patch.object(w, "_commit_worktree") as mock_commit:
+                                    mock_commit.return_value = True
+
+                                    result = await w._execute_task()
+
+            assert result["outcome"] == "failure"

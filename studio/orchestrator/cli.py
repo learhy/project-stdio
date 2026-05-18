@@ -145,7 +145,11 @@ async def cmd_show(bundle_id: str, verbose: bool = False, json_output: bool = Fa
     audit_entries = result.get("audit_entries", [])
     artifacts = result.get("artifacts", [])
 
-    print(format_bundle_show(bundle, proposal, nodes, edges, audit_entries, artifacts, verbose=verbose))
+    outcome_json_str = bundle.get("outcome_json", "")
+    outcome_json = json.loads(outcome_json_str) if outcome_json_str else None
+
+    print(format_bundle_show(bundle, proposal, nodes, edges, audit_entries, artifacts,
+                             verbose=verbose, outcome_json=outcome_json))
     return 0
 
 
@@ -305,6 +309,7 @@ async def cmd_status() -> int:
         worker_count=data.get("worker_count", 0),
         queue_depth=data.get("queue_depth", 0),
         listeners=data.get("listeners"),
+        sandbox=data.get("sandbox"),
     ))
     return 0
 

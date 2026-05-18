@@ -69,6 +69,7 @@ class TestOrchestratorLifecycle:
             mock_create_rpc.return_value = (mock_dispatcher, mock_handlers, mock_conn_mgr)
 
             mock_runner = MagicMock()
+            mock_runner._check_bwrap = AsyncMock(return_value=True)
             mock_runner_cls.return_value = mock_runner
 
             mock_selector = MagicMock()

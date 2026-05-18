@@ -47,6 +47,14 @@ def _now() -> int:
     return int(time.time())
 
 
+def _is_kill_or_abort(response: str) -> bool:
+    """Check if a PM response indicates the worker should abort."""
+    return (not response.strip() or
+            response.strip().lower() in ("/kill", "/abort") or
+            response.strip().lower().startswith("/kill ") or
+            response.strip().lower().startswith("/abort "))
+
+
 def _load_task_spec() -> dict[str, Any]:
     try:
         return json.loads(_TASK_SPEC_RAW)
@@ -215,7 +223,14 @@ class DeveloperWorker:
                 )
                 if attempt < max_attempts:
                     continue
-                await self._escalate_to_pm(objective, [], max_attempts)
+                pm_response = await self._escalate_to_pm(objective, [], max_attempts)
+                if pm_response and not _is_kill_or_abort(pm_response):
+                    self._log(f"PM overrode opencode failure: {pm_response[:200]}")
+                    await self._commit_worktree(objective, failed=False)
+                    return {"outcome": "success",
+                            "summary": f"Task accepted by PM after {max_attempts} failed opencode attempts",
+                            "attempts": max_attempts,
+                            "pm_override": True}
                 await self._commit_worktree(objective, failed=True)
                 return {"outcome": "failure", "summary": f"OpenCode failed after {max_attempts} attempts",
                         "errors": opencode_result.get("errors", [])}
@@ -265,7 +280,16 @@ class DeveloperWorker:
             )
 
         # All attempts exhausted
-        await self._escalate_to_pm(objective, last_result.failures if last_result else [], max_attempts)
+        pm_response = await self._escalate_to_pm(objective, last_result.failures if last_result else [], max_attempts)
+        if pm_response and not _is_kill_or_abort(pm_response):
+            self._log(f"PM overrode verification failure: {pm_response[:200]}")
+            await self._commit_worktree(objective, failed=False)
+            return {
+                "outcome": "success",
+                "summary": f"Task accepted by PM after {max_attempts} verification attempts",
+                "attempts": max_attempts,
+                "pm_override": True,
+            }
         await self._commit_worktree(objective, failed=True)
         return {
             "outcome": "failure",
@@ -442,7 +466,12 @@ Fix the error and complete the task. Do not repeat the same approach that caused
         except Exception:
             pass
 
-    async def _escalate_to_pm(self, objective: str, failures: list, attempts: int) -> None:
+    async def _escalate_to_pm(self, objective: str, failures: list, attempts: int) -> str | None:
+        """Escalate to PM and return the human response (or None if no response).
+
+        Returns the PM's response string, or None if the PM did not respond
+        or the escalation failed.
+        """
         from studio.orchestrator.artifacts import VerificationFailure
 
         failure_lines = []
@@ -466,12 +495,17 @@ Failures:
                 "percent": 100,
                 "message": f"Escalating after {attempts} failed attempts",
             })
-            await self._request_human_input(
+            response = await self._request_human_input(
                 f"All {attempts} verification attempts exhausted for task",
                 context,
             )
+            if response:
+                self._log(f"PM responded to escalation: {response[:200]}")
+                return response
+            self._log("No PM response received within poll window")
+            return None
         except Exception:
-            pass
+            return None
 
     async def _stream_and_detect_stuck(self) -> tuple[list[str], bytes, bool]:
         """Stream stdout from opencode, tracking rolling hash for stuck detection.

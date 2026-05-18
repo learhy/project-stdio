@@ -616,7 +616,7 @@ class Orchestrator:
             "SELECT output_json FROM dag_nodes WHERE bundle_id = ? AND kind = 'worker'",
             (bundle_id,),
         )
-        developer_verification_attempts = 1
+        developer_verification_attempts = 0
         first_attempt_pass = False
         for r in dev_rows or []:
             try:
@@ -624,9 +624,14 @@ class Orchestrator:
                 attempts = output.get("attempts", 1)
                 if isinstance(attempts, int) and attempts > developer_verification_attempts:
                     developer_verification_attempts = attempts
+                # A worker passed on first attempt if attempts == 1 and outcome was success
+                if isinstance(attempts, int) and attempts == 1 and output.get("outcome") == "success":
+                    first_attempt_pass = True
             except (json.JSONDecodeError, TypeError):
                 pass
-        first_attempt_pass = developer_verification_attempts == 1
+        # If no dev workers ran, don't claim first_attempt_pass
+        if developer_verification_attempts == 0:
+            first_attempt_pass = False
 
         # QA criterion scores from outcome_json
         verification = outcome.get("verification", {})
@@ -871,6 +876,17 @@ class Orchestrator:
             self._ssh_runner = ssh_runner
             self._k8s_runner = k8s_runner
             self._docker_runner = docker_runner
+
+            # Check bwrap availability at startup
+            try:
+                self._bwrap_available = await local_runner._check_bwrap()
+            except (TypeError, AttributeError):
+                # _check_bwrap may not be awaitable in test contexts
+                self._bwrap_available = True
+            if self._bwrap_available:
+                logger.info("Sandbox: bubblewrap (active)")
+            else:
+                logger.warning("Sandbox: none (WARNING: workers running unsandboxed)")
 
         # 5. Executor
         self.executor = DagExecutor(
@@ -2251,6 +2267,8 @@ async def _cli_status(app: Orchestrator, params: dict) -> dict:
     }
     if app._code_stale:
         result["warning"] = "Code updated since last restart. Restart required."
+    if hasattr(app, '_bwrap_available'):
+        result["sandbox"] = "bubblewrap (active)" if app._bwrap_available else "none (WARNING: workers running unsandboxed)"
     return result
 
 
@@ -2269,46 +2287,13 @@ async def _cli_recall(app: Orchestrator, params: dict) -> dict:
     if not bundle_id:
         return {"error": "bundle_id is required"}
 
-    # 1. Check recall eligibility (48h window)
-    result = await app.ops.recall_bundle(bundle_id, actor="cli")
-    if not result.get("eligible"):
-        return result
-
-    # 2. Fetch original bundle to build reversal bundle_input
-    row = await app.db.fetch_one(
-        "SELECT proposal_json FROM bundles WHERE id = ?", (bundle_id,)
-    )
-    proposal = json.loads(row["proposal_json"] or "{}") if row else {}
-    bundle_input = proposal.get("bundle_input", {})
-    original_idea = bundle_input.get("idea", "")
-
-    reversal_idea = f"Revert bundle {bundle_id}"
-    if original_idea:
-        reversal_idea += f": {original_idea}"
-
-    reversal_input = {
-        "idea": reversal_idea,
-        "supersedes_bundle_id": bundle_id,
-        "target_repo": bundle_input.get("target_repo", "control-plane"),
-    }
-
-    # 3. Submit reversal bundle through the normal bundler flow
-    from ulid import ULID
-    rollback_id = str(ULID())
-    now = int(time.time())
-
-    await app.sm.transition_1_submit_idea(rollback_id, reversal_input)
-    await _spawn_bundler(app, rollback_id, reversal_input)
-
-    # 4. Notify
-    await app.ops.notify_recall(bundle_id, rollback_id)
-
     return {
-        "eligible": True,
-        "bundle_id": bundle_id,
-        "rollback_bundle_id": rollback_id,
-        "reversal_idea": reversal_idea,
-        "message": "Recall rollback bundle created",
+        "eligible": False,
+        "reason": (
+            f"studio recall is not yet implemented. "
+            f"To revert a bundle, submit a new bundle with idea: "
+            f"'Revert bundle {bundle_id}: <original idea>'"
+        ),
     }
 
 
