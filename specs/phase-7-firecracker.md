@@ -353,3 +353,100 @@ Branch: phase-7/security-hardening. Merge 7.3 first. Report ambiguities before c
 **Nested virtualization**: some cloud environments disable KVM for VMs (nested virtualization). In those environments the installer falls back to bubblewrap with a warning. Document which cloud providers support KVM in `docs/install.md`.
 
 **VM snapshotting for fast restore**: Firecracker supports snapshotting a running VM and restoring from snapshot in <50ms. This could enable even faster pool replenishment — instead of booting a new VM, restore from a clean snapshot. Deferred to a future phase once the basic VM pool is stable.
+
+---
+
+## Bundle 7.5: Privileged agent support (eBPF and kernel modules)
+
+### Background
+
+Some workloads require kernel-level capabilities that bubblewrap strips: CAP_BPF for eBPF programs, CAP_SYS_ADMIN for certain monitoring agents, CAP_NET_ADMIN for network tools. Bundles 7.1-7.4 provide full microVM isolation but do not grant guest VMs elevated capabilities by default. Bundle 7.5 adds explicit support for privileged agent workloads.
+
+The key insight: granting CAP_BPF to a Firecracker guest VM is safe -- the guest kernel is isolated from the host kernel by the hypervisor boundary. An eBPF program running inside the Firecracker guest cannot affect the host kernel. This is the primary security advantage of microVM isolation for privileged agent workloads: full kernel capability grants without host kernel exposure.
+
+### Privileged capabilities in the capability manifest
+
+Add a `privileged_capabilities` field to the capability manifest schema:
+
+```yaml
+privileged_capabilities:
+  - CAP_BPF
+  - CAP_PERFMON
+  - CAP_SYS_ADMIN
+```
+
+When declared, the RunnerSelector routes the worker to a separate privileged VM pool rather than the standard pool. Capabilities are granted at the Firecracker jailer configuration level. All other capability manifest fields (filesystem, network, secrets, resource_limits) continue to apply normally.
+
+### Privileged VM pool
+
+Add a second pre-warmed VM pool in VmPool: `_privileged_pool`. Separate from the standard pool. Default size: 1 (privileged workloads are less common). Capabilities granted via the jailer's cgroup and seccomp configuration. Standard VMs never receive these capabilities.
+
+Settings addition:
+```json
+"firecracker": {
+  "privileged_pool_size": 1,
+  "allowed_privileged_capabilities": ["CAP_BPF", "CAP_PERFMON"]
+}
+```
+
+`allowed_privileged_capabilities` is an operator-controlled allowlist. Workers cannot request capabilities not on this list. Default allows CAP_BPF and CAP_PERFMON (safe for eBPF monitoring). CAP_SYS_ADMIN requires explicit operator opt-in.
+
+### eBPF toolchain in the worker image
+
+Update docker/Dockerfile.worker to include:
+- clang and llvm (eBPF C compilation)
+- libbpf-dev (BTF support)
+- linux-headers-generic (for eBPF program compilation)
+- bpftool (static verification and BTF inspection)
+- python3-bcc (Python eBPF programs via BCC)
+- The bpf filesystem is available inside privileged VMs at /sys/fs/bpf
+
+### ArtifactType.PRIVILEGED_AGENT
+
+Add to the ArtifactType enum in artifacts.py:
+
+```python
+PRIVILEGED_AGENT = "privileged_agent"  # eBPF, kernel modules, system daemons requiring elevated caps
+```
+
+### Split verification strategy for PRIVILEGED_AGENT
+
+Verification is two-phase:
+
+**Phase 1 -- Static (runs in standard sandbox, no privileges required):**
+- clang compilation of eBPF C code (catches syntax and type errors)
+- bpftool prog load --dry-run for kernel verifier simulation
+- Python syntax check for bcc programs
+- Unit tests for the userspace loader and output parser components
+
+**Phase 2 -- Runtime (runs in privileged VM with declared capabilities):**
+- Actually load and attach the eBPF program
+- Generate synthetic events (e.g. fork a test process to trigger execve tracepoints)
+- Verify events are captured and formatted correctly
+- Verify the streaming output format matches the declared schema
+
+The bundler generates both phases in the verification_strategy when artifact_type is PRIVILEGED_AGENT. The executor runs Phase 1 in a standard worker VM, then Phase 2 in a privileged worker VM if Phase 1 passes.
+
+### Bundler guidance for privileged agents
+
+Add to _BUNDLER_SYSTEM_PROMPT:
+
+"For eBPF programs, Linux monitoring agents, or any code requiring kernel capabilities: set artifact_type to 'privileged_agent'. Declare the minimum required capabilities in privileged_capabilities (prefer CAP_BPF + CAP_PERFMON over CAP_SYS_ADMIN where possible). The verification_strategy must include both a static_phase (clang compilation, dry-run verification) and a runtime_phase (actual program load and event capture test)."
+
+### Use cases enabled
+
+- Linux process monitoring agents (eBPF tracepoints on execve, exit, fork, clone)
+- Network observability (eBPF socket filters, XDP programs, connection tracking)
+- Security monitoring agents (syscall tracing, file access auditing, privilege escalation detection)
+- Performance profiling agents (perf events, CPU flame graph collection)
+- Container and Kubernetes observability (namespace events, cgroup tracking)
+
+### Acceptance criteria
+
+1. Worker with CAP_BPF in privileged_capabilities is routed to the privileged VM pool.
+2. Worker without privileged_capabilities cannot access /sys/fs/bpf inside the VM.
+3. An eBPF program compiled and loaded inside the privileged guest VM cannot be observed from the host (isolation verified).
+4. The eBPF toolchain (clang, bpftool, python3-bcc) is available inside the worker image.
+5. Split verification: Phase 1 (compilation) passes in standard VM, Phase 2 (runtime load) passes in privileged VM.
+
+Branch: phase-7/privileged-agents. Merge 7.4 first. Report ambiguities before coding.
