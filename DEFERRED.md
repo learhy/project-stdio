@@ -57,3 +57,8 @@ Each HTTP request opens a new upstream connection. Connection pooling (keep-aliv
 
 ### K8sJobWorkerRunner network policy integration (Bundle 3.1)
 The `K8sJobWorkerRunner` is future work; when implemented, the egress proxy model maps to `NetworkPolicy` egress rules with the proxy as a sidecar. The translation logic (capability manifest → NetworkPolicy + sidecar config) is not specified, and the proxy's Unix socket model may need a TCP listener variant for sidecar communication. Deferred until the k8s runner is implemented.
+
+## Phase 7
+
+### Firecracker aarch64 support (Bundle 7.3)
+The Firecracker installer and binary download only support x86_64. Firecracker has experimental aarch64 support but the kernel image URL and binary tarball differ. Deferred until aarch64 KVM hosts are common enough to justify the separate download paths and testing.

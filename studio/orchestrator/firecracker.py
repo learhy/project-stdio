@@ -35,6 +35,8 @@ _FC_AGENT_PORT = 52
 _FC_KERNEL_URL = (
     "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.7/x86_64/vmlinux-5.10"
 )
+# Expected SHA256 of the v1.7 kernel binary (supply chain verification)
+_FC_KERNEL_V1_7_SHA256 = ""
 # CID base for VMs (host is 2, guests start at 3)
 _FC_CID_BASE = 3
 
@@ -471,7 +473,18 @@ class VmPool:
             return await self._create_and_boot_vm()
 
     async def release(self, vm: FirecrackerVm) -> None:
-        """Reset VM and return it to the pool."""
+        """Reset VM and return it to the pool, or discard if pool was shrunk."""
+        # If pool was shrunk and we have more VMs than target, discard excess
+        if len(self._all_vms) > self._pool_size:
+            _logger.info("VmPool: discarding excess VM (pool shrunk to %d)", self._pool_size)
+            try:
+                await vm.stop()
+            except Exception:
+                pass
+            if vm in self._all_vms:
+                self._all_vms.remove(vm)
+            return
+
         try:
             await vm.reset()
         except Exception as exc:
@@ -502,6 +515,61 @@ class VmPool:
             except Exception:
                 pass
         self._all_vms.clear()
+
+    async def resize(self, new_size: int) -> dict[str, Any]:
+        """Resize the pool at runtime.
+
+        Growing: start new VMs immediately and add to queue.
+        Shrinking: drain idle VMs from queue, discard excess as they return from use.
+        """
+        if new_size < 0:
+            raise ValueError(f"pool_size must be >= 0, got {new_size}")
+        old_size = self._pool_size
+        self._pool_size = new_size
+
+        result: dict[str, Any] = {"old_size": old_size, "new_size": new_size, "started": 0, "drained": 0, "action": "noop"}
+
+        # Rebuild queue with new maxsize (asyncio.Queue doesn't support resize)
+        existing: list[FirecrackerVm] = []
+        while not self._available.empty():
+            try:
+                existing.append(self._available.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        if new_size > old_size:
+            to_create = new_size - old_size
+            _logger.info("VmPool: growing from %d to %d (creating %d VMs)", old_size, new_size, to_create)
+            for _ in range(to_create):
+                vm = await self._create_and_boot_vm()
+                self._all_vms.append(vm)
+                existing.append(vm)
+            result["started"] = to_create
+            result["action"] = "grown"
+        elif new_size < old_size:
+            _logger.info("VmPool: shrinking from %d to %d", old_size, new_size)
+            result["action"] = "shrinking"
+            # Stop excess idle VMs and remove from all_vms
+            excess = len(existing) - new_size
+            while excess > 0 and existing:
+                vm = existing.pop()
+                await vm.stop()
+                if vm in self._all_vms:
+                    self._all_vms.remove(vm)
+                excess -= 1
+                result["drained"] += 1
+            _logger.info("VmPool: drained %d idle VMs", result["drained"])
+
+        # Create new queue with updated maxsize and re-populate
+        self._available = asyncio.Queue(maxsize=new_size)
+        for vm in existing:
+            await self._available.put(vm)
+
+        return result
+
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
 
     async def _create_and_boot_vm(self) -> FirecrackerVm:
         vm_id = self._next_vm_id
@@ -637,8 +705,14 @@ async def build_rootfs(output_path: str, no_cache: bool = False) -> dict[str, An
     size_bytes = output.stat().st_size
     sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
 
+    # Write Dockerfile hash sidecar for freshness check
+    dockerfile_hash = hashlib.sha256(Path("docker/Dockerfile.worker").read_bytes()).hexdigest()
+    sidecar_path = Path(output_path + ".sha256")
+    sidecar_path.write_text(dockerfile_hash)
+    _logger.info("Dockerfile hash written to %s: %s", sidecar_path, dockerfile_hash[:16])
+
     _logger.info("Rootfs built: %s (%d bytes, sha256=%s)", output_path, size_bytes, sha256[:16])
-    return {"path": str(output), "size_bytes": size_bytes, "sha256": sha256}
+    return {"path": str(output), "size_bytes": size_bytes, "sha256": sha256, "dockerfile_sha256": dockerfile_hash}
 
 
 # ── Utility: download Firecracker kernel ────────────────────────────────────────
@@ -664,6 +738,17 @@ async def download_kernel(output_path: str, version: str = "v1.7") -> dict[str, 
 
     sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     size_bytes = output.stat().st_size
+
+    # Verify against known-good hash (supply chain protection)
+    if version == "v1.7" and _FC_KERNEL_V1_7_SHA256:
+        if sha256 != _FC_KERNEL_V1_7_SHA256:
+            raise RuntimeError(
+                f"Kernel SHA256 mismatch!\n"
+                f"  Expected: {_FC_KERNEL_V1_7_SHA256[:32]}...\n"
+                f"  Got:      {sha256[:32]}...\n"
+                f"  The downloaded kernel may have been tampered with."
+            )
+
     _logger.info(
         "Kernel downloaded: %s (%d bytes, sha256=%s)",
         output_path, size_bytes, sha256[:16],
@@ -704,4 +789,46 @@ def check_firecracker_available(
     result["kernel"] = True
 
     result["available"] = True
+    return result
+
+
+def check_rootfs_freshness(rootfs_path: str = "/var/lib/studio/firecracker/rootfs.ext4") -> dict[str, Any]:
+    """Compare installed rootfs Dockerfile hash against current Dockerfile.worker.
+
+    Returns dict with fresh (bool), stored_hash (str|None), current_hash (str|None),
+    and warning (str|None).
+    """
+    result: dict[str, Any] = {
+        "fresh": True,
+        "stored_hash": None,
+        "current_hash": None,
+        "warning": None,
+    }
+
+    dockerfile = Path("docker/Dockerfile.worker")
+    if not dockerfile.exists():
+        result["warning"] = "Dockerfile.worker not found; cannot check freshness"
+        return result
+
+    current_hash = hashlib.sha256(dockerfile.read_bytes()).hexdigest()
+    result["current_hash"] = current_hash
+
+    sidecar = Path(rootfs_path + ".sha256")
+    if not sidecar.exists():
+        result["fresh"] = False
+        result["warning"] = (
+            f"No rootfs hash sidecar found at {sidecar}. "
+            f"Rootfs may be out of date — run 'studio build-worker-image' to rebuild."
+        )
+        return result
+
+    stored_hash = sidecar.read_text().strip()
+    result["stored_hash"] = stored_hash
+
+    if stored_hash != current_hash:
+        result["fresh"] = False
+        result["warning"] = (
+            f"Worker rootfs is out of date (Dockerfile.worker has changed). "
+            f"Run 'studio build-worker-image' to rebuild."
+        )
     return result

@@ -427,5 +427,72 @@ Check `journalctl -u studio-orchestrator` for errors. Common issues: missing Pyt
 **`Permission denied` on sockets.**
 Ensure `/run/studio/` exists and is owned by `studio:studio`. Run `sudo mkdir -p /run/studio && sudo chown studio:studio /run/studio`.
 
+## Firecracker microVM isolation (optional)
+
+For stronger worker isolation, Studio can run workers inside Firecracker microVMs. This adds a hypervisor boundary (KVM) under the existing bubblewrap sandbox — defense in depth.
+
+### Requirements
+
+- **Linux x86_64** (KVM required; aarch64 not yet supported)
+- **KVM** available at `/dev/kvm`
+- **Docker** (only needed to build the rootfs image, not at runtime)
+- **~1GB disk space** for the rootfs image
+- **~100MB per concurrent worker** for overlay filesystems
+
+### KVM permissions
+
+The orchestrator user needs read/write access to `/dev/kvm`. On most Linux systems:
+
+```bash
+sudo usermod -aG kvm $USER
+```
+
+Log out and back in for the group change to take effect.
+
+### Disk space
+
+The worker rootfs image is typically 500MB–1GB. Each concurrent worker gets a tmpfs-backed overlay layer, typically <100MB for code generation tasks. Plan for:
+
+| Component | Approximate size |
+|-----------|-----------------|
+| Rootfs ext4 image | 500 MB – 1 GB |
+| Kernel image | ~15 MB |
+| Per-worker overlay | <100 MB |
+| Firecracker binary | ~10 MB |
+
+Docker is **not required at runtime** — once the rootfs image is built, workers run directly in Firecracker VMs without any Docker dependency.
+
+### Enabling Firecracker
+
+The installer enables Firecracker automatically if KVM is detected. To enable manually:
+
+```bash
+# Install Firecracker binary
+curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/v1.7.0/firecracker-v1.7.0-x86_64.tgz" \
+    | tar -xz -C /usr/local/bin/
+
+# Download kernel
+studio download-kernel
+
+# Build worker rootfs
+studio build-worker-image
+
+# Enable in settings
+studio config set firecracker.enabled true
+```
+
+Check status:
+
+```bash
+studio vm-status
+studio check-rootfs
+```
+
+To disable Firecracker and fall back to bubblewrap:
+
+```bash
+studio config set firecracker.enabled false
+```
+
 **Worker isolation not working.**
 Verify bubblewrap is installed: `bwrap --version`. Install it with your package manager if missing.
