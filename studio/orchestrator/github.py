@@ -89,6 +89,7 @@ class GitHubClient:
         self._installation_token: str | None = None
         self._token_expiry: int = 0
         self._rate_limiter = GitHubRateLimiter()
+        self._account_type_cache: dict[str, str] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -173,6 +174,18 @@ class GitHubClient:
         data = await self._request("PATCH", path, {"labels": labels})
         return data is not None
 
+    async def _get_account_type(self, owner: str) -> str | None:
+        """Determine whether `owner` is a User or Organization. Cached in memory."""
+        if owner in self._account_type_cache:
+            return self._account_type_cache[owner]
+        data = await self._request("GET", f"/users/{owner}")
+        if data is None:
+            return None
+        account_type = data.get("type")
+        if account_type:
+            self._account_type_cache[owner] = account_type
+        return account_type
+
     async def create_repo(self, name: str, private: bool = True, description: str = "") -> dict | None:
         """Create a new GitHub repository under the configured owner. Returns repo data or None."""
         if self._client is None:
@@ -181,10 +194,16 @@ class GitHubClient:
         payload: dict[str, Any] = {"name": name, "private": private}
         if description:
             payload["description"] = description
-        path = f"/orgs/{owner}/repos"
+        account_type = await self._get_account_type(owner)
+        if account_type == "Organization":
+            path = f"/orgs/{owner}/repos"
+        else:
+            path = "/user/repos"
         data = await self._request("POST", path, payload)
-        if data is None:
-            # Fallback to user endpoint
+        if data is None and account_type != "Organization":
+            # Fallback: try the org endpoint if user endpoint failed
+            data = await self._request("POST", f"/orgs/{owner}/repos", payload)
+        elif data is None:
             data = await self._request("POST", "/user/repos", payload)
         return data
 

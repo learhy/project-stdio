@@ -143,6 +143,119 @@ class TestGitHubClient:
         assert data == {"number": 42}
         assert client._client.request.call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_create_repo_personal_account(self, client):
+        client._client = MagicMock()
+        client._client.request = AsyncMock()
+        client._installation_token = "tok"
+        client._token_expiry = 9999999999
+        client._private_key = "fake-key"
+
+        # Mock GET /users/learhy -> type=User, then POST /user/repos succeeds
+        async def request_side_effect(method, path, json=None, headers=None):
+            if method == "GET" and path == "/users/learhy":
+                resp = MagicMock(status_code=200)
+                resp.json.return_value = {"login": "learhy", "type": "User"}
+                resp.raise_for_status = lambda: None
+                return resp
+            elif method == "POST" and path == "/user/repos":
+                resp = MagicMock(status_code=201)
+                resp.json.return_value = {"name": "linux-process-monitor", "full_name": "learhy/linux-process-monitor"}
+                resp.raise_for_status = lambda: None
+                return resp
+            return MagicMock(status_code=404, raise_for_status=lambda: None)
+
+        client._client.request.side_effect = request_side_effect
+
+        client._settings.owner = "learhy"
+        result = await client.create_repo("linux-process-monitor")
+
+        assert result is not None
+        assert result["full_name"] == "learhy/linux-process-monitor"
+
+        # Verify GET /users/learhy was called to detect account type
+        get_calls = [c for c in client._client.request.call_args_list
+                     if c[0][0] == "GET" and c[0][1] == "/users/learhy"]
+        assert len(get_calls) == 1
+
+        # Verify POST /user/repos was called (not /orgs/learhy/repos)
+        post_calls = [c for c in client._client.request.call_args_list
+                      if c[0][0] == "POST"]
+        assert len(post_calls) == 1
+        assert post_calls[0][0][1] == "/user/repos"
+
+        # Account type is cached
+        assert client._account_type_cache.get("learhy") == "User"
+
+    @pytest.mark.asyncio
+    async def test_create_repo_org_account(self, client):
+        client._client = MagicMock()
+        client._client.request = AsyncMock()
+        client._installation_token = "tok"
+        client._token_expiry = 9999999999
+        client._private_key = "fake-key"
+
+        async def request_side_effect(method, path, json=None, headers=None):
+            if method == "GET" and path == "/users/acme-corp":
+                resp = MagicMock(status_code=200)
+                resp.json.return_value = {"login": "acme-corp", "type": "Organization"}
+                resp.raise_for_status = lambda: None
+                return resp
+            elif method == "POST" and path == "/orgs/acme-corp/repos":
+                resp = MagicMock(status_code=201)
+                resp.json.return_value = {"name": "new-repo", "full_name": "acme-corp/new-repo"}
+                resp.raise_for_status = lambda: None
+                return resp
+            return MagicMock(status_code=404, raise_for_status=lambda: None)
+
+        client._client.request.side_effect = request_side_effect
+
+        client._settings.owner = "acme-corp"
+        result = await client.create_repo("new-repo")
+
+        assert result is not None
+        assert result["full_name"] == "acme-corp/new-repo"
+
+        post_calls = [c for c in client._client.request.call_args_list
+                      if c[0][0] == "POST"]
+        assert len(post_calls) == 1
+        assert post_calls[0][0][1] == "/orgs/acme-corp/repos"
+
+    @pytest.mark.asyncio
+    async def test_create_repo_account_type_cached(self, client):
+        """Second create_repo call should not re-fetch account type."""
+        client._client = MagicMock()
+        client._client.request = AsyncMock()
+        client._installation_token = "tok"
+        client._token_expiry = 9999999999
+        client._private_key = "fake-key"
+
+        call_count = 0
+
+        async def request_side_effect(method, path, json=None, headers=None):
+            nonlocal call_count
+            if method == "GET" and path.startswith("/users/"):
+                call_count += 1
+                resp = MagicMock(status_code=200)
+                resp.json.return_value = {"login": "learhy", "type": "User"}
+                resp.raise_for_status = lambda: None
+                return resp
+            elif method == "POST":
+                resp = MagicMock(status_code=201)
+                resp.json.return_value = {"name": "repo", "full_name": "learhy/repo"}
+                resp.raise_for_status = lambda: None
+                return resp
+            return MagicMock(status_code=404, raise_for_status=lambda: None)
+
+        client._client.request.side_effect = request_side_effect
+        client._settings.owner = "learhy"
+
+        await client.create_repo("repo-1")
+        await client.create_repo("repo-2")
+
+        # GET /users/learhy should only be called once (cached)
+        assert call_count == 1
+
 
 class TestCommentParsing:
     def test_slash_approve_parsing(self):
