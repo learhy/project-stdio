@@ -517,6 +517,14 @@ setup_firecracker_assets() {
         write_json_field "$CONFIG_FILE" "firecracker.enabled" "true"
         write_json_field "$CONFIG_FILE" "firecracker.kernel_path" "$kernel_path"
         write_json_field "$CONFIG_FILE" "firecracker.rootfs_path" "$rootfs_path"
+        # Enable jailer for system installs (defense-in-depth for production)
+        if [[ "$INSTALL_MODE" == "system" ]]; then
+            write_json_field "$CONFIG_FILE" "firecracker.jailer_enabled" "true"
+            write_json_field "$CONFIG_FILE" "firecracker.jailer_chroot_base" "${DATA_DIR}/firecracker/jailer"
+            color_ok "Jailer: enabled (system install)"
+        else
+            color_info "Jailer: disabled by default (use studio config set firecracker.jailer_enabled true)"
+        fi
     fi
     color_ok "Firecracker microVM isolation enabled"
 }

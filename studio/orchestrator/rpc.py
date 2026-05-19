@@ -1297,6 +1297,27 @@ class RpcHandlers:
 
         return {"accepted": True, "injection_id": injection_id}
 
+    # ── worker.audit_event (Bundle 7.4) ─────────────────────────────────────
+
+    async def handle_audit_event(self, binding: WorkerBinding, params: dict, req_id: Any) -> dict:
+        """Record a security audit event from the worker (e.g. exec hash mismatch)."""
+        event_type = params.get("event", "worker.security_event")
+        payload = params.get("payload", {})
+
+        await self.db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (event_type, "worker", binding.worker_id, json.dumps(payload), self.now()),
+        )
+        await self.db.conn.commit()
+
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.warning("worker.audit_event: %s from %s payload=%s",
+                        event_type, binding.worker_id, payload)
+
+        return {"recorded": True}
+
     # ── mcp.list_escalations (Bundle 5.3) ──────────────────────────────────
 
     async def handle_mcp_list_escalations(self, binding: SystemBinding, params: dict, req_id: Any) -> dict:
@@ -1632,6 +1653,8 @@ def create_rpc_system(
     dispatcher.register("worker.report_checkpoint", handlers.handle_report_checkpoint)
     dispatcher.register("worker.respond_to_query", handlers.handle_respond_to_query)
     dispatcher.register("worker.inject_context", handlers.handle_inject_context)
+    # Bundle 7.4: security audit events from guest VM
+    dispatcher.register("worker.audit_event", handlers.handle_audit_event)
     # Bundle 5.3: pause and resume promoted from stubs to real handlers
     dispatcher.register("worker.pause", handlers.handle_pause)
     dispatcher.register("worker.resume", handlers.handle_resume)

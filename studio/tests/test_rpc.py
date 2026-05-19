@@ -578,7 +578,7 @@ class TestCreateRpcSystem:
         assert dispatcher is not None
         assert handlers is not None
         assert conn_mgr is not None
-        assert len(dispatcher._handlers) == 28
+        assert len(dispatcher._handlers) == 29
 
     def test_register_all_methods(self, db_mock, tmp_path):
         sp = str(tmp_path / "test.sock")
@@ -593,6 +593,7 @@ class TestCreateRpcSystem:
             "worker.poll_human_input",
             "worker.ask_question", "worker.report_checkpoint",
             "worker.respond_to_query", "worker.inject_context",
+            "worker.audit_event",
             "mcp.approve_bundle", "mcp.reject_bundle",
             "mcp.request_modification", "mcp.escalate_bundle",
             "mcp.pause_bundle", "mcp.resume_bundle",
@@ -994,10 +995,10 @@ class TestBundleFiveTwo:
     # ── Handler count unchanged for Bundle 5.2 ─────────────────────────────
 
     def test_handler_count_unchanged(self, db_mock, tmp_path):
-        """Bundle 5.3 adds mcp.list_escalations — handler count now 28."""
+        """Bundle 5.3 adds mcp.list_escalations — handler count now 29."""
         sp = str(tmp_path / "test.sock")
         dispatcher, _, _ = create_rpc_system(db_mock, sp)
-        assert len(dispatcher._handlers) == 28
+        assert len(dispatcher._handlers) == 29
 
 
 # ── Bundle 5.3: Intervention actions ──────────────────────────────────────────
@@ -1199,11 +1200,11 @@ class TestBundleFiveThree:
 
     # ── Handler count ───────────────────────────────────────────────────────
 
-    def test_handler_count_is_28(self, db_mock, tmp_path):
-        """Bundle 5.3: 28 registered handlers."""
+    def test_handler_count_is_29(self, db_mock, tmp_path):
+        """Bundle 5.3+B7.4: 29 registered handlers."""
         sp = str(tmp_path / "test.sock")
         dispatcher, _, _ = create_rpc_system(db_mock, sp)
-        assert len(dispatcher._handlers) == 28
+        assert len(dispatcher._handlers) == 29
 
 
 # ── Bundle 5.4: Calibration integration ──────────────────────────────────────
@@ -1449,8 +1450,8 @@ class TestBundleFiveFour:
 
     # ── Handler count ───────────────────────────────────────────────────────
 
-    def test_handler_count_is_28(self, db_mock, tmp_path):
-        """Bundle 5.4: handler count unchanged at 28."""
+    def test_handler_count_is_29(self, db_mock, tmp_path):
+        """Bundle 5.4+B7.4: handler count now 29."""
         sp = str(tmp_path / "test.sock")
         dispatcher, _, _ = create_rpc_system(db_mock, sp)
-        assert len(dispatcher._handlers) == 28
+        assert len(dispatcher._handlers) == 29

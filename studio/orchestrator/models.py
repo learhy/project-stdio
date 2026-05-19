@@ -116,6 +116,7 @@ class ExecGrant(BaseModel):
     binary: str
     args_pattern: str | None = None
     rationale: str = ""
+    sha256: str | None = None  # filled by orchestrator from rootfs manifest
 
 
 class SpawnSubtasks(BaseModel):
@@ -789,6 +790,7 @@ class FirecrackerSettings(BaseModel):
     tap_bridge: str = "studio-fc-br0"
     ip_range: str = "172.16.0.0/24"
     jailer_enabled: bool = False
+    jailer_chroot_base: str = "/var/lib/studio/firecracker/jailer"
     reset_mode: Literal["reboot", "overlay_only"] = "reboot"
 
 
