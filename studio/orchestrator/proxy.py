@@ -229,32 +229,44 @@ def _extract_sni(data: bytes) -> str | None:
 class EgressProxy:
     """Per-worker asyncio forward proxy with capability manifest enforcement."""
 
-    def __init__(self, socket_path: str, manifest: CapabilityManifest) -> None:
+    def __init__(
+        self,
+        socket_path: str = "",
+        manifest: CapabilityManifest | None = None,
+        tcp_port: int = 0,
+    ) -> None:
         self._socket_path = socket_path
-        self._manifest = manifest
+        self._manifest = manifest or CapabilityManifest(
+            subject={"kind": "bundle"}, grants={},
+        )
+        self._tcp_port = tcp_port
         self._server: asyncio.AbstractServer | None = None
-        self._dns = DnsCache(manifest)
+        self._dns = DnsCache(self._manifest)
 
     async def run(self) -> None:
-        """Start the proxy on the Unix socket. Blocks until the server stops."""
-        # Clean up stale socket
-        try:
-            os.unlink(self._socket_path)
-        except OSError:
-            pass
+        """Start the proxy. TCP if tcp_port is set, otherwise Unix socket. Blocks until stopped."""
+        if self._tcp_port:
+            self._server = await asyncio.start_server(
+                self._handle_client, host="0.0.0.0", port=self._tcp_port,
+            )
+            _log(f"Listening on tcp:0.0.0.0:{self._tcp_port}")
+        else:
+            # Clean up stale socket
+            try:
+                os.unlink(self._socket_path)
+            except OSError:
+                pass
 
-        # Ensure parent directory exists
-        sock_dir = os.path.dirname(self._socket_path)
-        if sock_dir:
-            os.makedirs(sock_dir, exist_ok=True)
+            sock_dir = os.path.dirname(self._socket_path)
+            if sock_dir:
+                os.makedirs(sock_dir, exist_ok=True)
 
-        self._server = await asyncio.start_unix_server(
-            self._handle_client, path=self._socket_path
-        )
-        # Set restrictive permissions
-        os.chmod(self._socket_path, 0o600)
+            self._server = await asyncio.start_unix_server(
+                self._handle_client, path=self._socket_path
+            )
+            os.chmod(self._socket_path, 0o600)
+            _log(f"Listening on {self._socket_path}")
 
-        _log(f"Listening on {self._socket_path}")
         async with self._server:
             await self._server.serve_forever()
 
@@ -580,12 +592,14 @@ def _load_manifest() -> CapabilityManifest:
 
 async def _async_main() -> None:
     socket_path = os.environ.get("STUDIO_PROXY_SOCKET", "")
-    if not socket_path:
-        _log("FATAL: STUDIO_PROXY_SOCKET not set")
+    tcp_port_str = os.environ.get("STUDIO_PROXY_TCP_PORT", "")
+    if not socket_path and not tcp_port_str:
+        _log("FATAL: STUDIO_PROXY_SOCKET or STUDIO_PROXY_TCP_PORT must be set")
         sys.exit(1)
 
     manifest = _load_manifest()
-    proxy = EgressProxy(socket_path, manifest)
+    tcp_port = int(tcp_port_str) if tcp_port_str else 0
+    proxy = EgressProxy(socket_path=socket_path, manifest=manifest, tcp_port=tcp_port)
 
     loop = asyncio.get_running_loop()
     stop = loop.create_future()

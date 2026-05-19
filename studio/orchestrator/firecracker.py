@@ -163,9 +163,22 @@ class FirecrackerVm:
 
         self._cleanup_temp_files()
 
-    async def exec(self, argv: list[str], env: dict[str, str] | None = None) -> int:
-        """Launch a process inside the VM via the guest agent. Returns PID."""
-        resp = await self._agent_send("exec", argv=argv, env=env or {})
+    async def exec(
+        self,
+        argv: list[str],
+        env: dict[str, str] | None = None,
+        use_bwrap: bool = False,
+        bwrap_args: list[str] | None = None,
+    ) -> int:
+        """Launch a process inside the VM via the guest agent. Returns guest PID.
+
+        When use_bwrap is True, the guest agent wraps the command in bubblewrap
+        with the provided arguments for exec allowlist enforcement.
+        """
+        kwargs: dict[str, Any] = {"argv": argv, "env": env or {}}
+        if use_bwrap and bwrap_args:
+            kwargs["bwrap"] = {"use_bwrap": True, "bwrap_args": bwrap_args}
+        resp = await self._agent_send("exec", **kwargs)
         if not resp.ok:
             raise RuntimeError(f"Guest agent exec failed: {resp.error}")
         return resp.data.get("pid", -1)
