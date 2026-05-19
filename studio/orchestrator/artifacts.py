@@ -53,6 +53,7 @@ class ArtifactType(StrEnum):
     DATA_SCHEMA = "data_schema"            # SQL migrations, JSON schemas, OpenAPI specs
     TEST_SUITE = "test_suite"              # Tests only (no production code)
     MIXED = "mixed"                        # Multiple types in one bundle
+    PRIVILEGED_AGENT = "privileged_agent"  # eBPF, kernel modules, system daemons requiring elevated caps
 
 
 # ── Verification strategy models ──────────────────────────────────────────────
@@ -77,10 +78,19 @@ class VerificationStrategy(BaseModel):
     validate_command: str | None = None
     # DOCUMENTATION
     review: str | None = None
+    # PRIVILEGED_AGENT (Bundle 7.5): split verification
+    static_phase: VerificationStrategy | None = None
+    runtime_phase: VerificationStrategy | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> VerificationStrategy:
         smoke = [SmokeTest(**s) for s in d.get("smoke_tests", [])]
+        static_phase = None
+        if "static_phase" in d and d["static_phase"] is not None:
+            static_phase = cls.from_dict(d["static_phase"])
+        runtime_phase = None
+        if "runtime_phase" in d and d["runtime_phase"] is not None:
+            runtime_phase = cls.from_dict(d["runtime_phase"])
         return cls(
             type=ArtifactType(d.get("type", "executable_app")),
             startup_command=d.get("startup_command"),
@@ -90,6 +100,8 @@ class VerificationStrategy(BaseModel):
             test_command=d.get("test_command"),
             validate_command=d.get("validate_command"),
             review=d.get("review"),
+            static_phase=static_phase,
+            runtime_phase=runtime_phase,
         )
 
 
@@ -145,6 +157,11 @@ def detect_artifact_type_from_idea(idea: str) -> ArtifactType:
     if any(kw in lower for kw in ("sql migration", "json schema",
                                     "openapi spec", "graphql schema")):
         return ArtifactType.DATA_SCHEMA
+
+    # Privileged agent signals (Bundle 7.5)
+    if any(kw in lower for kw in ("ebpf", "tracepoint", "kprobe", "kernel module",
+                                    "cap_bpf", "bpf program", "uprobe")):
+        return ArtifactType.PRIVILEGED_AGENT
 
     return ArtifactType.LIBRARY  # conservative fallback
 

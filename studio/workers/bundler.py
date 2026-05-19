@@ -218,6 +218,10 @@ Signs that an idea is a multi-service app:
 
 ## Worker spec requirements — CRITICAL
 
+For eBPF programs, Linux monitoring agents, or any code requiring kernel capabilities: set artifact_type to 'privileged_agent'. Declare the minimum required capabilities in privileged_capabilities (prefer CAP_BPF + CAP_PERFMON over CAP_SYS_ADMIN where possible). The verification_strategy must include both a static_phase (clang compilation, dry-run verification) and a runtime_phase (actual program load and event capture test).
+
+## Worker spec requirements — CRITICAL
+
 Every worker node spec MUST be self-contained. The worker runs in an isolated environment with no access to the original idea or other nodes' specs. It cannot ask questions (the question tool is disabled in headless mode). If the worker lacks any detail it needs, it will fail silently.
 
 **The objective and description together must include:**

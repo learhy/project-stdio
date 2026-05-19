@@ -17,12 +17,43 @@ import (
 	"syscall"
 
 	"github.com/mdlayher/vsock"
+	"golang.org/x/sys/unix"
 )
 
 const (
 	agentPort   = 52
 	resetSignal = syscall.SIGUSR1
 )
+
+// ── Capability mapping (Bundle 7.5) ────────────────────────────────────────────
+
+var capNameToValue = map[string]uintptr{
+	"CAP_BPF":        unix.CAP_BPF,
+	"CAP_PERFMON":    unix.CAP_PERFMON,
+	"CAP_SYS_ADMIN":  unix.CAP_SYS_ADMIN,
+	"CAP_NET_ADMIN":  unix.CAP_NET_ADMIN,
+}
+
+func parsePrivilegedCaps(env map[string]string) []uintptr {
+	capsJSON, ok := env["STUDIO_PRIVILEGED_CAPS"]
+	if !ok || capsJSON == "" {
+		return nil
+	}
+	var capNames []string
+	if err := json.Unmarshal([]byte(capsJSON), &capNames); err != nil {
+		log.Printf("parsePrivilegedCaps: invalid JSON: %v", err)
+		return nil
+	}
+	var caps []uintptr
+	for _, name := range capNames {
+		if val, ok := capNameToValue[name]; ok {
+			caps = append(caps, val)
+		} else {
+			log.Printf("parsePrivilegedCaps: unknown capability %q, skipping", name)
+		}
+	}
+	return caps
+}
 
 // ── Protocol messages ──────────────────────────────────────────────────────────
 
@@ -109,6 +140,14 @@ func handleExec(req Request) Response {
 		cmd.Env = os.Environ()
 		for k, v := range req.Env {
 			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+		}
+
+		// Bundle 7.5: grant privileged capabilities via ambient set
+		if ambientCaps := parsePrivilegedCaps(req.Env); len(ambientCaps) > 0 {
+			cmd.SysProcAttr = &unix.SysProcAttr{
+				AmbientCaps: ambientCaps,
+			}
+			log.Printf("handleExec: granting ambient capabilities: %v", req.Env["STUDIO_PRIVILEGED_CAPS"])
 		}
 	}
 

@@ -306,6 +306,31 @@ class TestRunnerSelectorKillWorker:
         await sel.kill_worker(proc, "w4")
 
 
+def test_firecracker_privileged_maps_to_firecracker():
+    """firecracker-privileged preference resolves to firecracker runner."""
+    settings = RunnerSelectorSettings()
+    db = MagicMock()
+    fc = MagicMock()
+    sel = RunnerSelector(db, settings, firecracker=fc)
+
+    runner_type, runner = sel._select_runner("firecracker-privileged")
+    assert runner_type == "firecracker"
+    assert runner is fc
+
+
+def test_firecracker_privileged_falls_back_when_fc_missing():
+    """firecracker-privileged falls back when firecracker runner not available."""
+    settings = RunnerSelectorSettings()
+    db = MagicMock()
+    local = MagicMock()
+    sel = RunnerSelector(db, settings, local=local)
+
+    runner_type, runner = sel._select_runner("firecracker-privileged")
+    # firecracker not registered, should fall back
+    assert runner_type != "firecracker-privileged"
+    assert runner is local
+
+
 class TestRunnerSelectorClose:
     @pytest.mark.asyncio
     async def test_close_closes_all_runners(self):

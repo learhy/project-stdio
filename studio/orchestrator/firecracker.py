@@ -88,9 +88,10 @@ def _parse_agent_response(data: bytes) -> _AgentResponse:
 class FirecrackerVm:
     """Manages a single Firecracker microVM lifecycle via the HTTP API."""
 
-    def __init__(self, vm_id: int, config: FirecrackerVmConfig):
+    def __init__(self, vm_id: int, config: FirecrackerVmConfig, privileged: bool = False):
         self.vm_id = vm_id
         self.config = config
+        self.privileged = privileged
         self._cid = _FC_CID_BASE + vm_id
         self._api_path = _FC_API_SOCKET.format(vm_id=vm_id)
         self._vsock_path = _FC_VSOCK_PATH.format(vm_id=vm_id)
@@ -476,7 +477,7 @@ class FirecrackerVm:
 
 
 class VmPool:
-    """Pool of pre-warmed Firecracker microVMs."""
+    """Pool of pre-warmed Firecracker microVMs with optional privileged sub-pool (Bundle 7.5)."""
 
     def __init__(
         self,
@@ -484,8 +485,10 @@ class VmPool:
         rootfs_path: str,
         kernel_path: str,
         config: FirecrackerVmConfig | None = None,
+        privileged_pool_size: int = 1,
     ):
         self._pool_size = pool_size
+        self._privileged_pool_size = privileged_pool_size
         self._rootfs_path = rootfs_path
         self._kernel_path = kernel_path
         self._config = config or FirecrackerVmConfig(
@@ -496,38 +499,56 @@ class VmPool:
         self._all_vms: list[FirecrackerVm] = []
         self._next_vm_id = 0
         self._running = False
+        # Bundle 7.5: privileged sub-pool
+        self._privileged_available: asyncio.Queue[FirecrackerVm] = asyncio.Queue(maxsize=privileged_pool_size)
+        self._privileged_vms: list[FirecrackerVm] = []
 
     async def start(self) -> None:
-        """Pre-warm pool_size VMs at startup."""
+        """Pre-warm both standard and privileged pools at startup."""
         self._running = True
-        _logger.info("VmPool: pre-warming %d VMs...", self._pool_size)
+        _logger.info("VmPool: pre-warming %d standard VMs...", self._pool_size)
         for _ in range(self._pool_size):
-            vm = await self._create_and_boot_vm()
+            vm = await self._create_and_boot_vm(privileged=False)
             self._all_vms.append(vm)
             await self._available.put(vm)
-        _logger.info("VmPool: %d VMs ready", self._pool_size)
+        _logger.info("VmPool: %d standard VMs ready", self._pool_size)
 
-    async def acquire(self) -> FirecrackerVm:
-        """Get a pre-warmed VM from the pool, or create a new one if empty."""
+        if self._privileged_pool_size > 0:
+            _logger.info("VmPool: pre-warming %d privileged VMs...", self._privileged_pool_size)
+            for _ in range(self._privileged_pool_size):
+                vm = await self._create_and_boot_vm(privileged=True)
+                self._privileged_vms.append(vm)
+                await self._privileged_available.put(vm)
+            _logger.info("VmPool: %d privileged VMs ready", self._privileged_pool_size)
+
+    async def acquire(self, privileged: bool = False) -> FirecrackerVm:
+        """Get a pre-warmed VM from the appropriate pool, or cold-start one if empty."""
         if not self._running:
             raise RuntimeError("VmPool not started")
+        queue = self._privileged_available if privileged else self._available
         try:
-            return self._available.get_nowait()
+            return queue.get_nowait()
         except asyncio.QueueEmpty:
-            _logger.info("VmPool: empty, cold-starting new VM")
-            return await self._create_and_boot_vm()
+            _logger.info("VmPool: %s pool empty, cold-starting new VM",
+                         "privileged" if privileged else "standard")
+            return await self._create_and_boot_vm(privileged=privileged)
 
     async def release(self, vm: FirecrackerVm) -> None:
-        """Reset VM and return it to the pool, or discard if pool was shrunk."""
-        # If pool was shrunk and we have more VMs than target, discard excess
-        if len(self._all_vms) > self._pool_size:
-            _logger.info("VmPool: discarding excess VM (pool shrunk to %d)", self._pool_size)
+        """Reset VM and return it to the correct pool, or discard if pool was shrunk."""
+        privileged = vm.privileged
+        all_vms = self._privileged_vms if privileged else self._all_vms
+        pool_size = self._privileged_pool_size if privileged else self._pool_size
+
+        # If pool was shrunk, discard excess
+        if len(all_vms) > pool_size:
+            _logger.info("VmPool: discarding excess %s VM (pool shrunk to %d)",
+                         "privileged" if privileged else "standard", pool_size)
             try:
                 await vm.stop()
             except Exception:
                 pass
-            if vm in self._all_vms:
-                self._all_vms.remove(vm)
+            if vm in all_vms:
+                all_vms.remove(vm)
             return
 
         try:
@@ -538,21 +559,22 @@ class VmPool:
                 await vm.stop()
             except Exception:
                 pass
-            # Replace the dead VM
-            vm = await self._create_and_boot_vm()
+            vm = await self._create_and_boot_vm(privileged=privileged)
+
         if self._running:
-            await self._available.put(vm)
+            queue = self._privileged_available if privileged else self._available
+            await queue.put(vm)
 
     async def stop(self) -> None:
-        """Shut down all VMs in the pool."""
+        """Shut down all VMs in both pools."""
         self._running = False
-        _logger.info("VmPool: stopping %d VMs...", len(self._all_vms))
+
+        _logger.info("VmPool: stopping %d standard VMs...", len(self._all_vms))
         for vm in self._all_vms:
             try:
                 await vm.stop()
             except Exception as exc:
                 _logger.warning("VmPool: VM stop error: %s", exc)
-        # Drain queue
         while not self._available.empty():
             try:
                 vm = self._available.get_nowait()
@@ -561,12 +583,22 @@ class VmPool:
                 pass
         self._all_vms.clear()
 
-    async def resize(self, new_size: int) -> dict[str, Any]:
-        """Resize the pool at runtime.
+        _logger.info("VmPool: stopping %d privileged VMs...", len(self._privileged_vms))
+        for vm in self._privileged_vms:
+            try:
+                await vm.stop()
+            except Exception as exc:
+                _logger.warning("VmPool: privileged VM stop error: %s", exc)
+        while not self._privileged_available.empty():
+            try:
+                vm = self._privileged_available.get_nowait()
+                await vm.stop()
+            except Exception:
+                pass
+        self._privileged_vms.clear()
 
-        Growing: start new VMs immediately and add to queue.
-        Shrinking: drain idle VMs from queue, discard excess as they return from use.
-        """
+    async def resize(self, new_size: int) -> dict[str, Any]:
+        """Resize the standard pool at runtime."""
         if new_size < 0:
             raise ValueError(f"pool_size must be >= 0, got {new_size}")
         old_size = self._pool_size
@@ -574,7 +606,6 @@ class VmPool:
 
         result: dict[str, Any] = {"old_size": old_size, "new_size": new_size, "started": 0, "drained": 0, "action": "noop"}
 
-        # Rebuild queue with new maxsize (asyncio.Queue doesn't support resize)
         existing: list[FirecrackerVm] = []
         while not self._available.empty():
             try:
@@ -586,7 +617,7 @@ class VmPool:
             to_create = new_size - old_size
             _logger.info("VmPool: growing from %d to %d (creating %d VMs)", old_size, new_size, to_create)
             for _ in range(to_create):
-                vm = await self._create_and_boot_vm()
+                vm = await self._create_and_boot_vm(privileged=False)
                 self._all_vms.append(vm)
                 existing.append(vm)
             result["started"] = to_create
@@ -594,7 +625,6 @@ class VmPool:
         elif new_size < old_size:
             _logger.info("VmPool: shrinking from %d to %d", old_size, new_size)
             result["action"] = "shrinking"
-            # Stop excess idle VMs and remove from all_vms
             excess = len(existing) - new_size
             while excess > 0 and existing:
                 vm = existing.pop()
@@ -605,7 +635,6 @@ class VmPool:
                 result["drained"] += 1
             _logger.info("VmPool: drained %d idle VMs", result["drained"])
 
-        # Create new queue with updated maxsize and re-populate
         self._available = asyncio.Queue(maxsize=new_size)
         for vm in existing:
             await self._available.put(vm)
@@ -616,7 +645,11 @@ class VmPool:
     def pool_size(self) -> int:
         return self._pool_size
 
-    async def _create_and_boot_vm(self) -> FirecrackerVm:
+    @property
+    def privileged_pool_size(self) -> int:
+        return self._privileged_pool_size
+
+    async def _create_and_boot_vm(self, privileged: bool = False) -> FirecrackerVm:
         vm_id = self._next_vm_id
         self._next_vm_id += 1
         config = FirecrackerVmConfig(
@@ -630,7 +663,7 @@ class VmPool:
             reset_mode=self._config.reset_mode,
             firecracker_binary=self._config.firecracker_binary,
         )
-        vm = FirecrackerVm(vm_id=vm_id, config=config)
+        vm = FirecrackerVm(vm_id=vm_id, config=config, privileged=privileged)
         await vm.start()
         return vm
 

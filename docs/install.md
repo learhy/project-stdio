@@ -459,6 +459,9 @@ The worker rootfs image is typically 500MB–1GB. Each concurrent worker gets a 
 | Kernel image | ~15 MB |
 | Per-worker overlay | <100 MB |
 | Firecracker binary | ~10 MB |
+| eBPF toolchain (optional) | ~200 MB added to rootfs |
+
+The **eBPF toolchain** (clang, llvm, libbpf-dev, linux-headers, bpftool, python3-bcc) is included in the worker image to support privileged agents that compile and load eBPF programs. This adds approximately **200 MB** to the rootfs image. If you do not plan to run eBPF workloads, the toolchain is harmless — it is installed in the image but only activated when a bundle explicitly requests privileged capabilities.
 
 Docker is **not required at runtime** — once the rootfs image is built, workers run directly in Firecracker VMs without any Docker dependency.
 
@@ -493,6 +496,26 @@ To disable Firecracker and fall back to bubblewrap:
 ```bash
 studio config set firecracker.enabled false
 ```
+
+### Privileged agents (eBPF / kernel modules)
+
+For bundles that require eBPF tracing or kernel-level introspection, Studio supports **privileged agents** running in Firecracker VMs with ambient capabilities (`CAP_BPF`, `CAP_PERFMON`). The orchestrator maintains a separate privileged VM pool that is pre-warmed alongside the standard pool.
+
+To enable privileged agents:
+
+1. Ensure the eBPF toolchain is installed in the worker image (included by default in the Dockerfile)
+2. Enable Firecracker (see above)
+3. Configure allowed capabilities in `settings.json`:
+
+```json
+"firecracker": {
+  "enabled": true,
+  "privileged_pool_size": 1,
+  "allowed_privileged_capabilities": ["CAP_BPF", "CAP_PERFMON"]
+}
+```
+
+The operator controls which capabilities workers may request via the `allowed_privileged_capabilities` allowlist. Privileged VMs are isolated from standard VMs — they exist in a separate pool and cannot be acquired by standard tasks.
 
 **Worker isolation not working.**
 Verify bubblewrap is installed: `bwrap --version`. Install it with your package manager if missing.
