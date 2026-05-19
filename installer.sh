@@ -432,6 +432,95 @@ check_opencode() {
     fi
 }
 
+# ── Step 2.5: Firecracker microVM isolation (optional, requires KVM) ──────────
+
+_FC_KVM_AVAILABLE=false
+
+check_firecracker() {
+    step "Step 2.5: Firecracker microVM isolation (optional, requires KVM)"
+
+    if [[ ! -e /dev/kvm ]]; then
+        color_warn "/dev/kvm not available -- using bubblewrap isolation only"
+        echo "         For stronger isolation, enable KVM on this host"
+        return
+    fi
+
+    local arch
+    arch="$(uname -m)"
+    if [[ "$arch" != "x86_64" ]]; then
+        color_warn "Firecracker only available for x86_64 (detected: $arch). Skipping."
+        return
+    fi
+
+    _FC_KVM_AVAILABLE=true
+
+    # Check if firecracker binary already exists
+    local fc_path
+    fc_path="$(command -v firecracker 2>/dev/null || true)"
+    if [[ -n "$fc_path" ]]; then
+        color_ok "Firecracker already installed at $fc_path, skipping download"
+    else
+        dep_status "firecracker"
+        dep_install
+        local FC_VERSION="v1.7.0"
+        if ! should_skip "download firecracker ${FC_VERSION}"; then
+            curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz" \
+                | tar -xz -C /usr/local/bin/
+        fi
+
+        if [[ -x /usr/local/bin/jailer ]]; then
+            dep_ok
+            info "  firecracker + jailer installed"
+        elif cmd_exists firecracker; then
+            color_ok "firecracker: installed"
+        else
+            color_warn "firecracker may not have installed correctly"
+            _FC_KVM_AVAILABLE=false
+        fi
+    fi
+}
+
+setup_firecracker_assets() {
+    # Download kernel and build rootfs (requires studio CLI - runs post-install)
+    if [[ "$_FC_KVM_AVAILABLE" != "true" ]]; then
+        return
+    fi
+
+    local kernel_path="${DATA_DIR}/firecracker/vmlinux"
+    local rootfs_path="${DATA_DIR}/firecracker/rootfs.ext4"
+
+    step "Step 4.5: Firecracker kernel and rootfs setup"
+
+    if [[ -f "$kernel_path" ]]; then
+        color_ok "Kernel already present at $kernel_path, skipping download"
+    else
+        info "Downloading Firecracker kernel..."
+        if ! should_skip "download kernel"; then
+            "$BIN_DIR/studio" download-kernel --output "$kernel_path"
+        fi
+        color_ok "Kernel: downloaded"
+    fi
+
+    if [[ -f "$rootfs_path" ]]; then
+        color_ok "Rootfs already present at $rootfs_path, skipping build"
+    else
+        info "Building worker rootfs image..."
+        if ! should_skip "build rootfs"; then
+            "$BIN_DIR/studio" build-worker-image --output "$rootfs_path"
+        fi
+        color_ok "Rootfs: built"
+    fi
+
+    # Enable Firecracker in settings
+    info "Enabling Firecracker in settings..."
+    if ! should_skip "configure firecracker.enabled"; then
+        write_json_field "$CONFIG_FILE" "firecracker.enabled" "true"
+        write_json_field "$CONFIG_FILE" "firecracker.kernel_path" "$kernel_path"
+        write_json_field "$CONFIG_FILE" "firecracker.rootfs_path" "$rootfs_path"
+    fi
+    color_ok "Firecracker microVM isolation enabled"
+}
+
 # ── Step 3: Repo ─────────────────────────────────────────────────────────────
 
 resolve_source() {
@@ -996,6 +1085,9 @@ main() {
     check_bubblewrap
     check_opencode
 
+    # ── Step 2.5: Firecracker (system dep only -- binary download) ──
+    check_firecracker
+
     # ── Step 3: Repo ──
     resolve_source
 
@@ -1006,6 +1098,9 @@ main() {
     generate_tls_cert
     install_default_config
     install_systemd_units
+
+    # ── Step 4.5: Firecracker kernel and rootfs (requires studio CLI) ──
+    setup_firecracker_assets
 
     # ── Step 5: Configure ──
     configure_api_key

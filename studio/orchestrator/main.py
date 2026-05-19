@@ -883,6 +883,14 @@ class Orchestrator:
             except (TypeError, AttributeError):
                 # _check_bwrap may not be awaitable in test contexts
                 self._bwrap_available = True
+
+            # Check rootfs freshness at startup (Phase 7.3)
+            if self.settings.firecracker.enabled:
+                from studio.orchestrator.firecracker import check_rootfs_freshness
+                rootfs_check = check_rootfs_freshness(self.settings.firecracker.rootfs_path)
+                if not rootfs_check["fresh"]:
+                    logger.warning(rootfs_check["warning"])
+
             if self._bwrap_available:
                 logger.info("Sandbox: bubblewrap (active)")
             else:
@@ -2623,6 +2631,37 @@ async def _cli_docker_images(app: Orchestrator, params: dict) -> dict:
         return {"error": f"Failed to list Docker images: {exc}"}
 
 
+async def _cli_vm_pool_resize(app: Orchestrator, params: dict) -> dict:
+    """Resize the Firecracker VM pool at runtime (Phase 7.3)."""
+    new_size = params.get("size")
+    if new_size is None or not isinstance(new_size, int) or new_size < 0:
+        return {"error": "size must be a non-negative integer"}
+
+    if not hasattr(app, "_vm_pool") or app._vm_pool is None:
+        return {"error": "VM pool is not running. Enable firecracker.enabled in settings."}
+
+    try:
+        result = await app._vm_pool.resize(new_size)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    # Persist new size to settings
+    try:
+        app.settings.firecracker.pool_size = new_size
+    except Exception:
+        pass
+
+    return result
+
+
+async def _cli_check_rootfs(app: Orchestrator, params: dict) -> dict:
+    """Check if the worker rootfs is out of date (Phase 7.3)."""
+    from studio.orchestrator.firecracker import check_rootfs_freshness
+
+    rootfs_path = params.get("rootfs_path", app.settings.firecracker.rootfs_path)
+    return check_rootfs_freshness(rootfs_path)
+
+
 async def _cli_vm_status(app: Orchestrator, params: dict) -> dict:
     """Show Firecracker VM pool status (Phase 7.1)."""
     from studio.orchestrator.firecracker import check_firecracker_available
@@ -2788,6 +2827,8 @@ _CLI_HANDLERS = {
     "studio.docker_status": _cli_docker_status,
     "studio.docker_images": _cli_docker_images,
     "studio.vm_status": _cli_vm_status,
+    "studio.vm_pool_resize": _cli_vm_pool_resize,
+    "studio.check_rootfs": _cli_check_rootfs,
     "studio.review_worker": _cli_review_worker,
     "studio.answer_question": _cli_answer_question,
     "studio.resume_worker": _cli_resume_worker,

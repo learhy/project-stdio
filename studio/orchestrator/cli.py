@@ -58,6 +58,62 @@ def _get_socket_path() -> str:
     return os.environ.get("STUDIO_SOCKET_PATH", "/tmp/studio.sock")
 
 
+def _get_config_path() -> str:
+    """Resolve settings.json path using same logic as installer."""
+    env_path = os.environ.get("STUDIO_CONFIG_FILE")
+    if env_path:
+        return env_path
+    system_path = "/etc/studio/settings.json"
+    if os.path.exists(system_path):
+        return system_path
+    return os.path.expanduser("~/.config/studio/settings.json")
+
+
+def _read_config() -> dict[str, Any]:
+    try:
+        with open(_get_config_path()) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_config(data: dict[str, Any]) -> None:
+    path = _get_config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def _config_get_nested(data: dict[str, Any], key: str) -> Any:
+    parts = key.split(".")
+    for p in parts:
+        if not isinstance(data, dict) or p not in data:
+            return None
+        data = data[p]
+    return data
+
+
+def _config_set_nested(data: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
+    """Set a dot-notation key in a dict, auto-typing the value."""
+    parts = key.split(".")
+    d = data
+    for p in parts[:-1]:
+        d = d.setdefault(p, {})
+    # Auto-type: try int, float, bool, else string
+    if value.lower() in ("true", "false"):
+        d[parts[-1]] = value.lower() == "true"
+    else:
+        try:
+            d[parts[-1]] = int(value)
+        except ValueError:
+            try:
+                d[parts[-1]] = float(value)
+            except ValueError:
+                d[parts[-1]] = value
+    return data
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 async def cmd_submit(path: str) -> int:
@@ -535,6 +591,77 @@ async def cmd_vm_status() -> int:
     return 0
 
 
+async def cmd_check_rootfs() -> int:
+    """Check if Firecracker worker rootfs is up to date."""
+    resp = await _send_rpc(_get_socket_path(), "studio.check_rootfs", {})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    if "error" in data:
+        print(f"Error: {data['error']}", file=sys.stderr)
+        return 1
+
+    if data.get("fresh"):
+        print("Rootfs is up to date.")
+    else:
+        print(f"WARNING: {data.get('warning', 'Rootfs may be out of date')}")
+        if data.get("stored_hash"):
+            print(f"  Stored Dockerfile hash:  {data['stored_hash'][:16]}...")
+        if data.get("current_hash"):
+            print(f"  Current Dockerfile hash: {data['current_hash'][:16]}...")
+        print("  Run 'studio build-worker-image' to rebuild.")
+    return 0
+
+
+async def cmd_vm_pool_resize(size: int) -> int:
+    """Resize the Firecracker VM pool at runtime."""
+    resp = await _send_rpc(_get_socket_path(), "studio.vm_pool_resize", {"size": size})
+    if "error" in resp:
+        print(f"Error: {resp['error']['message']}", file=sys.stderr)
+        return 1
+
+    data = resp.get("result", {})
+    if "error" in data:
+        print(f"Error: {data['error']}", file=sys.stderr)
+        return 1
+
+    print(f"Pool resized: {data.get('old_size', '?')} -> {data.get('new_size', '?')}")
+    print(f"  Action:  {data.get('action', 'unknown')}")
+    if data.get("started"):
+        print(f"  Started: {data['started']} new VMs")
+    if data.get("drained"):
+        print(f"  Drained: {data['drained']} idle VMs")
+    return 0
+
+
+# ── Config commands ───────────────────────────────────────────────────────────
+
+
+def cmd_config_get(key: str) -> int:
+    """Read a setting by dot-notation key."""
+    data = _read_config()
+    val = _config_get_nested(data, key)
+    if val is None:
+        print(f"Key not set: {key}", file=sys.stderr)
+        return 1
+    if isinstance(val, bool):
+        print("true" if val else "false")
+    else:
+        print(val)
+    return 0
+
+
+def cmd_config_set(key: str, value: str) -> int:
+    """Write a setting by dot-notation key."""
+    data = _read_config()
+    _config_set_nested(data, key, value)
+    _write_config(data)
+    print(f"{key} = {value}")
+    return 0
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def cmd_version() -> int:
@@ -650,6 +777,22 @@ def main() -> None:
     # vm-status (Phase 7.1)
     sub.add_parser("vm-status", help="Show Firecracker VM pool status")
 
+    # check-rootfs (Phase 7.3)
+    sub.add_parser("check-rootfs", help="Check if Firecracker worker rootfs is up to date")
+
+    # vm-pool-resize (Phase 7.3)
+    p_vmresize = sub.add_parser("vm-pool-resize", help="Resize the Firecracker VM pool at runtime")
+    p_vmresize.add_argument("size", type=int, help="New pool size (non-negative integer)")
+
+    # config (Phase 7.3)
+    p_config = sub.add_parser("config", help="Read or write settings")
+    p_config_sub = p_config.add_subparsers(dest="config_action")
+    p_config_get = p_config_sub.add_parser("get", help="Read a setting")
+    p_config_get.add_argument("key", help="Dot-notation key (e.g. firecracker.enabled)")
+    p_config_set = p_config_sub.add_parser("set", help="Write a setting")
+    p_config_set.add_argument("key", help="Dot-notation key (e.g. firecracker.enabled)")
+    p_config_set.add_argument("value", help="Value to set")
+
     # fleet-add (Bundle 4.2)
     p_fadd = sub.add_parser("fleet-add", help="Add a host to the remote fleet")
     p_fadd.add_argument("name", help="Host name")
@@ -725,6 +868,18 @@ def main() -> None:
             exit_code = loop.run_until_complete(cmd_download_kernel(args.output, args.version))
         elif args.command == "vm-status":
             exit_code = loop.run_until_complete(cmd_vm_status())
+        elif args.command == "check-rootfs":
+            exit_code = loop.run_until_complete(cmd_check_rootfs())
+        elif args.command == "vm-pool-resize":
+            exit_code = loop.run_until_complete(cmd_vm_pool_resize(args.size))
+        elif args.command == "config":
+            if args.config_action == "get":
+                exit_code = cmd_config_get(args.key)
+            elif args.config_action == "set":
+                exit_code = cmd_config_set(args.key, args.value)
+            else:
+                p_config.print_help()
+                exit_code = 1
         else:
             print(f"Unknown command: {args.command}", file=sys.stderr)
             exit_code = 1
