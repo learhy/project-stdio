@@ -15,6 +15,8 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     python3.12 python3-pip git curl bubblewrap \
+    clang llvm libbpf-dev linux-headers-generic bpftool \
+    python3-bcc \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv

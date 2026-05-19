@@ -177,6 +177,7 @@ class Grants(BaseModel):
     secrets: list[SecretGrant] = Field(default_factory=list)
     rpc: RpcGrants = Field(default_factory=RpcGrants)
     resources: ResourceGrants = Field(default_factory=ResourceGrants)
+    privileged_capabilities: list[str] = Field(default_factory=list)  # Bundle 7.5: CAP_BPF, etc.
 
 
 class ManifestMetadata(BaseModel):
@@ -216,7 +217,7 @@ class TaskSpec(BaseModel):
     success_criteria: list[dict[str, Any]] = Field(default_factory=list)
     retry_policy: dict[str, Any] = Field(default_factory=lambda: {"max_attempts": 1, "backoff": "immediate"})
     capability_manifest: dict[str, Any] | None = None
-    runner_preference: Literal["local", "remote_ssh", "k8s", "docker", "any"] = "any"
+    runner_preference: Literal["local", "remote_ssh", "k8s", "docker", "firecracker-privileged", "any"] = "any"
 
 
 class DAGNode(BaseModel):
@@ -792,6 +793,9 @@ class FirecrackerSettings(BaseModel):
     jailer_enabled: bool = False
     jailer_chroot_base: str = "/var/lib/studio/firecracker/jailer"
     reset_mode: Literal["reboot", "overlay_only"] = "reboot"
+    # Bundle 7.5: privileged agent support
+    privileged_pool_size: int = 1
+    allowed_privileged_capabilities: list[str] = Field(default_factory=lambda: ["CAP_BPF", "CAP_PERFMON"])
 
 
 class RunnerSelectorSettings(BaseModel):

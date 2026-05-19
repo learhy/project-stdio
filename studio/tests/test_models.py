@@ -281,7 +281,7 @@ def test_known_version_constants_are_frozensets():
 
 def test_artifact_type_enum_values():
     from studio.orchestrator.artifacts import ArtifactType
-    assert len(ArtifactType) == 7
+    assert len(ArtifactType) == 8
     assert ArtifactType.EXECUTABLE_APP == "executable_app"
     assert ArtifactType.LIBRARY == "library"
     assert ArtifactType.INFRASTRUCTURE == "infrastructure"
@@ -289,6 +289,7 @@ def test_artifact_type_enum_values():
     assert ArtifactType.DATA_SCHEMA == "data_schema"
     assert ArtifactType.TEST_SUITE == "test_suite"
     assert ArtifactType.MIXED == "mixed"
+    assert ArtifactType.PRIVILEGED_AGENT == "privileged_agent"
 
 
 def test_verification_strategy_from_dict_executable_app():

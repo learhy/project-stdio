@@ -109,16 +109,19 @@ def test_firecracker_available():
 
 @pytest.mark.asyncio
 async def test_vm_pool_start_creates_vms():
-    """test_vm_pool_prewarms: pool.start() creates pool_size VMs."""
+    """test_vm_pool_prewarms: pool.start() creates pool_size standard + privileged VMs."""
     with patch("studio.orchestrator.firecracker.FirecrackerVm.start", new_callable=AsyncMock) as mock_start:
         pool = VmPool(
             pool_size=2,
             rootfs_path="/tmp/test-rootfs.ext4",
             kernel_path="/tmp/test-vmlinux",
+            privileged_pool_size=1,
         )
         await pool.start()
-        assert mock_start.call_count == 2
+        # 2 standard + 1 privileged
+        assert mock_start.call_count == 3
         assert pool._available.qsize() == 2
+        assert pool._privileged_available.qsize() == 1
         await pool.stop()
 
 
@@ -154,6 +157,7 @@ async def test_vm_pool_acquire_empty_cold_starts():
             pool_size=0,
             rootfs_path="/tmp/test-rootfs.ext4",
             kernel_path="/tmp/test-vmlinux",
+            privileged_pool_size=0,
         )
         await pool.start()
         assert pool._available.qsize() == 0
@@ -176,10 +180,11 @@ async def test_vm_pool_release_reset_failure_replaces_vm():
                     pool_size=1,
                     rootfs_path="/tmp/test-rootfs.ext4",
                     kernel_path="/tmp/test-vmlinux",
+                    privileged_pool_size=0,
                 )
                 await pool.start()
                 vm = await pool.acquire()
-                # start called once for pool pre-warm
+                # start called once for pool pre-warm (privileged_pool_size=0)
                 assert mock_start.call_count == 1
 
                 await pool.release(vm)
@@ -750,10 +755,11 @@ async def test_vm_pool_resize_grow():
     mock_vm.start = AsyncMock()
     mock_vm.stop = AsyncMock()
     mock_vm.reset = AsyncMock()
+    mock_vm.privileged = False
     mock_vm.config = MagicMock(vcpus=1, memory_mb=512)
 
     with patch.object(VmPool, "_create_and_boot_vm", AsyncMock(return_value=mock_vm)):
-        pool = VmPool(pool_size=1, rootfs_path="/tmp/rfs.ext4", kernel_path="/tmp/vmlinux")
+        pool = VmPool(pool_size=1, rootfs_path="/tmp/rfs.ext4", kernel_path="/tmp/vmlinux", privileged_pool_size=0)
         await pool.start()
         assert pool.pool_size == 1
 
@@ -771,10 +777,11 @@ async def test_vm_pool_resize_shrink():
     mock_vm.start = AsyncMock()
     mock_vm.stop = AsyncMock()
     mock_vm.reset = AsyncMock()
+    mock_vm.privileged = False
     mock_vm.config = MagicMock(vcpus=1, memory_mb=512)
 
     with patch.object(VmPool, "_create_and_boot_vm", AsyncMock(return_value=mock_vm)):
-        pool = VmPool(pool_size=2, rootfs_path="/tmp/rfs.ext4", kernel_path="/tmp/vmlinux")
+        pool = VmPool(pool_size=2, rootfs_path="/tmp/rfs.ext4", kernel_path="/tmp/vmlinux", privileged_pool_size=0)
         await pool.start()
         assert pool._available.qsize() == 2
 
@@ -794,10 +801,11 @@ async def test_vm_pool_resize_release_discard():
     mock_vm.start = AsyncMock()
     mock_vm.stop = AsyncMock()
     mock_vm.reset = AsyncMock()
+    mock_vm.privileged = False
     mock_vm.config = MagicMock(vcpus=1, memory_mb=512)
 
     with patch.object(VmPool, "_create_and_boot_vm", AsyncMock(return_value=mock_vm)):
-        pool = VmPool(pool_size=2, rootfs_path="/tmp/rfs.ext4", kernel_path="/tmp/vmlinux")
+        pool = VmPool(pool_size=2, rootfs_path="/tmp/rfs.ext4", kernel_path="/tmp/vmlinux", privileged_pool_size=0)
         await pool.start()
         vm1 = await pool.acquire()
         vm2 = await pool.acquire()
@@ -1512,3 +1520,523 @@ async def test_jailer_integration_skip_if_no_kvm():
     # Just verify the config is correct — actual start requires root
     assert vm.config.jailer_enabled is True
     assert vm.config.jailer_chroot_base == "/tmp/test-jailer-chroot"
+
+
+# ── Bundle 7.5: Privileged agents ──────────────────────────────────────────────
+
+
+def test_firecracker_vm_privileged_flag():
+    """FirecrackerVm stores privileged flag from constructor."""
+    config = FirecrackerVmConfig()
+    vm = FirecrackerVm(vm_id=100, config=config, privileged=True)
+    assert vm.privileged is True
+
+    vm2 = FirecrackerVm(vm_id=101, config=config)
+    assert vm2.privileged is False
+
+
+def test_firecracker_vm_config_default_privileged():
+    """FirecrackerVmConfig default does not set privileged."""
+    config = FirecrackerVmConfig()
+    assert not hasattr(config, "privileged") or getattr(config, "privileged", False) is False
+
+
+@pytest.mark.asyncio
+async def test_vmpool_acquire_standard_vm():
+    """VmPool.acquire() without privileged flag returns standard VM."""
+    pool = VmPool(pool_size=1, rootfs_path="/tmp/test-rootfs.ext4",
+                  kernel_path="/tmp/vmlinux", privileged_pool_size=0)
+    pool._running = True
+    mock_vm = MagicMock(spec=FirecrackerVm)
+    mock_vm.privileged = False
+    pool._available.put_nowait(mock_vm)
+    pool._all_vms.append(mock_vm)
+
+    vm = await pool.acquire(privileged=False)
+    assert vm is mock_vm
+    assert vm.privileged is False
+
+
+@pytest.mark.asyncio
+async def test_vmpool_acquire_privileged_vm():
+    """VmPool.acquire(privileged=True) returns privileged VM."""
+    pool = VmPool(pool_size=1, rootfs_path="/tmp/test-rootfs.ext4",
+                  kernel_path="/tmp/vmlinux", privileged_pool_size=1)
+    pool._running = True
+    mock_vm = MagicMock(spec=FirecrackerVm)
+    mock_vm.privileged = True
+    pool._privileged_available.put_nowait(mock_vm)
+    pool._privileged_vms.append(mock_vm)
+
+    vm = await pool.acquire(privileged=True)
+    assert vm is mock_vm
+    assert vm.privileged is True
+
+
+@pytest.mark.asyncio
+async def test_vmpool_release_routes_to_correct_pool():
+    """VmPool.release() returns VM to the correct sub-pool based on vm.privileged."""
+    pool = VmPool(pool_size=1, rootfs_path="/tmp/test-rootfs.ext4",
+                  kernel_path="/tmp/vmlinux", privileged_pool_size=1)
+    pool._running = True
+
+    std_vm = MagicMock(spec=FirecrackerVm)
+    std_vm.privileged = False
+    std_vm.reset = AsyncMock()
+    pool._all_vms.append(std_vm)
+
+    priv_vm = MagicMock(spec=FirecrackerVm)
+    priv_vm.privileged = True
+    priv_vm.reset = AsyncMock()
+    pool._privileged_vms.append(priv_vm)
+
+    # Release standard VM
+    await pool.release(std_vm)
+    assert pool._available.qsize() == 1
+    assert pool._privileged_available.qsize() == 0
+    retrieved = await pool._available.get()
+    assert retrieved is std_vm
+
+    # Release privileged VM
+    await pool.release(priv_vm)
+    assert pool._privileged_available.qsize() == 1
+    retrieved_priv = await pool._privileged_available.get()
+    assert retrieved_priv is priv_vm
+
+
+@pytest.mark.asyncio
+async def test_vmpool_create_and_boot_vm_passes_privileged():
+    """VmPool._create_and_boot_vm passes privileged flag to FirecrackerVm."""
+    pool = VmPool(pool_size=1, rootfs_path="/tmp/test-rootfs.ext4",
+                  kernel_path="/tmp/vmlinux", privileged_pool_size=1)
+
+    with patch("studio.orchestrator.firecracker.FirecrackerVm") as MockVm:
+        mock_instance = MagicMock(spec=FirecrackerVm)
+        mock_instance.privileged = True
+        mock_instance.boot = AsyncMock()
+        mock_instance.exec = AsyncMock(return_value=9000)
+        MockVm.return_value = mock_instance
+
+        vm = await pool._create_and_boot_vm(privileged=True)
+        assert vm.privileged is True
+        call_kwargs = MockVm.call_args.kwargs
+        assert call_kwargs.get("privileged") is True
+
+
+@pytest.mark.asyncio
+async def test_vmpool_start_prewarms_both_pools():
+    """VmPool.start() pre-warms standard and privileged pools."""
+    pool = VmPool(pool_size=2, rootfs_path="/tmp/test-rootfs.ext4",
+                  kernel_path="/tmp/vmlinux", privileged_pool_size=1)
+
+    created_std = 0
+    created_priv = 0
+
+    async def create_and_boot(privileged=False):
+        nonlocal created_std, created_priv
+        if privileged:
+            created_priv += 1
+        else:
+            created_std += 1
+        vm = MagicMock(spec=FirecrackerVm)
+        vm.privileged = privileged
+        return vm
+
+    with patch.object(pool, "_create_and_boot_vm", side_effect=create_and_boot):
+        await pool.start()
+
+    assert created_std == 2
+    assert created_priv == 1
+    assert len(pool._all_vms) == 2
+    assert len(pool._privileged_vms) == 1
+
+
+@pytest.mark.asyncio
+async def test_vmpool_stop_cleans_both_pools():
+    """VmPool.stop() shuts down both standard and privileged VMs."""
+    pool = VmPool(pool_size=1, rootfs_path="/tmp/test-rootfs.ext4",
+                  kernel_path="/tmp/vmlinux", privileged_pool_size=1)
+
+    std_vm = MagicMock(spec=FirecrackerVm)
+    std_vm.privileged = False
+    std_vm.stop = AsyncMock()
+    pool._all_vms.append(std_vm)
+
+    priv_vm = MagicMock(spec=FirecrackerVm)
+    priv_vm.privileged = True
+    priv_vm.stop = AsyncMock()
+    pool._privileged_vms.append(priv_vm)
+
+    await pool.stop()
+
+    std_vm.stop.assert_called_once()
+    priv_vm.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_vmpool_privileged_pool_size_default():
+    """VmPool defaults privileged_pool_size to 1."""
+    pool = VmPool(pool_size=1, rootfs_path="/tmp/test-rootfs.ext4",
+                  kernel_path="/tmp/vmlinux")
+    assert pool._privileged_pool_size == 1
+    assert pool._privileged_available.maxsize == 1
+
+
+def test_grants_privileged_capabilities_field():
+    """Grants model has privileged_capabilities field."""
+    from studio.orchestrator.models import Grants
+
+    g = Grants()
+    assert g.privileged_capabilities == []
+
+    g2 = Grants(privileged_capabilities=["CAP_BPF", "CAP_PERFMON"])
+    assert g2.privileged_capabilities == ["CAP_BPF", "CAP_PERFMON"]
+
+
+def test_firecracker_settings_privileged_fields():
+    """FirecrackerSettings has privileged_pool_size and allowed_privileged_capabilities fields."""
+    from studio.orchestrator.models import Settings
+
+    settings = Settings()
+    assert hasattr(settings.firecracker, "privileged_pool_size")
+    assert settings.firecracker.privileged_pool_size == 1
+    assert hasattr(settings.firecracker, "allowed_privileged_capabilities")
+    assert "CAP_BPF" in settings.firecracker.allowed_privileged_capabilities
+    assert "CAP_PERFMON" in settings.firecracker.allowed_privileged_capabilities
+
+    # Parse from raw
+    raw = {
+        "firecracker": {
+            "enabled": True,
+            "privileged_pool_size": 3,
+            "allowed_privileged_capabilities": ["CAP_BPF"],
+        }
+    }
+    settings2 = Settings.model_validate(raw)
+    assert settings2.firecracker.privileged_pool_size == 3
+    assert settings2.firecracker.allowed_privileged_capabilities == ["CAP_BPF"]
+
+
+def test_task_spec_runner_preference_firecracker_privileged():
+    """TaskSpec accepts firecracker-privileged as runner_preference."""
+    from studio.orchestrator.models import TaskSpec
+
+    ts = TaskSpec(objective="test", runner_preference="firecracker-privileged")
+    assert ts.runner_preference == "firecracker-privileged"
+
+
+@pytest.mark.asyncio
+async def test_firecracker_runner_privileged_worker():
+    """FirecrackerWorkerRunner.spawn_worker passes privileged caps when manifest requires them."""
+    mock_db = MagicMock()
+    mock_db.execute = AsyncMock()
+    mock_db.conn = MagicMock()
+    mock_db.conn.commit = AsyncMock()
+
+    mock_vm = MagicMock()
+    mock_vm.exec = AsyncMock(return_value=1001)
+    mock_vm.mount_worktree = AsyncMock()
+    mock_vm.privileged = True
+
+    mock_pool = MagicMock()
+    mock_pool.acquire = AsyncMock(return_value=mock_vm)
+    mock_pool._rootfs_path = "/var/lib/studio/firecracker/rootfs.ext4"
+
+    from studio.orchestrator.models import FirecrackerSettings
+    settings = FirecrackerSettings()
+    settings.allowed_privileged_capabilities = ["CAP_BPF", "CAP_PERFMON"]
+
+    runner = FirecrackerWorkerRunner(
+        db=mock_db,
+        pool=mock_pool,
+        orchestrator_host="172.16.0.1",
+        settings=settings,
+    )
+
+    manifest_fc = make_fc_manifest()
+    manifest_fc.grants.privileged_capabilities = ["CAP_BPF"]
+
+    with patch("studio.orchestrator.runner._generate_token", return_value="test-token"):
+        with patch("studio.orchestrator.runner.capability_to_bwrap_args", return_value=[]):
+            with patch("studio.orchestrator.runner.Path.mkdir"):
+                with patch("studio.orchestrator.runner.Path.write_text"):
+                    with patch("studio.orchestrator.runner.FirecrackerWorkerRunner._spawn_proxy_tcp",
+                               new_callable=AsyncMock) as mock_proxy:
+                        mock_proxy.return_value = MagicMock()
+                        with patch.object(runner, "_apply_resource_config", new_callable=AsyncMock):
+                            result = await runner.spawn_worker(
+                                worker_id="w-priv",
+                                bundle_id="b-test",
+                                node_id="n-test",
+                                manifest=manifest_fc,
+                                worktree_path="/tmp/test-wt",
+                            )
+
+    # Verify VM was acquired with privileged=True
+    mock_pool.acquire.assert_called_once_with(privileged=True)
+
+    # Verify STUDIO_PRIVILEGED_CAPS is in exec env
+    exec_call = mock_vm.exec.call_args
+    env = exec_call.kwargs["env"]
+    assert "STUDIO_PRIVILEGED_CAPS" in env
+    caps = json.loads(env["STUDIO_PRIVILEGED_CAPS"])
+    assert "CAP_BPF" in caps
+
+
+@pytest.mark.asyncio
+async def test_firecracker_runner_privileged_operator_allowlist_blocks():
+    """FirecrackerWorkerRunner blocks privileged caps not in operator allowlist."""
+    mock_db = MagicMock()
+    mock_db.execute = AsyncMock()
+    mock_db.conn = MagicMock()
+    mock_db.conn.commit = AsyncMock()
+
+    mock_pool = MagicMock()
+    mock_pool._rootfs_path = "/var/lib/studio/firecracker/rootfs.ext4"
+
+    from studio.orchestrator.models import FirecrackerSettings
+    settings = FirecrackerSettings()
+    settings.allowed_privileged_capabilities = ["CAP_BPF"]  # only BPF, not SYS_ADMIN
+
+    runner = FirecrackerWorkerRunner(
+        db=mock_db,
+        pool=mock_pool,
+        orchestrator_host="172.16.0.1",
+        settings=settings,
+    )
+
+    manifest_fc = make_fc_manifest()
+    manifest_fc.grants.privileged_capabilities = ["CAP_SYS_ADMIN"]  # not in allowlist
+
+    with patch("studio.orchestrator.runner._generate_token", return_value="test-token"):
+        with patch("studio.orchestrator.runner.capability_to_bwrap_args", return_value=[]):
+            with patch("studio.orchestrator.runner.Path.mkdir"):
+                with patch("studio.orchestrator.runner.Path.write_text"):
+                    with patch("studio.orchestrator.runner.FirecrackerWorkerRunner._spawn_proxy_tcp",
+                               new_callable=AsyncMock) as mock_proxy:
+                        mock_proxy.return_value = MagicMock()
+                        result = await runner.spawn_worker(
+                            worker_id="w-blocked",
+                            bundle_id="b-test",
+                            node_id="n-test",
+                            manifest=manifest_fc,
+                            worktree_path="/tmp/test-wt",
+                        )
+
+    assert result.error
+    assert "privileged" in result.error.lower() or "CAP_SYS_ADMIN" in result.error
+    mock_pool.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_firecracker_runner_privileged_partial_allowlist():
+    """FirecrackerWorkerRunner blocks all when any requested cap is not in allowlist."""
+    mock_db = MagicMock()
+    mock_db.execute = AsyncMock()
+    mock_db.conn = MagicMock()
+    mock_db.conn.commit = AsyncMock()
+
+    mock_pool = MagicMock()
+    mock_pool._rootfs_path = "/var/lib/studio/firecracker/rootfs.ext4"
+
+    from studio.orchestrator.models import FirecrackerSettings
+    settings = FirecrackerSettings()
+    settings.allowed_privileged_capabilities = ["CAP_BPF"]
+
+    runner = FirecrackerWorkerRunner(
+        db=mock_db,
+        pool=mock_pool,
+        orchestrator_host="172.16.0.1",
+        settings=settings,
+    )
+
+    manifest_fc = make_fc_manifest()
+    manifest_fc.grants.privileged_capabilities = ["CAP_BPF", "CAP_SYS_ADMIN"]
+
+    with patch("studio.orchestrator.runner._generate_token", return_value="test-token"):
+        with patch("studio.orchestrator.runner.capability_to_bwrap_args", return_value=[]):
+            with patch("studio.orchestrator.runner.Path.mkdir"):
+                with patch("studio.orchestrator.runner.Path.write_text"):
+                    with patch("studio.orchestrator.runner.FirecrackerWorkerRunner._spawn_proxy_tcp",
+                               new_callable=AsyncMock) as mock_proxy:
+                        mock_proxy.return_value = MagicMock()
+                        result = await runner.spawn_worker(
+                            worker_id="w-partial",
+                            bundle_id="b-test",
+                            node_id="n-test",
+                            manifest=manifest_fc,
+                            worktree_path="/tmp/test-wt",
+                        )
+
+    assert result.error
+    assert "CAP_SYS_ADMIN" in result.error
+
+
+@pytest.mark.asyncio
+async def test_firecracker_runner_standard_worker_no_privileged_caps():
+    """Standard worker (no privileged caps) does not set STUDIO_PRIVILEGED_CAPS."""
+    mock_db = MagicMock()
+    mock_db.execute = AsyncMock()
+    mock_db.conn = MagicMock()
+    mock_db.conn.commit = AsyncMock()
+
+    mock_vm = MagicMock()
+    mock_vm.exec = AsyncMock(return_value=1001)
+    mock_vm.mount_worktree = AsyncMock()
+
+    mock_pool = MagicMock()
+    mock_pool.acquire = AsyncMock(return_value=mock_vm)
+    mock_pool._rootfs_path = "/var/lib/studio/firecracker/rootfs.ext4"
+
+    from studio.orchestrator.models import FirecrackerSettings
+    settings = FirecrackerSettings()
+
+    runner = FirecrackerWorkerRunner(
+        db=mock_db,
+        pool=mock_pool,
+        orchestrator_host="172.16.0.1",
+        settings=settings,
+    )
+
+    manifest_fc = make_fc_manifest()
+    # No privileged_capabilities set
+
+    with patch("studio.orchestrator.runner._generate_token", return_value="test-token"):
+        with patch("studio.orchestrator.runner.capability_to_bwrap_args", return_value=[]):
+            with patch("studio.orchestrator.runner.Path.mkdir"):
+                with patch("studio.orchestrator.runner.Path.write_text"):
+                    with patch("studio.orchestrator.runner.FirecrackerWorkerRunner._spawn_proxy_tcp",
+                               new_callable=AsyncMock) as mock_proxy:
+                        mock_proxy.return_value = MagicMock()
+                        with patch.object(runner, "_apply_resource_config", new_callable=AsyncMock):
+                            await runner.spawn_worker(
+                                worker_id="w-std",
+                                bundle_id="b-test",
+                                node_id="n-test",
+                                manifest=manifest_fc,
+                                worktree_path="/tmp/test-wt",
+                            )
+
+    mock_pool.acquire.assert_called_once_with(privileged=False)
+    exec_call = mock_vm.exec.call_args
+    env = exec_call.kwargs["env"]
+    assert "STUDIO_PRIVILEGED_CAPS" not in env
+
+
+def test_artifact_type_privileged_agent_exists():
+    """ArtifactType.PRIVILEGED_AGENT exists and is 'privileged_agent'."""
+    from studio.orchestrator.artifacts import ArtifactType
+    assert ArtifactType.PRIVILEGED_AGENT == "privileged_agent"
+
+
+def test_detect_artifact_type_ebpf_keywords():
+    """detect_artifact_type_from_idea returns PRIVILEGED_AGENT for eBPF-related ideas."""
+    from studio.orchestrator.artifacts import detect_artifact_type_from_idea, ArtifactType
+
+    assert detect_artifact_type_from_idea("write an ebpf program to trace syscalls") == ArtifactType.PRIVILEGED_AGENT
+    assert detect_artifact_type_from_idea("add a tracepoint for network events") == ArtifactType.PRIVILEGED_AGENT
+    assert detect_artifact_type_from_idea("create a kprobe to monitor file opens") == ArtifactType.PRIVILEGED_AGENT
+    assert detect_artifact_type_from_idea("add a uprobe to trace user-space function calls") == ArtifactType.PRIVILEGED_AGENT
+    assert detect_artifact_type_from_idea("use cap_bpf to attach XDP program") == ArtifactType.PRIVILEGED_AGENT
+    assert detect_artifact_type_from_idea("write a bpf program for packet filtering") == ArtifactType.PRIVILEGED_AGENT
+    assert detect_artifact_type_from_idea("add a uprobe to trace user function calls") == ArtifactType.PRIVILEGED_AGENT
+
+
+def test_detect_artifact_type_ebpf_not_matched():
+    """detect_artifact_type_from_idea does NOT match non-eBPF ideas as privileged."""
+    from studio.orchestrator.artifacts import detect_artifact_type_from_idea, ArtifactType
+
+    result = detect_artifact_type_from_idea("write a flask web application")
+    assert result != ArtifactType.PRIVILEGED_AGENT
+
+
+def test_verification_strategy_split_phases():
+    """VerificationStrategy supports static_phase and runtime_phase for split verification."""
+    from studio.orchestrator.artifacts import VerificationStrategy
+
+    vs = VerificationStrategy(
+        type="privileged_agent",
+        static_phase=VerificationStrategy(
+            type="library",
+            test_command="cargo test",
+        ),
+        runtime_phase=VerificationStrategy(
+            type="executable_app",
+            startup_command="./target/agent",
+            smoke_tests=[{"method": "GET", "path": "/health", "expected_status": 200}],
+        ),
+    )
+    assert vs.type == "privileged_agent"
+    assert vs.static_phase is not None
+    assert vs.static_phase.type == "library"
+    assert vs.static_phase.test_command == "cargo test"
+    assert vs.runtime_phase is not None
+    assert vs.runtime_phase.type == "executable_app"
+    assert vs.runtime_phase.startup_command == "./target/agent"
+
+
+def test_verification_strategy_from_dict_split_phases():
+    """VerificationStrategy.from_dict parses nested static_phase and runtime_phase."""
+    from studio.orchestrator.artifacts import VerificationStrategy
+
+    d = {
+        "type": "privileged_agent",
+        "static_phase": {
+            "type": "library",
+            "test_command": "cargo build",
+        },
+        "runtime_phase": {
+            "type": "executable_app",
+            "startup_command": "./agent",
+        },
+    }
+    vs = VerificationStrategy.from_dict(d)
+    assert vs.type == "privileged_agent"
+    assert vs.static_phase.type == "library"
+    assert vs.runtime_phase.type == "executable_app"
+
+
+def test_verification_strategy_no_split_phases():
+    """VerificationStrategy without split phases works as before (backward compat)."""
+    from studio.orchestrator.artifacts import VerificationStrategy
+
+    vs = VerificationStrategy(
+        type="executable_app",
+        startup_command="flask run",
+    )
+    assert vs.type == "executable_app"
+    assert vs.static_phase is None
+    assert vs.runtime_phase is None
+
+
+def test_verification_strategy_serialization_roundtrip():
+    """VerificationStrategy with split phases round-trips through model_dump."""
+    from studio.orchestrator.artifacts import VerificationStrategy
+
+    vs = VerificationStrategy(
+        type="privileged_agent",
+        static_phase=VerificationStrategy(type="library", test_command="make"),
+        runtime_phase=VerificationStrategy(type="executable_app", startup_command="./bin/app"),
+    )
+    dumped = vs.model_dump()
+    restored = VerificationStrategy.model_validate(dumped)
+    assert restored.type == "privileged_agent"
+    assert restored.static_phase.type == "library"
+    assert restored.runtime_phase.type == "executable_app"
+
+
+def test_dockerfile_worker_has_ebpf_toolchain():
+    """Dockerfile.worker installs eBPF toolchain packages."""
+    import os
+    dockerfile_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "docker", "Dockerfile.worker"
+    )
+    if not os.path.exists(dockerfile_path):
+        dockerfile_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "docker", "Dockerfile.worker"
+        )
+    content = open(dockerfile_path).read()
+    assert "clang" in content
+    assert "libbpf-dev" in content
+    assert "bpftool" in content
+    assert "python3-bcc" in content

@@ -2354,6 +2354,29 @@ class FirecrackerWorkerRunner:
         # Determine worker binary
         worker_binary = "studio-review" if worker_type == "review" else "studio-worker"
 
+        # Bundle 7.5: detect privileged worker from manifest
+        privileged = bool(manifest.grants.privileged_capabilities)
+        runner_type = "firecracker-privileged" if privileged else "firecracker"
+
+        # Enforce operator allowlist for privileged capabilities
+        if privileged:
+            allowed = set(self._settings.allowed_privileged_capabilities)
+            requested = set(manifest.grants.privileged_capabilities)
+            blocked = requested - allowed
+            if blocked:
+                msg = (
+                    f"Privileged capability(s) not allowed by operator policy: "
+                    f"{', '.join(sorted(blocked))}. "
+                    f"Allowed: {', '.join(sorted(allowed)) if allowed else '(none)'}"
+                )
+                logger.error("worker.audit_event: privileged_capability_blocked from %s: %s", worker_id, msg)
+                return WorkerSpawnResult(
+                    worker_id=worker_id,
+                    token="",
+                    node_id=node_id,
+                    error=msg,
+                )
+
         # Insert worker row
         await self._db.execute(
             "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, "
@@ -2365,7 +2388,7 @@ class FirecrackerWorkerRunner:
             "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             ("worker_spawned", "worker", worker_id,
-             json.dumps({"bundle_id": bundle_id, "node_id": node_id, "runner_type": "firecracker"}),
+             json.dumps({"bundle_id": bundle_id, "node_id": node_id, "runner_type": runner_type}),
              self.now()),
         )
         await self._db.conn.commit()
@@ -2382,8 +2405,8 @@ class FirecrackerWorkerRunner:
             (mtls_dir / "tls.crt").write_text(cert_pem)
             (mtls_dir / "tls.key").write_text(key_pem)
 
-        # Acquire a VM from the pool
-        vm = await self._pool.acquire()
+        # Acquire a VM from the appropriate pool
+        vm = await self._pool.acquire(privileged=privileged)
 
         # Pre-bake worktree into VM drive
         await vm.mount_worktree(worktree_path)
@@ -2399,6 +2422,12 @@ class FirecrackerWorkerRunner:
         }
         if self._ca_cert_pem:
             worker_env["STUDIO_ORCHESTRATOR_CA_B64"] = _b64_encode(self._ca_cert_pem)
+
+        # Bundle 7.5: pass privileged capabilities to guest init/agent
+        if privileged:
+            worker_env["STUDIO_PRIVILEGED_CAPS"] = json.dumps(
+                manifest.grants.privileged_capabilities
+            )
 
         # Egress proxy via TCP (host reachable from guest at bridge IP)
         proxy_port = 8888 + hash(worker_id) % 1000
@@ -2605,10 +2634,15 @@ class RunnerSelector:
 
         # Resolve "any" to concrete preference order: explicit preference → local fallback
         candidates: list[str]
+        # Bundle 7.5: "firecracker-privileged" maps to firecracker runner (privilege detection
+        # happens inside FirecrackerWorkerRunner.spawn_worker from manifest)
+        resolved = preference
+        if preference == "firecracker-privileged":
+            resolved = "firecracker"
         if preference == "any":
             candidates = [self._default_preference()] + [r for r in available if r != self._default_preference()]
-        elif preference in self._runners:
-            candidates = [preference] + [r for r in available if r != preference]
+        elif resolved in self._runners:
+            candidates = [resolved] + [r for r in available if r != resolved]
         else:
             # Unknown preference — treat as "any"
             logger.warning("Unknown runner_preference %r, falling back to available runners", preference)
