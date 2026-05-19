@@ -69,8 +69,14 @@ setup_colors() {
 color_ok()    { echo -e "${GREEN}[ok]${NC} $*"; }
 color_warn()  { echo -e "${YELLOW}[warn]${NC} $*"; }
 color_err()   { echo -e "${RED}[error]${NC} $*"; }
+color_info()  { echo -e "${BOLD}[info]${NC} $*"; }
 step()        { echo -e "\n${BOLD}[step]${NC} $*"; }
 info()        { echo "       $*"; }
+log_ok()      { echo -e "  ${GREEN}[ok]${NC} $*"; }
+log_warning() { echo -e "  ${YELLOW}[warn]${NC} $*"; }
+log_error()   { echo -e "  ${RED}[error]${NC} $*"; }
+log_installing() { echo -e "  ${YELLOW}[installing]${NC} $*"; }
+print_header() { echo -e "\n${BOLD}── $* ──${NC}"; }
 
 die() {
     color_err "$@"
@@ -429,6 +435,41 @@ check_opencode() {
         if cmd_exists opencode; then
             color_ok "opencode: installed"
         fi
+    fi
+}
+
+check_docker() {
+    dep_status "Docker Engine"
+    if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
+        dep_ok
+        info "  Docker $(docker --version | cut -d' ' -f3 | tr -d ',')"
+        return 0
+    fi
+
+    dep_install
+    if should_skip "install Docker Engine"; then
+        return 0
+    fi
+
+    if command -v apt-get &>/dev/null; then
+        curl -fsSL https://get.docker.com | sh
+        usermod -aG docker "$USER" 2>/dev/null || true
+        systemctl enable --now docker 2>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+        dnf install -y docker docker-compose-plugin
+        systemctl enable --now docker
+    else
+        color_err "Cannot auto-install Docker on this system. Please install Docker Engine manually: https://docs.docker.com/engine/install/"
+        return 1
+    fi
+
+    if command -v docker &>/dev/null; then
+        color_ok "Docker: installed"
+        color_info "NOTE: You may need to log out and back in for Docker group membership to take effect."
+        info "Run 'newgrp docker' to activate immediately."
+    else
+        color_err "Docker installation failed"
+        return 1
     fi
 }
 
@@ -855,8 +896,26 @@ configure_api_key() {
 configure_github() {
     info "GitHub App integration (optional — press Enter to skip)"
 
+    # Check for environment variables first (non-interactive mode)
+    local env_app_id="${STUDIO_GITHUB_APP_ID:-}"
+    local env_install_id="${STUDIO_GITHUB_INSTALLATION_ID:-}"
+    local env_key_path="${STUDIO_GITHUB_KEY_PATH:-}"
+
+    if [[ -n "$env_app_id" && -n "$env_install_id" && -n "$env_key_path" ]]; then
+        write_json_field "$CONFIG_FILE" "github.app_id" "$env_app_id"
+        write_json_field "$CONFIG_FILE" "github.installation_id" "$env_install_id"
+        write_json_field "$CONFIG_FILE" "github.private_key_path" "$env_key_path"
+        write_json_field "$CONFIG_FILE" "github.enabled" "true"
+        color_ok "GitHub App configured from environment"
+        return
+    fi
+
     if [[ "$IS_TTY" != "true" ]]; then
-        info "  Skipping GitHub setup (non-interactive)"
+        if [[ -n "$env_app_id" || -n "$env_install_id" || -n "$env_key_path" ]]; then
+            color_warn "GitHub App env vars partially set — all three required (STUDIO_GITHUB_APP_ID, STUDIO_GITHUB_INSTALLATION_ID, STUDIO_GITHUB_KEY_PATH). Skipping GitHub setup."
+        else
+            color_warn "Skipping GitHub setup (non-interactive, no env vars set)"
+        fi
         return
     fi
 
@@ -1066,6 +1125,111 @@ do_uninstall() {
     exit 0
 }
 
+# ── Pre-flight checks ────────────────────────────────────────────────────────
+
+check_prerequisites() {
+    local failed=0
+
+    print_header "Pre-flight checks"
+
+    # OS check
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        log_error "project-stdio requires Linux. macOS/Windows: use Docker (see docs/install.md)"
+        ((failed++))
+    else
+        log_ok "Operating system: Linux"
+    fi
+
+    # Architecture check
+    local arch
+    arch=$(uname -m)
+    if [[ "$arch" != "x86_64" ]]; then
+        log_warning "Architecture $arch: Firecracker isolation not available (x86_64 only). Workers will use bubblewrap."
+    else
+        log_ok "Architecture: x86_64"
+    fi
+
+    # Python 3.12+ check
+    local python_cmd=""
+    for cmd in python3.12 python3.13 python3; do
+        if command -v "$cmd" &>/dev/null; then
+            local ver
+            ver=$($cmd -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
+            local major minor
+            major=$(echo "$ver" | cut -d. -f1)
+            minor=$(echo "$ver" | cut -d. -f2)
+            if [[ "$major" -ge 3 && "$minor" -ge 12 ]]; then
+                python_cmd="$cmd"
+                log_ok "Python $ver ($cmd)"
+                break
+            fi
+        fi
+    done
+    if [[ -z "$python_cmd" ]]; then
+        log_error "Python 3.12+ required but not found."
+        log_error "Install: sudo apt install python3.12 python3.12-venv  (Debian/Ubuntu)"
+        log_error "         sudo dnf install python3.12                   (RHEL/Fedora)"
+        ((failed++))
+    fi
+
+    # Git check
+    if ! command -v git &>/dev/null; then
+        log_error "git required but not found."
+        log_error "Install: sudo apt install git  (Debian/Ubuntu)"
+        log_error "         sudo dnf install git  (RHEL/Fedora)"
+        ((failed++))
+    else
+        log_ok "git $(git --version | cut -d' ' -f3)"
+    fi
+
+    # curl check
+    if ! command -v curl &>/dev/null; then
+        log_error "curl required but not found."
+        log_error "Install: sudo apt install curl"
+        ((failed++))
+    else
+        log_ok "curl $(curl --version | head -1 | cut -d' ' -f2)"
+    fi
+
+    # Disk space check (minimum 5GB free in install prefix)
+    local free_gb
+    free_gb=$(df -BG "${PREFIX:-/usr/local}" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+    if [[ -n "$free_gb" && "$free_gb" -lt 5 ]]; then
+        log_error "Insufficient disk space: ${free_gb}GB free, 5GB required (rootfs image ~1GB, worker overlays ~10GB each)"
+        ((failed++))
+    else
+        log_ok "Disk space: ${free_gb:-?}GB free"
+    fi
+
+    # KVM check (non-fatal, just inform)
+    if [[ -e /dev/kvm ]]; then
+        log_ok "KVM available: Firecracker microVM isolation will be enabled"
+    else
+        log_warning "KVM not available: Firecracker isolation disabled. Workers will use bubblewrap."
+        log_warning "For KVM on cloud VMs: AWS use .metal instances, GCP use --enable-nested-virtualization"
+    fi
+
+    # Internet connectivity check
+    if ! curl -sf --max-time 10 https://github.com &>/dev/null; then
+        log_error "No internet connectivity (cannot reach github.com)"
+        ((failed++))
+    else
+        log_ok "Internet connectivity"
+    fi
+
+    # Summary
+    if [[ "$failed" -gt 0 ]]; then
+        echo ""
+        log_error "Pre-flight check failed: $failed prerequisite(s) missing."
+        log_error "Please fix the issues above and re-run the installer."
+        log_error "The installer has NOT modified your system."
+        exit 1
+    fi
+
+    log_ok "All pre-flight checks passed"
+    echo ""
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -1077,6 +1241,9 @@ main() {
     if [[ "$UNINSTALL" == "true" ]]; then
         do_uninstall
     fi
+
+    # ── Pre-flight: check prerequisites before touching anything ──
+    check_prerequisites
 
     # ── Step 1: Detect ──
     detect_os
@@ -1092,6 +1259,7 @@ main() {
     check_git
     check_bubblewrap
     check_opencode
+    check_docker
 
     # ── Step 2.5: Firecracker (system dep only -- binary download) ──
     check_firecracker
