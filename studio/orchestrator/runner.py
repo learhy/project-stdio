@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 import asyncssh
 import docker as docker_lib
 
-from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost, K8sRunnerSettings, DockerRunnerSettings, RunnerSelectorSettings
+from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost, K8sRunnerSettings, DockerRunnerSettings, FirecrackerSettings, RunnerSelectorSettings
 from . import tls as tls_helpers
 
 if TYPE_CHECKING:
@@ -123,6 +123,7 @@ def capability_to_runner_compatibility(
         "remote_ssh": {"compatible": True, "unenforced_grants": []},
         "k8s": {"compatible": True, "unenforced_grants": []},
         "docker": {"compatible": True, "unenforced_grants": []},
+        "firecracker": {"compatible": True, "unenforced_grants": []},
     }
 
     # k8s and docker can't enforce exec allowlists — no bwrap in containers
@@ -196,13 +197,46 @@ def capability_to_docker_args(
     return args
 
 
+# ── Firecracker VM config ──────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class VmConfig:
+    """Firecracker VM resource configuration derived from capability manifest (Bundle 7.2)."""
+    vcpus: int = 1
+    memory_mb: int = 512
+    egress_allowlist: list[str] = field(default_factory=list)
+    exec_allowlist: list[str] = field(default_factory=list)
+
+
+def capability_to_vm_config(manifest: CapabilityManifest) -> VmConfig:
+    """Translate a capability manifest into Firecracker VM resource configuration.
+
+    Filesystem grants are handled separately via worktree pre-baking.
+    vCPU/memory come from resource_limits. Network grants become egress proxy
+    allowlist entries. Process exec grants are enforced inside the VM by bwrap.
+    """
+    resources = manifest.grants.resources
+    network = manifest.grants.network
+    process = manifest.grants.process
+
+    return VmConfig(
+        vcpus=resources.cpu_limit or 1,
+        memory_mb=int(resources.memory_limit or 512),
+        egress_allowlist=[g.destination for g in network.egress],
+        exec_allowlist=[g.binary for g in process.exec] if process.exec else [],
+    )
+
+
 class WorkerSpawnResult:
     def __init__(
         self,
         worker_id: str,
         token: str,
         node_id: str,
-        process: asyncio.subprocess.Process | "RemoteWorkerHandle | K8sWorkerHandle | None" = None,
+        process: asyncio.subprocess.Process | "RemoteWorkerHandle | K8sWorkerHandle | DockerWorkerHandle | FirecrackerWorkerHandle | None" = None,
         proxy_process: asyncio.subprocess.Process | None = None,
         error: str = "",
     ) -> None:
@@ -2219,6 +2253,262 @@ class DockerWorkerRunner:
             self._client = None
 
 
+# ── Firecracker Worker Handle ──────────────────────────────────────────────────
+
+
+@dataclass
+class FirecrackerWorkerHandle:
+    """Handle for a worker running inside a Firecracker microVM (Bundle 7.2).
+
+    Tracks the VM, worker ID, and the guest-agent-assigned PID so
+    the executor can cancel, poll, and clean up the worker.
+    """
+
+    vm: "FirecrackerVm"
+    worker_id: str
+    _worker_pid: int | None = None
+
+    @property
+    def returncode(self) -> int | None:
+        return None
+
+    async def cancel(self) -> None:
+        """Send SIGTERM to worker process inside VM, then stop the VM."""
+        if self._worker_pid is not None:
+            try:
+                await self.vm.exec_signal(self._worker_pid, "TERM")
+            except Exception:
+                pass
+        await asyncio.sleep(5)
+        try:
+            await self.vm.stop()
+        except Exception:
+            pass
+
+    async def is_alive(self) -> bool:
+        """Check if worker process is still running inside VM."""
+        if self._worker_pid is None:
+            return False
+        try:
+            return await self.vm.is_process_running(self._worker_pid)
+        except Exception:
+            return False
+
+    async def cleanup(self) -> None:
+        """Return VM to pool after worker exits."""
+        # Called by the pool owner (FirecrackerWorkerRunner)
+        pass
+
+
+# ── Firecracker Worker Runner ──────────────────────────────────────────────────
+
+
+class FirecrackerWorkerRunner:
+    """Worker runner using Firecracker microVMs (Bundle 7.2).
+
+    Implements the same spawn_worker / kill_worker protocol as all other runners.
+    Workers run inside a Firecracker microVM with bwrap enforcement nested inside.
+    """
+
+    def __init__(
+        self,
+        db: "Database",
+        pool: "VmPool",
+        settings: FirecrackerSettings | None = None,
+        ca_cert_path: str = "",
+        ca_key_path: str = "",
+        ca_cert_pem: str = "",
+        orchestrator_host: str = "172.16.0.1",
+        token_expiry_minutes: int = 15,
+    ) -> None:
+        from .models import FirecrackerSettings as FS
+        self._db = db
+        self._pool = pool
+        self._settings = settings or FS()
+        self._ca_cert_path = ca_cert_path
+        self._ca_key_path = ca_key_path
+        self._ca_cert_pem = ca_cert_pem
+        self._orchestrator_host = orchestrator_host
+        self._token_expiry_minutes = token_expiry_minutes
+        self._active_handles: dict[str, FirecrackerWorkerHandle] = {}
+
+    @staticmethod
+    def now() -> int:
+        return int(time.time())
+
+    async def spawn_worker(
+        self,
+        worker_id: str,
+        bundle_id: str,
+        node_id: str,
+        manifest: CapabilityManifest,
+        worktree_path: str,
+        task_spec: dict[str, Any] | None = None,
+        base_branch: str = "main",
+        target: str = "existing-repo",
+        worker_type: str = "developer",
+    ) -> WorkerSpawnResult:
+        token = _generate_token()
+        token_expires_at = self.now() + (self._token_expiry_minutes * 60)
+
+        # Determine worker binary
+        worker_binary = "studio-review" if worker_type == "review" else "studio-worker"
+
+        # Insert worker row
+        await self._db.execute(
+            "INSERT INTO workers (id, bundle_id, node_id, token, token_expires_at, "
+            "manifest_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (worker_id, bundle_id, node_id, token, token_expires_at,
+             json.dumps(manifest.model_dump()), WorkerState.PENDING, self.now()),
+        )
+        await self._db.execute(
+            "INSERT INTO audit_log (event_type, subject_type, subject_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("worker_spawned", "worker", worker_id,
+             json.dumps({"bundle_id": bundle_id, "node_id": node_id, "runner_type": "firecracker"}),
+             self.now()),
+        )
+        await self._db.conn.commit()
+
+        # Issue mTLS cert and write to worktree
+        cert_pem = ""
+        key_pem = ""
+        if self._ca_cert_path and self._ca_key_path:
+            cert_pem, key_pem = tls_helpers.issue_worker_cert(
+                self._ca_cert_path, self._ca_key_path, worker_id,
+            )
+            mtls_dir = Path(worktree_path) / ".studio" / "mtls"
+            mtls_dir.mkdir(parents=True, exist_ok=True)
+            (mtls_dir / "tls.crt").write_text(cert_pem)
+            (mtls_dir / "tls.key").write_text(key_pem)
+
+        # Acquire a VM from the pool
+        vm = await self._pool.acquire()
+
+        # Pre-bake worktree into VM drive
+        await vm.mount_worktree(worktree_path)
+
+        # Build env vars
+        worker_env = {
+            "STUDIO_WORKER_ID": worker_id,
+            "STUDIO_BUNDLE_ID": bundle_id,
+            "STUDIO_ORCHESTRATOR_ADDR": f"tcp://{self._orchestrator_host}:7811",
+            "STUDIO_WORKER_TOKEN": token,
+            "STUDIO_WORKER_CERT_PATH": str(Path(worktree_path) / ".studio" / "mtls" / "tls.crt"),
+            "STUDIO_WORKER_KEY_PATH": str(Path(worktree_path) / ".studio" / "mtls" / "tls.key"),
+        }
+        if self._ca_cert_pem:
+            worker_env["STUDIO_ORCHESTRATOR_CA_B64"] = _b64_encode(self._ca_cert_pem)
+
+        # Egress proxy via TCP (host reachable from guest at bridge IP)
+        proxy_port = 8888 + hash(worker_id) % 1000
+        worker_env["HTTPS_PROXY"] = f"http://172.16.0.1:{proxy_port}"
+        worker_env["HTTP_PROXY"] = f"http://172.16.0.1:{proxy_port}"
+        worker_env["NO_PROXY"] = "localhost,127.0.0.1,172.16.0.0/24"
+
+        # Spawn per-worker egress proxy on host TCP port
+        proxy_process = await self._spawn_proxy_tcp(worker_id, manifest, proxy_port)
+
+        # Apply resource config (filesystem/network grants; vCPU/memory no-op if match pool)
+        vm_config = capability_to_vm_config(manifest)
+        await self._apply_resource_config(vm, vm_config)
+
+        # Build bwrap args for exec allowlist enforcement inside VM
+        bwrap_args = capability_to_bwrap_args(manifest)
+        use_bwrap = bool(manifest.grants.process.exec)
+
+        # Launch worker inside VM via guest agent
+        worker_pid = await vm.exec(
+            argv=[worker_binary],
+            env=worker_env,
+            use_bwrap=use_bwrap,
+            bwrap_args=bwrap_args if use_bwrap else [],
+        )
+
+        handle = FirecrackerWorkerHandle(vm=vm, worker_id=worker_id, _worker_pid=worker_pid)
+        self._active_handles[worker_id] = handle
+
+        return WorkerSpawnResult(
+            worker_id=worker_id,
+            token=token,
+            node_id=node_id,
+            process=handle,
+            proxy_process=proxy_process,
+        )
+
+    async def kill_worker(
+        self,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle | DockerWorkerHandle | FirecrackerWorkerHandle,
+        worker_id: str = "",
+    ) -> None:
+        """Cancel worker inside VM, stop VM, release back to pool."""
+        if isinstance(process, FirecrackerWorkerHandle):
+            handle = process
+            try:
+                await handle.cancel()
+            except Exception as exc:
+                logger.warning("Firecracker worker cancel failed: %s", exc)
+            # Release VM back to pool
+            handle = self._active_handles.pop(handle.worker_id, handle)
+            try:
+                await handle.vm.extract_worktree_changes()
+            except Exception as exc:
+                logger.warning("Worktree extraction failed: %s", exc)
+            try:
+                await self._pool.release(handle.vm)
+            except Exception as exc:
+                logger.warning("VM pool release failed: %s", exc)
+            return
+
+        # Fallback: if it's a subprocess, delegate to local kill
+        if isinstance(process, asyncio.subprocess.Process):
+            try:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            except ProcessLookupError:
+                pass
+
+    async def close(self) -> None:
+        """Stop the VM pool."""
+        await self._pool.stop()
+
+    # ── Internal helpers ────────────────────────────────────────────────────
+
+    async def _spawn_proxy_tcp(
+        self, worker_id: str, manifest: CapabilityManifest, port: int,
+    ) -> asyncio.subprocess.Process:
+        """Spawn per-worker egress proxy listening on a TCP port (Firecracker runner)."""
+        proxy_env = {
+            **os.environ,
+            "STUDIO_PROXY_TCP_PORT": str(port),
+            "STUDIO_MANIFEST_JSON": json.dumps(manifest.model_dump()),
+        }
+        return await asyncio.create_subprocess_exec(
+            "studio-proxy",
+            env=proxy_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    async def _apply_resource_config(self, vm: "FirecrackerVm", config: VmConfig) -> None:
+        """Apply per-worker resource config to VM (no-op for vCPU/memory after boot)."""
+        if config.vcpus != vm.config.vcpus or config.memory_mb != vm.config.memory_mb:
+            logger.debug(
+                "VM resource config differs from pool default (vcpus=%d mem=%d vs %d/%d); "
+                "using pre-warmed config",
+                config.vcpus, config.memory_mb, vm.config.vcpus, vm.config.memory_mb,
+            )
+
+
+def _b64_encode(data: str) -> str:
+    import base64
+    return base64.b64encode(data.encode()).decode()
+
+
 class RunnerSelector:
     """Selects from multiple enabled runners per-task based on preference and capacity (Bundle 4.4).
 
@@ -2234,10 +2524,11 @@ class RunnerSelector:
         remote_ssh: RemoteSSHWorkerRunner | None = None,
         k8s: K8sJobWorkerRunner | None = None,
         docker: DockerWorkerRunner | None = None,
+        firecracker: FirecrackerWorkerRunner | None = None,
     ) -> None:
         self._db = db
         self._settings = settings
-        self._runners: dict[str, LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner | DockerWorkerRunner] = {}
+        self._runners: dict[str, LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner | DockerWorkerRunner | FirecrackerWorkerRunner] = {}
         if local:
             self._runners["local"] = local
         if remote_ssh:
@@ -2246,14 +2537,24 @@ class RunnerSelector:
             self._runners["k8s"] = k8s
         if docker:
             self._runners["docker"] = docker
+        if firecracker:
+            self._runners["firecracker"] = firecracker
 
     @staticmethod
     def now() -> int:
         return int(time.time())
 
     def _default_preference(self) -> str:
-        """Effective default preference from settings."""
+        """Effective default preference from settings.
+
+        When firecracker is registered, it becomes the default local runner
+        (microVM isolation replaces bubblewrap). The bwrap runner remains
+        available via explicit runner_preference: local.
+        """
         pref = self._settings.default_preference
+        if pref == "any":
+            return "firecracker" if "firecracker" in self._runners else "local"
+        return pref
         if pref == "any":
             return "local"
         return pref
@@ -2385,11 +2686,15 @@ class RunnerSelector:
 
     async def kill_worker(
         self,
-        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle | DockerWorkerHandle,
+        process: asyncio.subprocess.Process | RemoteWorkerHandle | K8sWorkerHandle | DockerWorkerHandle | FirecrackerWorkerHandle,
         worker_id: str = "",
     ) -> None:
         """Dispatch kill to the appropriate runner based on handle type."""
-        if isinstance(process, DockerWorkerHandle):
+        if isinstance(process, FirecrackerWorkerHandle):
+            runner = self._runners.get("firecracker")
+            if runner:
+                await runner.kill_worker(process, worker_id)
+        elif isinstance(process, DockerWorkerHandle):
             runner = self._runners.get("docker")
             if runner:
                 await runner.kill_worker(process, worker_id)

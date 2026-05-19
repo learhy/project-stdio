@@ -26,12 +26,18 @@ const (
 
 // ── Protocol messages ──────────────────────────────────────────────────────────
 
+type BwrapConfig struct {
+	UseBwrap  bool     `json:"use_bwrap"`
+	BwrapArgs []string `json:"bwrap_args"`
+}
+
 type Request struct {
-	Cmd   string            `json:"cmd"`
+	Cmd    string            `json:"cmd"`
 	Argv  []string          `json:"argv,omitempty"`
 	Env   map[string]string `json:"env,omitempty"`
 	PID   int               `json:"pid,omitempty"`
 	Signal string           `json:"signal,omitempty"`
+	Bwrap  *BwrapConfig     `json:"bwrap,omitempty"`
 }
 
 type Response struct {
@@ -86,7 +92,15 @@ func trackProcess(cmd *exec.Cmd) int {
 // ── Command handlers ───────────────────────────────────────────────────────────
 
 func handleExec(req Request) Response {
-	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
+	var cmd *exec.Cmd
+	if req.Bwrap != nil && req.Bwrap.UseBwrap && len(req.Bwrap.BwrapArgs) > 0 {
+		// Wrap command in bubblewrap for exec allowlist enforcement
+		fullArgv := append(req.Bwrap.BwrapArgs, "--")
+		fullArgv = append(fullArgv, req.Argv...)
+		cmd = exec.Command("bwrap", fullArgv...)
+	} else {
+		cmd = exec.Command(req.Argv[0], req.Argv[1:]...)
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin

@@ -1199,8 +1199,14 @@ class DagExecutor:
         return max_attempts
 
     @staticmethod
-    def _drain_worker_pipes(process: asyncio.subprocess.Process, worker_id: str) -> None:
-        """Create background tasks to drain worker subprocess stdout/stderr to the logger."""
+    def _drain_worker_pipes(process: asyncio.subprocess.Process | Any, worker_id: str) -> None:
+        """Create background tasks to drain worker subprocess stdout/stderr to the logger.
+
+        FirecrackerWorkerHandle: no-op (workers send output over TCP RPC, not pipes).
+        """
+        if not isinstance(process, asyncio.subprocess.Process):
+            return
+
         import logging
         _logger = logging.getLogger(__name__)
 
