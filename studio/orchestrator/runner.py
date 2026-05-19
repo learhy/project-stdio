@@ -2417,6 +2417,37 @@ class FirecrackerWorkerRunner:
         bwrap_args = capability_to_bwrap_args(manifest)
         use_bwrap = bool(manifest.grants.process.exec)
 
+        # Bundle 7.4: content-hash exec verification
+        # Read rootfs manifest and filter to exec-allowlist binaries
+        exec_manifest: dict[str, str] = {}
+        rootfs_manifest_path = self._pool._rootfs_path + "-manifest.json"
+        if use_bwrap and os.path.exists(rootfs_manifest_path):
+            try:
+                raw_manifest = json.loads(Path(rootfs_manifest_path).read_text())
+                for grant in manifest.grants.process.exec:
+                    binary_path = grant.binary
+                    if binary_path in raw_manifest:
+                        exec_manifest[binary_path] = raw_manifest[binary_path]
+                        if grant.sha256 and grant.sha256 != raw_manifest[binary_path]:
+                            logger.warning(
+                                "ExecGrant sha256 mismatch for %s: manifest has %s, grant has %s",
+                                binary_path, raw_manifest[binary_path], grant.sha256,
+                            )
+                    elif grant.sha256:
+                        # Grant has an explicit hash, use it even if not in manifest
+                        exec_manifest[binary_path] = grant.sha256
+                    else:
+                        logger.warning(
+                            "ExecGrant %s not found in rootfs manifest — hash verification unavailable",
+                            binary_path,
+                        )
+                if exec_manifest:
+                    worker_env["STUDIO_EXEC_MANIFEST"] = json.dumps(exec_manifest)
+                    worker_env["STUDIO_EXEC_GUARD"] = "/sbin/studio-exec-guard"
+                    logger.info("Content-hash exec verification enabled for %d binaries", len(exec_manifest))
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Failed to load rootfs manifest for exec verification: %s", exc)
+
         # Launch worker inside VM via guest agent
         worker_pid = await vm.exec(
             argv=[worker_binary],

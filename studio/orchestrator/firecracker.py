@@ -52,6 +52,8 @@ class FirecrackerVmConfig:
     tap_bridge: str = "studio-fc-br0"
     ip_range: str = "172.16.0.0/24"
     jailer_enabled: bool = False
+    jailer_chroot_base: str = "/var/lib/studio/firecracker/jailer"
+    seccomp_filter_path: str = ""
     reset_mode: str = "reboot"  # "reboot" | "overlay_only"
     firecracker_binary: str = "firecracker"
 
@@ -108,18 +110,10 @@ class FirecrackerVm:
         self._rootfs_overlay_path = await self._create_overlay_drive()
 
         # Launch firecracker process
-        cmd = [
-            self.config.firecracker_binary,
-            "--api-sock", self._api_path,
-        ]
         if self.config.jailer_enabled:
-            _logger.warning("Firecracker jailer not yet implemented, running without jailer")
-
-        self._process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+            await self._start_jailed()
+        else:
+            await self._start_direct()
 
         # Wait for API socket
         await self._wait_api_socket()
@@ -307,6 +301,57 @@ class FirecrackerVm:
             f"http://unix{self._api_path}/actions",
             json={"action_type": "InstanceStart"},
             timeout=5,
+        )
+
+    def _resolve_jailer_uid_gid(self) -> tuple[int, int]:
+        """Resolve uid/gid for jailer. Uses studio system user if available."""
+        try:
+            import pwd
+            studio_user = pwd.getpwnam("studio")
+            return studio_user.pw_uid, studio_user.pw_gid
+        except (ImportError, KeyError):
+            return os.getuid(), os.getgid()
+
+    async def _start_direct(self) -> None:
+        """Launch firecracker directly (no jailer)."""
+        cmd = [
+            self.config.firecracker_binary,
+            "--api-sock", self._api_path,
+        ]
+        self._process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    async def _start_jailed(self) -> None:
+        """Launch firecracker via the jailer binary (chroot + cgroups + seccomp)."""
+        uid, gid = self._resolve_jailer_uid_gid()
+        jailer_id = str(self.vm_id)
+
+        # Jailer creates chroot at {chroot_base}/firecracker/{id}/root/
+        # The API socket lives inside the chroot at /run/firecracker.socket
+        chroot_api_socket = f"{self.config.jailer_chroot_base}/firecracker/{jailer_id}/root/run/firecracker.socket"
+        self._api_path = chroot_api_socket
+
+        cmd = [
+            "jailer",
+            "--id", jailer_id,
+            "--exec-file", shutil.which(self.config.firecracker_binary) or "/usr/bin/firecracker",
+            "--uid", str(uid),
+            "--gid", str(gid),
+            "--chroot-base-dir", self.config.jailer_chroot_base,
+            "--",
+            "--api-sock", "/run/firecracker.socket",
+        ]
+        if self.config.seccomp_filter_path:
+            cmd.insert(cmd.index("--"), f"--seccomp-filter={self.config.seccomp_filter_path}")
+
+        _logger.info("Starting jailed Firecracker: %s", " ".join(cmd))
+        self._process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
     async def _wait_api_socket(self, timeout: float = 10.0) -> None:
@@ -658,6 +703,29 @@ async def build_rootfs(output_path: str, no_cache: bool = False) -> dict[str, An
             await proc.communicate(input=tar_stdout)
             if proc.returncode != 0:
                 raise RuntimeError("Failed to extract container filesystem")
+
+            # Generate rootfs manifest: hash all binaries for content-hash exec verification
+            manifest: dict[str, str] = {}
+            bin_dirs = ["usr/bin", "usr/local/bin", "usr/sbin", "sbin", "bin"]
+            for bin_dir in bin_dirs:
+                walk_dir = os.path.join(extract_dir, bin_dir)
+                if not os.path.isdir(walk_dir):
+                    continue
+                for fname in os.listdir(walk_dir):
+                    fpath = os.path.join(walk_dir, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    if os.path.islink(fpath):
+                        continue
+                    try:
+                        with open(fpath, "rb") as bf:
+                            file_hash = hashlib.sha256(bf.read()).hexdigest()
+                        manifest[f"/{bin_dir}/{fname}"] = file_hash
+                    except (OSError, PermissionError):
+                        pass
+            manifest_path = output_path + "-manifest.json"
+            Path(manifest_path).write_text(json.dumps(manifest, indent=2))
+            _logger.info("Rootfs manifest written to %s (%d binaries)", manifest_path, len(manifest))
 
             # Calculate directory size
             du = subprocess.run(

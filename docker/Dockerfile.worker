@@ -8,6 +8,7 @@ FROM golang:bookworm AS fc-agent-builder
 WORKDIR /build
 COPY studio/fc-agent/ .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /studio-fc-agent .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /studio-exec-guard ./cmd/exec-guard/
 
 # ── Stage 2: Worker image ──────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -29,6 +30,7 @@ RUN cd /build && uv pip install --system -e ".[worker]"
 
 # Copy fc-agent from builder stage (Firecracker runner)
 COPY --from=fc-agent-builder /studio-fc-agent /sbin/studio-fc-agent
+COPY --from=fc-agent-builder /studio-exec-guard /sbin/studio-exec-guard
 
 # Init script for Firecracker microVM boot
 COPY docker/init.sh /sbin/init
