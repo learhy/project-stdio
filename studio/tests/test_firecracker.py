@@ -649,7 +649,7 @@ from studio.orchestrator.main import _cli_vm_pool_resize
 def test_config_set_get(tmp_path):
     """config set writes, config get reads back, with type coercion."""
     config_path = str(tmp_path / "settings.json")
-    with patch.dict("os.environ", {"STUDIO_CONFIG_FILE": config_path}):
+    with patch.dict("os.environ", {"STUDIO_SETTINGS_PATH": config_path}):
         assert cmd_config_set("test.key", "hello") == 0
         assert cmd_config_set("test.bool_true", "true") == 0
         assert cmd_config_set("test.bool_false", "false") == 0
@@ -664,7 +664,7 @@ def test_config_set_get(tmp_path):
 
 def test_config_get_missing_key(capsys):
     """config get on missing key returns error."""
-    with patch.dict("os.environ", {"STUDIO_CONFIG_FILE": "/nonexistent/settings.json"}):
+    with patch.dict("os.environ", {"STUDIO_SETTINGS_PATH": "/nonexistent/settings.json"}):
         exit_code = cmd_config_get("no.such.key")
         assert exit_code == 1
 

@@ -118,27 +118,21 @@ def _resolve_socket_path() -> str | None:
     return get_socket_path()
 
 
-def _get_config_path() -> str:
-    """Resolve settings.json path using same logic as installer."""
-    env_path = os.environ.get("STUDIO_CONFIG_FILE")
-    if env_path:
-        return env_path
-    system_path = "/etc/studio/settings.json"
-    if os.path.exists(system_path):
-        return system_path
-    return os.path.expanduser("~/.config/studio/settings.json")
-
-
 def _read_config() -> dict[str, Any]:
+    from .settings import get_settings_path as _gsp
     try:
-        with open(_get_config_path()) as f:
+        path = _gsp()
+        if path is None:
+            return {}
+        with open(path) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
 def _write_config(data: dict[str, Any]) -> None:
-    path = _get_config_path()
+    from .settings import get_settings_path
+    path = get_settings_path() or os.path.expanduser("~/.config/studio/settings.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)

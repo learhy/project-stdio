@@ -2856,13 +2856,16 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # Load settings from file if present
-    settings_file = os.path.join("memory", "settings.json")
-    if os.path.exists(settings_file):
-        with open(settings_file) as f:
+    # Load settings from file if present (auto-detects path)
+    from .settings import get_settings_path
+    settings_path = get_settings_path()
+    if settings_path:
+        logging.getLogger(__name__).info("Loading settings from %s", settings_path)
+        with open(settings_path) as f:
             file_settings = json.loads(f.read())
         settings = Settings(**file_settings)
     else:
+        logging.getLogger(__name__).info("No settings.json found — using defaults")
         settings = Settings()
 
     # Allow environment variable overrides for testing.
