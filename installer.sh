@@ -378,43 +378,61 @@ check_bubblewrap() {
     if cmd_exists bwrap; then
         dep_ok
         info "  $(bwrap --version 2>/dev/null || true)"
+        return
+    fi
+
+    dep_install
+    if should_skip "install bubblewrap"; then
+        color_warn "bubblewrap not installed — worker isolation will not be available"
+        return
+    fi
+
+    local distro
+    distro="$(detect_distro)"
+
+    local install_ok=false
+    case "$distro" in
+        debian)
+            if [[ "$IS_ROOT" == "true" ]]; then
+                apt-get update -qq && apt-get install -y -qq bubblewrap && install_ok=true
+            elif sudo -n true 2>/dev/null; then
+                sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap && install_ok=true
+            else
+                color_err "bubblewrap requires root. Ask your sysadmin:"
+                color_err "  sudo apt-get install bubblewrap"
+            fi ;;
+        fedora)
+            if [[ "$IS_ROOT" == "true" ]]; then
+                dnf install -y bubblewrap && install_ok=true
+            elif sudo -n true 2>/dev/null; then
+                sudo dnf install -y bubblewrap && install_ok=true
+            else
+                color_err "bubblewrap requires root. Ask your sysadmin:"
+                color_err "  sudo dnf install bubblewrap"
+            fi ;;
+        arch)
+            if [[ "$IS_ROOT" == "true" ]]; then
+                pacman -S --noconfirm bubblewrap && install_ok=true
+            elif sudo -n true 2>/dev/null; then
+                sudo pacman -S --noconfirm bubblewrap && install_ok=true
+            else
+                color_err "bubblewrap requires root. Ask your sysadmin:"
+                color_err "  sudo pacman -S bubblewrap"
+            fi ;;
+        *)
+            color_warn "Unknown package manager. Install bubblewrap manually:"
+            color_warn "  Debian/Ubuntu:  apt install bubblewrap"
+            color_warn "  Fedora:         dnf install bubblewrap"
+            color_warn "  Arch:           pacman -S bubblewrap"
+            ;;
+    esac
+
+    if cmd_exists bwrap; then
+        color_ok "bubblewrap: installed"
+    elif [[ "$install_ok" == "true" && "$DRY_RUN" != "true" ]]; then
+        color_warn "bubblewrap installed but not found on PATH — worker isolation will not work"
     else
-        dep_install
-        local distro
-        distro="$(detect_distro)"
-        if ! should_skip "install bubblewrap via $distro"; then
-            case "$distro" in
-                debian)
-                    if [[ "$IS_ROOT" == "true" ]]; then
-                        apt-get update -qq && apt-get install -y -qq bubblewrap
-                    else
-                        sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
-                    fi ;;
-                fedora)
-                    if [[ "$IS_ROOT" == "true" ]]; then
-                        dnf install -y bubblewrap
-                    else
-                        sudo dnf install -y bubblewrap
-                    fi ;;
-                arch)
-                    if [[ "$IS_ROOT" == "true" ]]; then
-                        pacman -S --noconfirm bubblewrap
-                    else
-                        sudo pacman -S --noconfirm bubblewrap
-                    fi ;;
-                *)
-                    color_warn "Unknown package manager. Install bubblewrap manually:
-  Debian/Ubuntu:  apt install bubblewrap
-  Fedora:         dnf install bubblewrap
-  Arch:           pacman -S bubblewrap"
-                    ;;
-            esac
-        fi
-        if cmd_exists bwrap; then
-            color_ok "bubblewrap: installed"
-        else
-            color_warn "bubblewrap may not have installed correctly — worker isolation will not work"
-        fi
+        color_warn "bubblewrap not available — worker isolation will not be available"
     fi
 }
 
@@ -423,18 +441,27 @@ check_opencode() {
     if cmd_exists opencode; then
         dep_ok
         info "  $(opencode --version 2>/dev/null || true)"
-    else
-        dep_install
-        if ! should_skip "install opencode"; then
-            curl -fsSL https://opencode.ai/install | sh
-            export PATH="${HOME}/.local/bin:${PATH}"
-            if ! cmd_exists opencode; then
-                color_warn "opencode installed but not found on PATH — some worker features may not work"
-            fi
-        fi
+        return
+    fi
+
+    dep_install
+    if should_skip "install opencode"; then
+        return
+    fi
+
+    # Must pipe to bash, not sh — the install script uses [[ bashisms
+    # that fail silently under dash (Debian/Ubuntu default /bin/sh).
+    if curl -fsSL https://opencode.ai/install | bash; then
+        export PATH="${HOME}/.local/bin:${PATH}"
         if cmd_exists opencode; then
             color_ok "opencode: installed"
+        else
+            color_warn "opencode install completed but binary not found on PATH"
+            color_warn "Look in ~/.local/bin or ~/.cargo/bin and ensure it's on your PATH"
         fi
+    else
+        color_warn "opencode install failed — developer worker features will not be available"
+        color_warn "Install manually: https://opencode.ai/install"
     fi
 }
 

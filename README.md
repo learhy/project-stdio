@@ -37,8 +37,16 @@ Most agent tools hand a task to an LLM and hope for the best. Studio puts struct
 ### One-liner
 
 ```bash
+# Safer: download + inspect before running
+curl -fsSL https://raw.githubusercontent.com/learhy/project-stdio/main/installer.sh > /tmp/studio-installer.sh
+less /tmp/studio-installer.sh
+bash /tmp/studio-installer.sh
+
+# One-liner (convenient, less secure):
 curl -fsSL https://raw.githubusercontent.com/learhy/project-stdio/main/installer.sh | bash
 ```
+
+The download-then-run pattern respects the script's shebang and lets you inspect before executing.
 
 The installer checks prerequisites before touching anything, installs what's missing, prompts for your Ollama Cloud API key and optional GitHub App credentials, and starts the orchestrator under systemd.
 
