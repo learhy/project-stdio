@@ -713,6 +713,19 @@ create_directories() {
         fi
     fi
 
+    # Write socket-path hint so the CLI can auto-detect
+    if ! should_skip "write socket-path hint"; then
+        if [[ "$INSTALL_MODE" == "system" ]]; then
+            mkdir -p /run/studio
+            echo "/run/studio/orchestrator.sock" > /run/studio/.socket-path
+            chown studio:studio /run/studio/.socket-path 2>/dev/null || true
+        else
+            mkdir -p "$DATA_DIR"
+            echo "${DATA_DIR}/orchestrator.sock" > "${DATA_DIR}/.socket-path"
+        fi
+        info "  Socket path hint written"
+    fi
+
     color_ok "Directories created"
 }
 

@@ -22,8 +22,22 @@ from .display import (
 )
 
 
-async def _send_rpc(socket_path: str, method: str, params: dict[str, Any] | None = None) -> dict:
+async def _send_rpc(socket_path: str | None, method: str, params: dict[str, Any] | None = None) -> dict:
     """Send a JSON-RPC request over the Unix socket and return the result."""
+    if socket_path is None:
+        paths_tried = _socket_paths_to_try()
+        msg = "Cannot connect to orchestrator.\n\n"
+        msg += "Tried the following paths but none exist:\n"
+        msg += "\n".join(f"  - {p}" for p in paths_tried)
+        msg += "\n\nIf the orchestrator is running, find its socket with:\n"
+        msg += "  systemctl status studio-orchestrator\n"
+        msg += "  ls /run/studio/ ~/.local/share/studio/ /tmp/studio* 2>/dev/null\n"
+        msg += "\nThen run: export STUDIO_SOCKET_PATH=<socket-path>\n"
+        msg += "\nTo start the orchestrator:\n"
+        msg += "  systemctl start studio-orchestrator (system install)\n"
+        msg += "  studio-orchestrator &              (manual)"
+        return {"error": {"code": -1, "message": msg}}
+
     try:
         reader, writer = await asyncio.open_unix_connection(socket_path, limit=2**20)
     except (FileNotFoundError, ConnectionRefusedError):
@@ -54,8 +68,54 @@ async def _send_rpc(socket_path: str, method: str, params: dict[str, Any] | None
     return json.loads(line.decode("utf-8"))
 
 
-def _get_socket_path() -> str:
-    return os.environ.get("STUDIO_SOCKET_PATH", "/tmp/studio.sock")
+def _socket_paths_to_try() -> list[str]:
+    """Return ordered list of socket paths to probe."""
+    paths: list[str] = []
+    # Well-known location files (written by installer)
+    system_socket_file = "/run/studio/.socket-path"
+    user_socket_file = os.path.expanduser("~/.local/share/studio/.socket-path")
+    for loc_file in (system_socket_file, user_socket_file):
+        try:
+            with open(loc_file) as f:
+                p = f.read().strip()
+                if p and os.path.exists(p):
+                    paths.append(p)
+        except (FileNotFoundError, PermissionError):
+            pass
+    # Standard locations
+    paths.extend([
+        "/run/studio/orchestrator.sock",                       # system install
+        os.path.expanduser("~/.local/share/studio/orchestrator.sock"),  # user install
+        "/tmp/studio.sock",                                     # dev fallback
+    ])
+    return paths
+
+
+def get_socket_path() -> str | None:
+    """Auto-detect orchestrator socket path. Returns None if none found."""
+    env_path = os.environ.get("STUDIO_SOCKET_PATH")
+    if env_path:
+        return env_path
+
+    for p in _socket_paths_to_try():
+        if os.path.exists(p):
+            return p
+    return None
+
+
+_SOCKET_ARG_PATH: str | None = None
+
+
+def _set_socket_arg(path: str | None) -> None:
+    global _SOCKET_ARG_PATH
+    _SOCKET_ARG_PATH = path
+
+
+def _resolve_socket_path() -> str | None:
+    """Return the socket path to use, respecting --socket, env, and auto-detect."""
+    if _SOCKET_ARG_PATH:
+        return _SOCKET_ARG_PATH
+    return get_socket_path()
 
 
 def _get_config_path() -> str:
@@ -125,7 +185,7 @@ async def cmd_submit(path: str) -> int:
         print(f"Error reading submission file: {e}", file=sys.stderr)
         return 1
 
-    resp = await _send_rpc(_get_socket_path(), "studio.submit",
+    resp = await _send_rpc(_resolve_socket_path(), "studio.submit",
                            {"submission": submission})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
@@ -138,7 +198,7 @@ async def cmd_submit(path: str) -> int:
 
 async def cmd_approve(bundle_id: str) -> int:
     """Approve a bundle in PROPOSED state."""
-    resp = await _send_rpc(_get_socket_path(), "studio.approve",
+    resp = await _send_rpc(_resolve_socket_path(), "studio.approve",
                            {"bundle_id": bundle_id})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
@@ -150,7 +210,7 @@ async def cmd_approve(bundle_id: str) -> int:
 
 async def cmd_reject(bundle_id: str, reason: str = "") -> int:
     """Reject a bundle in PROPOSED state."""
-    resp = await _send_rpc(_get_socket_path(), "studio.reject",
+    resp = await _send_rpc(_resolve_socket_path(), "studio.reject",
                            {"bundle_id": bundle_id, "reason": reason or "rejected via CLI"})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
@@ -168,7 +228,7 @@ async def cmd_list(state: str | None = None, tier: str | None = None, json_outpu
     if tier:
         params["tier"] = tier
 
-    resp = await _send_rpc(_get_socket_path(), "studio.list", params)
+    resp = await _send_rpc(_resolve_socket_path(), "studio.list", params)
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -183,7 +243,7 @@ async def cmd_list(state: str | None = None, tier: str | None = None, json_outpu
 
 async def cmd_show(bundle_id: str, verbose: bool = False, json_output: bool = False) -> int:
     """Show bundle detail."""
-    resp = await _send_rpc(_get_socket_path(), "studio.show",
+    resp = await _send_rpc(_resolve_socket_path(), "studio.show",
                            {"bundle_id": bundle_id})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
@@ -211,7 +271,7 @@ async def cmd_show(bundle_id: str, verbose: bool = False, json_output: bool = Fa
 
 async def cmd_show_worker(worker_id: str) -> int:
     """Show worker detail."""
-    resp = await _send_rpc(_get_socket_path(), "studio.show_worker",
+    resp = await _send_rpc(_resolve_socket_path(), "studio.show_worker",
                            {"worker_id": worker_id})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
@@ -228,7 +288,7 @@ async def cmd_show_worker(worker_id: str) -> int:
 
 async def cmd_kill(bundle_id: str) -> int:
     """Kill a running bundle."""
-    resp = await _send_rpc(_get_socket_path(), "studio.kill",
+    resp = await _send_rpc(_resolve_socket_path(), "studio.kill",
                            {"bundle_id": bundle_id})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
@@ -243,7 +303,7 @@ async def cmd_kill(bundle_id: str) -> int:
 
 async def cmd_recall(bundle_id: str) -> int:
     """Recall a COMPLETE bundle within the 48h window."""
-    resp = await _send_rpc(_get_socket_path(), "studio.recall",
+    resp = await _send_rpc(_resolve_socket_path(), "studio.recall",
                            {"bundle_id": bundle_id})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
@@ -260,7 +320,7 @@ async def cmd_recall(bundle_id: str) -> int:
 
 async def cmd_audit(bundle_id: str) -> int:
     """Audit capability grants and usage for a bundle (Bundle 3.4)."""
-    resp = await _send_rpc(_get_socket_path(), "studio.audit",
+    resp = await _send_rpc(_resolve_socket_path(), "studio.audit",
                            {"bundle_id": bundle_id})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
@@ -320,7 +380,7 @@ async def cmd_audit(bundle_id: str) -> int:
 
 async def cmd_rotate_secret(name: str) -> int:
     """Rotate a secret (Bundle 3.4)."""
-    resp = await _send_rpc(_get_socket_path(), "studio.rotate_secret",
+    resp = await _send_rpc(_resolve_socket_path(), "studio.rotate_secret",
                            {"name": name})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
@@ -342,7 +402,7 @@ async def cmd_rotate_secret(name: str) -> int:
 
 async def cmd_health() -> int:
     """Show orchestrator health dashboard."""
-    resp = await _send_rpc(_get_socket_path(), "studio.health", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.health", {})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -354,7 +414,7 @@ async def cmd_health() -> int:
 
 async def cmd_status() -> int:
     """Show orchestrator status."""
-    resp = await _send_rpc(_get_socket_path(), "studio.status", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.status", {})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -372,7 +432,7 @@ async def cmd_status() -> int:
 
 async def cmd_fleet_status() -> int:
     """Show remote fleet host status (Bundle 4.2)."""
-    resp = await _send_rpc(_get_socket_path(), "studio.fleet_status", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.fleet_status", {})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -404,7 +464,7 @@ async def cmd_fleet_add(name: str, addr: str, args) -> int:
         "capabilities": getattr(args, "capabilities", []),
         "max_concurrent_workers": getattr(args, "max_workers", 4),
     }
-    resp = await _send_rpc(_get_socket_path(), "studio.fleet_add", params)
+    resp = await _send_rpc(_resolve_socket_path(), "studio.fleet_add", params)
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         result = resp.get("error", {})
@@ -420,7 +480,7 @@ async def cmd_fleet_add(name: str, addr: str, args) -> int:
 
 async def cmd_fleet_remove(name: str) -> int:
     """Remove a host from the fleet registry (Bundle 4.2)."""
-    resp = await _send_rpc(_get_socket_path(), "studio.fleet_remove", {"name": name})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.fleet_remove", {"name": name})
     if "error" in resp:
         result = resp.get("error", {})
         if isinstance(result, dict) and "message" in result:
@@ -435,7 +495,7 @@ async def cmd_fleet_remove(name: str) -> int:
 
 async def cmd_k8s_status() -> int:
     """Show active Kubernetes Jobs for workers (Bundle 4.3)."""
-    resp = await _send_rpc(_get_socket_path(), "studio.k8s_status", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.k8s_status", {})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -461,7 +521,7 @@ async def cmd_k8s_status() -> int:
 
 async def cmd_calibration_report() -> int:
     """Print calibration report from memory/calibration/."""
-    resp = await _send_rpc(_get_socket_path(), "studio.calibration_report", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.calibration_report", {})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -472,7 +532,7 @@ async def cmd_calibration_report() -> int:
 
 async def cmd_docker_status() -> int:
     """Show running Docker worker containers (Bundle 4.5)."""
-    resp = await _send_rpc(_get_socket_path(), "studio.docker_status", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.docker_status", {})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -498,7 +558,7 @@ async def cmd_docker_status() -> int:
 
 async def cmd_docker_images() -> int:
     """Show worker and proxy Docker images (Bundle 4.5)."""
-    resp = await _send_rpc(_get_socket_path(), "studio.docker_images", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.docker_images", {})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -568,7 +628,7 @@ async def cmd_download_kernel(output: str, version: str = "v1.7") -> int:
 
 async def cmd_vm_status() -> int:
     """Show Firecracker VM pool status."""
-    resp = await _send_rpc(_get_socket_path(), "studio.vm_status", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.vm_status", {})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -593,7 +653,7 @@ async def cmd_vm_status() -> int:
 
 async def cmd_check_rootfs() -> int:
     """Check if Firecracker worker rootfs is up to date."""
-    resp = await _send_rpc(_get_socket_path(), "studio.check_rootfs", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.check_rootfs", {})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -617,7 +677,7 @@ async def cmd_check_rootfs() -> int:
 
 async def cmd_vm_pool_resize(size: int) -> int:
     """Resize the Firecracker VM pool at runtime."""
-    resp = await _send_rpc(_get_socket_path(), "studio.vm_pool_resize", {"size": size})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.vm_pool_resize", {"size": size})
     if "error" in resp:
         print(f"Error: {resp['error']['message']}", file=sys.stderr)
         return 1
@@ -666,7 +726,7 @@ def cmd_config_set(key: str, value: str) -> int:
 
 async def cmd_version() -> int:
     """Show installed version and whether running orchestrator is current."""
-    resp = await _send_rpc(_get_socket_path(), "studio.version", {})
+    resp = await _send_rpc(_resolve_socket_path(), "studio.version", {})
     if "error" in resp:
         r = resp["error"]["message"]
         if "not running" in r.lower() or "no socket" in r.lower():
@@ -690,6 +750,7 @@ async def cmd_version() -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="studio", description="Studio kernel CLI")
+    parser.add_argument("--socket", "-S", help="Orchestrator Unix socket path (auto-detected if omitted)")
     parser.add_argument("--version", "-V", action="store_true", help="Show installed version")
     sub = parser.add_subparsers(dest="command")
 
@@ -807,6 +868,9 @@ def main() -> None:
     p_fremove.add_argument("name", help="Host name to remove")
 
     args = parser.parse_args()
+
+    if args.socket:
+        _set_socket_arg(args.socket)
 
     if args.version:
         loop = asyncio.new_event_loop()
