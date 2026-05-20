@@ -94,10 +94,10 @@ yn_prompt() {
     fi
 
     if [[ "$default" == "y" ]]; then
-        read -r -p "       ${prompt} [Y/n]: " yn
+        read -r -p "       ${prompt} [Y/n]: " yn </dev/tty
         [[ "${yn:-}" =~ ^[Nn]$ ]] && return 1 || return 0
     else
-        read -r -p "       ${prompt} [y/N]: " yn
+        read -r -p "       ${prompt} [y/N]: " yn </dev/tty
         [[ "${yn:-}" =~ ^[Yy]$ ]] && return 0 || return 1
     fi
 }
@@ -113,10 +113,10 @@ prompt_value() {
     fi
 
     if [[ -n "$default" ]]; then
-        read -r -p "       ${prompt} [${default}]: " val
+        read -r -p "       ${prompt} [${default}]: " val </dev/tty
         echo "${val:-$default}"
     else
-        read -r -p "       ${prompt}: " val
+        read -r -p "       ${prompt}: " val </dev/tty
         echo "$val"
     fi
 }
@@ -920,7 +920,7 @@ configure_api_key() {
     if [[ "$IS_TTY" == "true" ]]; then
         info "Enter your Ollama Cloud API key (or set OLLAMA_CLOUD_API_KEY env var)"
         local api_key
-        read -r -p "       API Key: " api_key
+        read -r -p "       API Key: " api_key </dev/tty
         if [[ -n "$api_key" ]]; then
             write_json_field "$CONFIG_FILE" "ollama_cloud.api_key" "$api_key"
             color_ok "API key written to config"
@@ -960,7 +960,7 @@ configure_github() {
     fi
 
     local app_id
-    read -r -p "       GitHub App ID: " app_id
+    read -r -p "       GitHub App ID: " app_id </dev/tty
     if [[ -z "$app_id" ]]; then
         color_warn "GitHub App skipped"
         return
@@ -970,11 +970,11 @@ configure_github() {
     write_json_field "$CONFIG_FILE" "github.enabled" "true"
 
     local install_id
-    read -r -p "       GitHub Installation ID: " install_id
+    read -r -p "       GitHub Installation ID: " install_id </dev/tty
     write_json_field "$CONFIG_FILE" "github.installation_id" "$install_id"
 
     local key_path
-    read -r -p "       GitHub App private key path (.pem): " key_path
+    read -r -p "       GitHub App private key path (.pem): " key_path </dev/tty
     write_json_field "$CONFIG_FILE" "github.private_key_path" "$key_path"
 
     color_ok "GitHub App configured"
