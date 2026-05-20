@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS workers (
   runner_type TEXT,
   questions_asked INTEGER NOT NULL DEFAULT 0,
   last_reviewed_at INTEGER,
-  tokens_used INTEGER NOT NULL DEFAULT 0
+  tokens_used INTEGER NOT NULL DEFAULT 0,
+  worker_timeout_seconds INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS capabilities (

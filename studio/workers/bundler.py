@@ -382,6 +382,9 @@ def _call_llm(system_prompt: str, user_message: str) -> dict:
 
 def _extract_json(text: str) -> dict:
     """Pull a JSON object out of LLM response text, handling markdown fences."""
+    # Debug: log raw text excerpt on parse failure for diagnosis
+    text_excerpt = text[:500] if text else "(empty)"
+
     # Try parsing the whole text first
     try:
         return json.loads(text)
@@ -422,6 +425,7 @@ def _extract_json(text: str) -> dict:
     except (ValueError, json.JSONDecodeError):
         pass
 
+    print(f"[_extract_json] Failed to parse LLM response. Raw excerpt: {text_excerpt}", file=sys.stderr)
     return {"parse_error": True, "raw_text": text[:1000]}
 
 
