@@ -4,6 +4,9 @@ Documentation=https://github.com/learhy/studio
 After=network.target
 
 [Service]
+# Security model: orchestrator runs as an unprivileged user with restricted filesystem access.
+# Worker isolation is provided by bubblewrap/Firecracker at the worker level, not here.
+# See docs/security.md for the full threat model.
 Type=simple
 User=studio
 Group=studio
@@ -21,9 +24,11 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX
+# AF_INET/AF_INET6 required for Ollama Cloud, GitHub API, and remote worker TCP connections
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictRealtime=yes
-MemoryDenyWriteExecute=yes
+# Disabled: incompatible with Python runtime (requires W+X memory for bytecode compilation)
+MemoryDenyWriteExecute=no
 LockPersonality=yes
 
 # Runtime directories

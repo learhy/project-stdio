@@ -826,7 +826,7 @@ render_unit() {
             -e "s|/etc/studio|${CONFIG_DIR}|g" \
             "$src" > "$dst"
     elif [[ "$INSTALL_MODE" == "user" ]]; then
-        # User install: remove User=/Group=, adjust paths, add XDG env vars
+        # User install: remove User=/Group=, adjust paths, switch target
         sed \
             -e "s|/usr/bin/studio|${exec_prefix}/studio|g" \
             -e "s|/var/lib/studio|${DATA_DIR}|g" \
@@ -834,6 +834,7 @@ render_unit() {
             -e "s|/etc/studio|${CONFIG_DIR}|g" \
             -e '/^User=/d' \
             -e '/^Group=/d' \
+            -e 's/^WantedBy=multi-user.target/WantedBy=default.target/' \
             "$src" > "$dst"
     fi
 }
