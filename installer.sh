@@ -802,6 +802,7 @@ install_default_config() {
             if [[ "$INSTALL_MODE" == "system" ]]; then
                 chown studio:studio "$CONFIG_FILE"
             fi
+            write_json_field "$CONFIG_FILE" "orchestrator.memory_root" "${DATA_DIR}/memory"
             color_ok "Default config: $CONFIG_FILE"
         else
             color_warn "No settings.json.example found — skipping config"
@@ -902,7 +903,12 @@ parts = '$key'.split('.')
 d = data
 for p in parts[:-1]:
     d = d.setdefault(p, {})
-d[parts[-1]] = '$value'
+v = '$value'
+try:
+    v = json.loads(v)
+except (json.JSONDecodeError, TypeError):
+    pass
+d[parts[-1]] = v
 with open('$file', 'w') as f:
     json.dump(data, f, indent=2)
 " 2>/dev/null || color_warn "Could not set $key in $file"

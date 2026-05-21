@@ -28,7 +28,7 @@
     "db_path": "/var/lib/studio/state.db",
     "socket_permissions": "0660",
     "socket_owner": "studio:studio",
-    "memory_root": "memory/",
+    "memory_root": "/var/lib/studio/memory",
     "http_port": 7810
   },
   "remote_workers": {

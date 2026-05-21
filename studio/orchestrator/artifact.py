@@ -610,10 +610,12 @@ class SecretStore:
     configured env var. Rotation writes to the file store.
     """
 
-    def __init__(self, entries: list[dict], memory_root: str = "memory/") -> None:
+    def __init__(self, entries: list, memory_root: str = "memory/") -> None:
         self._entries: dict[str, dict] = {}
         self._store_dir = Path(memory_root) / "secrets"
         for entry in entries:
+            if not isinstance(entry, dict):
+                entry = entry.model_dump()
             name = entry.get("name", "")
             env_var = entry.get("env_var", "")
             if name:
