@@ -1254,7 +1254,7 @@ check_prerequisites() {
         log_ok "Architecture: x86_64"
     fi
 
-    # Python 3.12+ check
+    # Python 3.12+ check — warn if missing but defer install to check_python()
     local python_cmd=""
     for cmd in python3.12 python3.13 python3; do
         if command -v "$cmd" &>/dev/null; then
@@ -1271,10 +1271,7 @@ check_prerequisites() {
         fi
     done
     if [[ -z "$python_cmd" ]]; then
-        log_error "Python 3.12+ required but not found."
-        log_error "Install: sudo apt install python3.12 python3.12-venv  (Debian/Ubuntu)"
-        log_error "         sudo dnf install python3.12                   (RHEL/Fedora)"
-        ((failed++))
+        log_warning "Python 3.12+ not found — will be installed in the next step"
     fi
 
     # Git check
