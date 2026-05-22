@@ -827,7 +827,7 @@ render_unit() {
             -e "s|/etc/studio|${CONFIG_DIR}|g" \
             "$src" > "$dst"
     elif [[ "$INSTALL_MODE" == "user" ]]; then
-        # User install: remove User=/Group=, adjust paths, switch target
+        # User install: remove User=/Group= and hardening directives unsupported by user services
         sed \
             -e "s|/usr/bin/studio|${exec_prefix}/studio|g" \
             -e "s|/var/lib/studio|${DATA_DIR}|g" \
@@ -835,6 +835,9 @@ render_unit() {
             -e "s|/etc/studio|${CONFIG_DIR}|g" \
             -e '/^User=/d' \
             -e '/^Group=/d' \
+            -e '/^ProtectSystem=/d' \
+            -e '/^ProtectHome=/d' \
+            -e '/^PrivateDevices=/d' \
             -e 's/^WantedBy=multi-user.target/WantedBy=default.target/' \
             "$src" > "$dst"
     fi
@@ -890,6 +893,7 @@ write_json_field() {
     local file="$1"
     local key="$2"
     local value="$3"
+    local type="${4:-auto}"  # auto | string
 
     # Use python3 for reliable JSON editing
     python3 -c "
@@ -904,10 +908,11 @@ d = data
 for p in parts[:-1]:
     d = d.setdefault(p, {})
 v = '$value'
-try:
-    v = json.loads(v)
-except (json.JSONDecodeError, TypeError):
-    pass
+if '$type' != 'string':
+    try:
+        v = json.loads(v)
+    except (json.JSONDecodeError, TypeError):
+        pass
 d[parts[-1]] = v
 with open('$file', 'w') as f:
     json.dump(data, f, indent=2)
@@ -949,8 +954,8 @@ configure_github() {
     local env_key_path="${STUDIO_GITHUB_KEY_PATH:-}"
 
     if [[ -n "$env_app_id" && -n "$env_install_id" && -n "$env_key_path" ]]; then
-        write_json_field "$CONFIG_FILE" "github.app_id" "$env_app_id"
-        write_json_field "$CONFIG_FILE" "github.installation_id" "$env_install_id"
+        write_json_field "$CONFIG_FILE" "github.app_id" "$env_app_id" string
+        write_json_field "$CONFIG_FILE" "github.installation_id" "$env_install_id" string
         write_json_field "$CONFIG_FILE" "github.private_key_path" "$env_key_path"
         write_json_field "$CONFIG_FILE" "github.enabled" "true"
         color_ok "GitHub App configured from environment"
@@ -973,12 +978,12 @@ configure_github() {
         return
     fi
 
-    write_json_field "$CONFIG_FILE" "github.app_id" "$app_id"
+    write_json_field "$CONFIG_FILE" "github.app_id" "$app_id" string
     write_json_field "$CONFIG_FILE" "github.enabled" "true"
 
     local install_id
     read -r -p "       GitHub Installation ID: " install_id </dev/tty
-    write_json_field "$CONFIG_FILE" "github.installation_id" "$install_id"
+    write_json_field "$CONFIG_FILE" "github.installation_id" "$install_id" string
 
     local key_path
     read -r -p "       GitHub App private key path (.pem): " key_path </dev/tty

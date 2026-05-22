@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -673,6 +673,13 @@ class GitHubSettings(BaseModel):
     poll_interval_seconds: int = 60
     owner: str = ""
     repo: str = ""
+
+    @field_validator("app_id", "installation_id", mode="before")
+    @classmethod
+    def _coerce_id_to_str(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)
 
 
 class ApprovalSettings(BaseModel):
