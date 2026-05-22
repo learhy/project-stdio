@@ -85,7 +85,8 @@ def _socket_paths_to_try() -> list[str]:
     # Standard locations
     paths.extend([
         "/run/studio/orchestrator.sock",                       # system install
-        os.path.expanduser("~/.local/share/studio/orchestrator.sock"),  # user install
+        f"/run/user/{os.getuid()}/studio/orchestrator.sock",  # user-level systemd
+        os.path.expanduser("~/.local/share/studio/orchestrator.sock"),  # user install (fallback)
         "/tmp/studio.sock",                                     # dev fallback
     ])
     return paths

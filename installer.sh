@@ -720,8 +720,9 @@ create_directories() {
             echo "/run/studio/orchestrator.sock" > /run/studio/.socket-path
             chown studio:studio /run/studio/.socket-path 2>/dev/null || true
         else
+            local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
             mkdir -p "$DATA_DIR"
-            echo "${DATA_DIR}/orchestrator.sock" > "${DATA_DIR}/.socket-path"
+            echo "${runtime_dir}/studio/orchestrator.sock" > "${DATA_DIR}/.socket-path"
         fi
         info "  Socket path hint written"
     fi
