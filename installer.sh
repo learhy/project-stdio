@@ -303,30 +303,82 @@ dep_missing() { echo -e "${RED}missing - manual install required${NC}"; }
 
 check_python() {
     dep_status "python3 >= 3.12"
-    if ! cmd_exists python3; then
-        dep_missing
-        die "python3 not found. Install Python 3.12+ and retry:
-  Debian/Ubuntu:  apt install python3.12
-  Fedora:         dnf install python3.12
-  Arch:           pacman -S python"
+
+    local pyver=""
+    if cmd_exists python3; then
+        pyver="$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')"
+        local major minor
+        major="${pyver%%.*}"
+        minor="${pyver##*.}"
+        if (( major >= 3 && minor >= 12 )); then
+            dep_ok
+            info "  version: $pyver"
+            return
+        fi
     fi
 
-    local pyver
+    # Python 3.12+ not available
+    dep_missing
+
+    local current="${pyver:-none}"
+    color_warn "Python 3.12+ not found. Current version: ${current}"
+    info "Studio requires Python 3.12 or newer."
+    echo ""
+
+    # Determine OS packaging
+    if cmd_exists apt-get; then
+        # Debian/Ubuntu — can auto-install via deadsnakes
+        if [[ "$IS_TTY" != "true" ]]; then
+            info "Non-interactive mode: installing Python 3.12 via deadsnakes PPA"
+        else
+            info "On Ubuntu 22.04/20.04, this can be installed via the deadsnakes PPA:"
+            info "  add-apt-repository ppa:deadsnakes/ppa"
+            info "  apt-get install python3.12 python3.12-venv"
+            echo ""
+            local answer
+            read -r -p "  Install Python 3.12 now? [Y/n]: " answer </dev/tty
+            case "$answer" in
+                [Nn]*) info "Python 3.12 skipped — install manually and re-run."; exit 0 ;;
+            esac
+        fi
+
+        if ! should_skip "install python3.12 via deadsnakes PPA"; then
+            if ! cmd_exists add-apt-repository; then
+                if [[ "$IS_ROOT" == "true" ]]; then
+                    apt-get update -qq && apt-get install -y -qq software-properties-common
+                else
+                    sudo apt-get update -qq && sudo apt-get install -y -qq software-properties-common
+                fi
+            fi
+            sudo add-apt-repository -y ppa:deadsnakes/ppa
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3.12 python3.12-venv
+            color_ok "Python 3.12 installed via deadsnakes PPA"
+        fi
+    else
+        # RHEL/Fedora/etc — print instructions, no auto-install
+        if cmd_exists dnf; then
+            info "Install Python 3.12+ manually:"
+            info "  sudo dnf install python3.12"
+        elif cmd_exists pacman; then
+            info "Install Python 3.12+ manually:"
+            info "  sudo pacman -S python"
+        else
+            info "Install Python 3.12+ manually using your distribution's package manager."
+        fi
+        exit 1
+    fi
+
+    # Verify the install worked
     pyver="$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')"
     local major minor
     major="${pyver%%.*}"
     minor="${pyver##*.}"
-
-    if (( major < 3 )) || (( major == 3 && minor < 12 )); then
-        dep_missing
-        die "Python $pyver detected, but 3.12+ is required.
-  Install Python 3.12+ and ensure 'python3' points to it.
-  Debian/Ubuntu:  apt install python3.12
-  Fedora:         dnf install python3.12"
+    if (( major >= 3 && minor >= 12 )); then
+        info "  version: $pyver"
+    else
+        color_warn "python3 is still $pyver — ensure python3.12 is installed and 'python3' resolves to it"
     fi
-
-    dep_ok
-    info "  version: $pyver"
 }
 
 check_uv() {
