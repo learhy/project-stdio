@@ -260,6 +260,7 @@ class LocalBwrapWorkerRunner:
         token_expiry_minutes: int = 15,
         ca_cert_path: str = "",
         ca_key_path: str = "",
+        repo_path: str = "",
     ) -> None:
         self.db = db
         self.socket_path = socket_path
@@ -268,6 +269,10 @@ class LocalBwrapWorkerRunner:
         self.token_expiry_minutes = token_expiry_minutes
         self.ca_cert_path = ca_cert_path
         self.ca_key_path = ca_key_path
+        # repo_path: directory of the git repo to create worktrees from.
+        # When empty (default), git worktree commands run in the current
+        # working directory.  Set this to a local clone path for reproducibility.
+        self.repo_path = repo_path
         self._bwrap_available: bool | None = None  # cached
         # Track proxy processes for cleanup
         self._proxy_processes: dict[str, asyncio.subprocess.Process] = {}
@@ -548,17 +553,22 @@ class LocalBwrapWorkerRunner:
     async def _create_worktree(self, path: str, branch: str, base_branch: str) -> None:
         """Create a git worktree at path on branch, based off base_branch.
 
+        Uses self.repo_path as the git repository root. When repo_path is
+        empty (default), runs in the current working directory.
+
         After creation, strips any inherited remote and configures local-only
         git identity so workers cannot accidentally push to the host's remotes.
         """
         import os as _os
         _os.makedirs(_os.path.dirname(path) if _os.path.dirname(path) else path, exist_ok=True)
 
+        repo_root = self.repo_path or None  # None → subprocess uses CWD
         proc = await asyncio.create_subprocess_exec(
             "git", "worktree", "add", path, "-b", branch,
             f"origin/{base_branch}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=repo_root,
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:

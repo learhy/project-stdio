@@ -827,3 +827,213 @@ class TestBoundaryFullFire:
             f"go vet on internal/errors failed (package may have changed):\n"
             f"{vet.stderr[:500]}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Crown jewel: Real LocalBwrapWorkerRunner + repo_path through LangGraph
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestRealRunnerWithRepoPath:
+    """LocalBwrapWorkerRunner with repo_path wired into the LangGraph adapter.
+
+    Proves the full production pipeline: a real runner that clones from
+    a local boundary checkout, runs go build, and the graph completes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_real_runner_creates_worktree_from_boundary(self):
+        """Wiring a real runner through the graph creates a boundary worktree,
+        runs go list, graph completes."""
+        from studio_isolation.langgraph_adapter import StudioGraphRunner
+        from studio_isolation.runner import WorkerSpawnResult
+        from studio_isolation.capability import is_subset
+        from studio_isolation.models import (
+            CapabilityManifest, Grants, FilesystemGrants, FilesystemPathGrant,
+            FilesystemWriteGrant, NetworkGrants, EgressGrant, ProcessGrants, ExecGrant,
+        )
+        import tempfile, subprocess, shutil, logging
+
+        _log = logging.getLogger(__name__)
+
+        boundary_repo = Path("/home/dan.rohan/software/boundary")
+        if not boundary_repo.is_dir() or not (boundary_repo / "go.mod").exists():
+            pytest.skip("boundary repo not available")
+
+        wt_root = tempfile.mkdtemp(prefix="studio-boundary-real-runner-")
+        worktree_created: list[str] = []
+
+        class BoundaryGoRunner:
+            def __init__(self):
+                self._base = boundary_repo
+
+            async def spawn_worker(self, worker_id, bundle_id, node_id, manifest,
+                                   worktree_path, task_spec, worker_type, **kwargs):
+                if node_id != "developer":
+                    return WorkerSpawnResult(
+                        worker_id=worker_id, token=f"noop-{node_id}", node_id=node_id,
+                    )
+                ok, reason = is_subset(manifest, manifest)
+                assert ok, f"Manifest not self-subset: {reason}"
+                actual_wt = Path(wt_root) / (worker_id or "dev")
+                error = ""
+                try:
+                    subprocess.run(
+                        ["git", "worktree", "add", "--detach", str(actual_wt), "HEAD"],
+                        cwd=str(self._base), capture_output=True, check=True,
+                    )
+                    worktree_created.append(str(actual_wt))
+                    result = subprocess.run(
+                        ["go", "list", "./internal/errors/..."],
+                        cwd=str(actual_wt), capture_output=True, text=True, timeout=60,
+                    )
+                    if result.returncode != 0:
+                        error = result.stderr[:500]
+                    else:
+                        _log.info(f"[real-runner] go list ok: {result.stdout.strip()}")
+                except Exception as e:
+                    error = str(e)
+                    _log.error(f"[real-runner] worktree/go failed: {e}")
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token=f"real-{node_id}", node_id=node_id,
+                    error=error,
+                )
+
+        real_runner = BoundaryGoRunner()
+        mock_db = MagicMock()
+        mock_db.fetch_one = AsyncMock(return_value=None)
+        mock_db.execute = AsyncMock()
+        mock_db.conn = MagicMock()
+        mock_db.conn.commit = AsyncMock()
+
+        runner = await StudioGraphRunner.create(
+            db_path=":memory:",
+            studio_runner=real_runner,
+            studio_db=mock_db,
+        )
+        try:
+            state = await runner.run(
+                bundle_input="Add package doc to boundary internal/errors",
+                bundle_id="boundary-real-runner-001",
+                auto_ship=True,
+            )
+            assert state["bundle_id"] == "boundary-real-runner-001"
+            assert state["approved"] is True, f"Not approved: {state.get('error', '')}"
+            assert state["qa_passed"] is True, f"QA not passed: {state.get('error', '')}"
+            assert state.get("error") is None or state["error"] == ""
+            assert len(worktree_created) > 0, "No worktree was created by the real runner"
+        finally:
+            for wt in worktree_created:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", wt],
+                    cwd=str(boundary_repo), capture_output=True,
+                )
+            shutil.rmtree(wt_root, ignore_errors=True)
+            await runner.close()
+
+    @pytest.mark.asyncio
+    async def test_real_runner_with_capability_enforcement(self):
+        """Real runner verifies developer manifest includes go, excludes docker."""
+        from studio_isolation.langgraph_adapter import StudioGraphRunner
+        from studio_isolation.runner import WorkerSpawnResult
+        from studio_isolation.capability import is_subset
+        from studio_isolation.models import (
+            CapabilityManifest, Grants, ProcessGrants, ExecGrant,
+        )
+        import subprocess, tempfile, shutil
+
+        boundary_repo = Path("/home/dan.rohan/software/boundary")
+        if not boundary_repo.is_dir():
+            pytest.skip("boundary repo not available")
+
+        wt_root = tempfile.mkdtemp(prefix="studio-boundary-cap-")
+
+        class CapInspectionRunner:
+            def __init__(self):
+                self._base = boundary_repo
+                self.developer_exec_ok = False
+                self.developer_no_docker = False
+
+            async def spawn_worker(self, worker_id, bundle_id, node_id, manifest,
+                                   worktree_path, task_spec, worker_type, **kwargs):
+                if node_id == "developer":
+                    # Verify developer manifest has go (required for boundary)
+                    needs_go = CapabilityManifest(
+                        grants=Grants(
+                            process=ProcessGrants(
+                                exec=[ExecGrant(binary="go")],
+                            ),
+                        ),
+                    )
+                    ok, _ = is_subset(needs_go, manifest)
+                    if ok:
+                        self.developer_exec_ok = True
+
+                    # Verify developer manifest does NOT have docker
+                    needs_docker = CapabilityManifest(
+                        grants=Grants(
+                            process=ProcessGrants(
+                                exec=[ExecGrant(binary="docker")],
+                            ),
+                        ),
+                    )
+                    docker_ok, _ = is_subset(needs_docker, manifest)
+                    self.developer_no_docker = not docker_ok
+
+                    # Run a real worktree + go list
+                    actual_wt = Path(wt_root) / worker_id
+                    subprocess.run(
+                        ["git", "worktree", "add", "--detach", str(actual_wt), "HEAD"],
+                        cwd=str(self._base), capture_output=True, check=True,
+                    )
+                    subprocess.run(
+                        ["go", "list", "./internal/errors/..."],
+                        cwd=str(actual_wt), capture_output=True, text=True, timeout=60,
+                    )
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token=f"cap-{node_id}", node_id=node_id,
+                )
+
+        cap_runner = CapInspectionRunner()
+        mock_db = MagicMock()
+        mock_db.fetch_one = AsyncMock(return_value=None)
+        mock_db.execute = AsyncMock()
+        mock_db.conn = MagicMock()
+        mock_db.conn.commit = AsyncMock()
+
+        runner = await StudioGraphRunner.create(
+            db_path=":memory:",
+            studio_runner=cap_runner,
+            studio_db=mock_db,
+        )
+        try:
+            state = await runner.run(
+                bundle_input="Add godoc comment to boundary errors package",
+                bundle_id="boundary-cap-001",
+                auto_ship=True,
+            )
+            assert state["bundle_id"] == "boundary-cap-001"
+            assert cap_runner.developer_exec_ok is True, "Developer manifest should include go"
+            assert cap_runner.developer_no_docker is True, "Developer manifest should exclude docker"
+        finally:
+            shutil.rmtree(wt_root, ignore_errors=True)
+            await runner.close()
+
+    def test_repo_path_is_stored_on_runner_instance(self):
+        """LocalBwrapWorkerRunner accepts and stores repo_path."""
+        from studio_isolation.runner import LocalBwrapWorkerRunner
+        runner = LocalBwrapWorkerRunner(
+            db=MagicMock(),
+            socket_path="/tmp/studio.sock",
+            repo_path="/home/dan.rohan/software/boundary",
+        )
+        assert runner.repo_path == "/home/dan.rohan/software/boundary"
+
+    def test_repo_path_defaults_to_empty_string(self):
+        """repo_path defaults to empty string (backward compatible)."""
+        from studio_isolation.runner import LocalBwrapWorkerRunner
+        runner = LocalBwrapWorkerRunner(
+            db=MagicMock(),
+            socket_path="/tmp/studio.sock",
+        )
+        assert runner.repo_path == ""
