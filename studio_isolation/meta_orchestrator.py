@@ -119,14 +119,22 @@ class MetaOrchestrator:
         cls,
         db_path: str = ":memory:",
         relay: SignalRelay | None = None,
+        studio_runner: Any = None,
+        studio_db: Any = None,
     ) -> "MetaOrchestrator":
         """Create a new MetaOrchestrator.
 
         Args:
             db_path: SQLite path for checkpoints.
             relay: Optional Signal relay for human-in-the-loop interrupts.
+            studio_runner: Optional Studio runner for real worker spawning.
+            studio_db: Optional Studio DB handle.
         """
-        runner = await StudioGraphRunner.create(db_path=db_path)
+        runner = await StudioGraphRunner.create(
+            db_path=db_path,
+            studio_runner=studio_runner,
+            studio_db=studio_db,
+        )
         return cls(runner=runner, relay=relay)
 
     async def execute(

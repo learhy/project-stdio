@@ -35,15 +35,16 @@ Usage:
     state = await sr.run("build a rate limiter", bundle_id="bundle-abc123")
 """
 
-from __future__ import annotations
-
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import aiosqlite
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import interrupt
+
+# LangChain's RunnableConfig — the type LangGraph nodes use for config
+from langchain_core.runnables.config import RunnableConfig
 
 logger = logging.getLogger(__name__)
 
@@ -99,9 +100,13 @@ class StudioGraphState(TypedDict, total=False):
 #  Each node accepts (state, config?) where config is LangGraph's RunnableConfig.
 #  The config.configurable dict carries the Studio runner and DB handle when
 #  available. If not present, nodes produce placeholder state for testing.
+#
+#  CRITICAL: Nodes must use `Optional[RunnableConfig]` as the config type.
+#  `from __future__ import annotations` BREAKS LangGraph's type introspection
+#  — nodes won't receive config if LangGraph can't recognize the type.
 
 
-def _get_runner_and_db(config: dict | None) -> tuple[Any, Any]:
+def _get_runner_and_db(config: Optional[RunnableConfig]) -> tuple[Any, Any]:
     """Extract (runner, db) from LangGraph config, or return (None, None)."""
     if config is None:
         return None, None
@@ -109,7 +114,7 @@ def _get_runner_and_db(config: dict | None) -> tuple[Any, Any]:
     return conf.get("studio_runner"), conf.get("studio_db")
 
 
-async def node_bundler(state: StudioGraphState, config: dict | None = None) -> dict[str, Any]:
+async def node_bundler(state: StudioGraphState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Bundler node: decomposes intent into a proposal + task DAG.
 
     In production with a runner available, this spawns a bundler worker.
@@ -236,7 +241,7 @@ async def node_approval_gate(state: StudioGraphState) -> dict[str, Any]:
     }
 
 
-async def node_developer(state: StudioGraphState, config: dict | None = None) -> dict[str, Any]:
+async def node_developer(state: StudioGraphState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Developer node: implements the task using a Studio worker.
 
     With a runner in config: spawns a real isolated developer worker via the
@@ -292,7 +297,7 @@ async def node_developer(state: StudioGraphState, config: dict | None = None) ->
     }
 
     logger.info(f"[developer] Spawning worker for bundle {bundle_id}")
-    result = runner.spawn_worker(
+    result = await runner.spawn_worker(
         worker_id=f"{bundle_id}-dev",
         bundle_id=bundle_id,
         node_id=node_id,
@@ -379,18 +384,36 @@ class StudioGraphRunner:
         await runner.close()
     """
 
-    def __init__(self, conn: aiosqlite.Connection, checkpointer: AsyncSqliteSaver, graph: StateGraph) -> None:
+    def __init__(
+        self,
+        conn: aiosqlite.Connection,
+        checkpointer: AsyncSqliteSaver,
+        graph: StateGraph,
+        studio_runner: Any = None,
+        studio_db: Any = None,
+    ) -> None:
         self._conn = conn
         self.checkpointer = checkpointer
         self.graph = graph
+        self.studio_runner = studio_runner
+        self.studio_db = studio_db
 
     @classmethod
-    async def create(cls, db_path: str = ":memory:") -> "StudioGraphRunner":
+    async def create(
+        cls,
+        db_path: str = ":memory:",
+        studio_runner: Any = None,
+        studio_db: Any = None,
+    ) -> "StudioGraphRunner":
         """Create a new StudioGraphRunner with checkpointer.
 
         Args:
             db_path: SQLite path for checkpoints. ":memory:" (ephemeral)
                      or a file path for durability.
+            studio_runner: Optional Studio runner (e.g. NoopWorkerRunner,
+                           LocalBwrapWorkerRunner) for real worker spawning.
+                           When None, nodes produce placeholder state.
+            studio_db: Optional Studio DB handle (must match runner's DB).
         """
         conn = await aiosqlite.connect(db_path)
         checkpointer = AsyncSqliteSaver(conn)
@@ -398,8 +421,15 @@ class StudioGraphRunner:
 
         graph = _make_graph()
         compiled = graph.compile(checkpointer=checkpointer)
-        logger.info("StudioGraphRunner created with checkpointer")
-        return cls(conn=conn, checkpointer=checkpointer, graph=compiled)
+        logger.info("StudioGraphRunner created with checkpointer"
+                     + (" (real runner)" if studio_runner else " (placeholder)"))
+        return cls(
+            conn=conn,
+            checkpointer=checkpointer,
+            graph=compiled,
+            studio_runner=studio_runner,
+            studio_db=studio_db,
+        )
 
     async def run(
         self,
@@ -414,7 +444,7 @@ class StudioGraphRunner:
             bundle_id: Unique thread ID for checkpointing.
             auto_ship: If True, the approval gate auto-approves.
         """
-        config = {"configurable": {"thread_id": bundle_id}}
+        config = self.config_for(bundle_id)
         initial_state: StudioGraphState = {
             "bundle_input": bundle_input,
             "bundle_id": bundle_id,
@@ -423,8 +453,18 @@ class StudioGraphRunner:
         return await self.graph.ainvoke(initial_state, config)
 
     def config_for(self, bundle_id: str) -> dict:
-        """Build a LangGraph config dict for a bundle."""
-        return {"configurable": {"thread_id": bundle_id}}
+        """Build a LangGraph config dict for a bundle.
+
+        When studio_runner and studio_db are set on this instance,
+        they're threaded through configurable so node_developer and
+        node_qa can spawn real workers.
+        """
+        configurable: dict[str, Any] = {"thread_id": bundle_id}
+        if self.studio_runner is not None:
+            configurable["studio_runner"] = self.studio_runner
+        if self.studio_db is not None:
+            configurable["studio_db"] = self.studio_db
+        return {"configurable": configurable}
 
     def get_mermaid(self) -> str:
         """Return a Mermaid diagram of the graph."""
