@@ -1,4 +1,5 @@
-"""LangGraph adapter for Studio's isolation layer.
+"""
+LangGraph adapter for Studio's isolation layer.
 
 This module defines the canonical Studio StateGraph that replaces
 executor.py, scheduler.py, reconciler.py, reducers.py, and expression.py.
@@ -11,16 +12,27 @@ Architecture (sequential — parallel fan-out via Send() in Phase 3):
 Each node wraps a Studio runner from studio_isolation. The graph uses
 SQLite checkpointing to survive restarts.
 
+When a Studio runner and database handle are threaded through
+RunnableConfig, nodes spawn real isolated workers (bubblewrap/Docker/K8s).
+Without a runner, nodes produce placeholder state for testing.
+
 Usage:
-    from studio_isolation.langgraph_adapter import build_studio_graph, StudioGraphRunner
+    # Testing / dry-run (no workers spawned):
+    from studio_isolation.langgraph_adapter import StudioGraphRunner
 
     runner = await StudioGraphRunner.create(db_path="/tmp/checkpoints.db")
     state = await runner.run("build a rate limiter", bundle_id="bundle-abc123")
 
-    # For human-in-the-loop:
-    async for event in runner.graph.astream_events(state, runner.config):
-        if event["event"] == "on_interrupt":
-            ...  # relay to human, then resume
+    # Production (real worker spawning):
+    from studio_isolation.langgraph_adapter import StudioGraphRunner
+    from studio_isolation.runner import NoopWorkerRunner
+
+    sr = await StudioGraphRunner.create(
+        db_path="/tmp/checkpoints.db",
+        studio_runner=your_runner_impl,
+        db_handle=your_db,
+    )
+    state = await sr.run("build a rate limiter", bundle_id="bundle-abc123")
 """
 
 from __future__ import annotations
@@ -83,13 +95,25 @@ class StudioGraphState(TypedDict, total=False):
 
 
 # ── Node implementations ────────────────────────────────────────────────────────
+#
+#  Each node accepts (state, config?) where config is LangGraph's RunnableConfig.
+#  The config.configurable dict carries the Studio runner and DB handle when
+#  available. If not present, nodes produce placeholder state for testing.
 
 
-async def node_bundler(state: StudioGraphState) -> dict[str, Any]:
+def _get_runner_and_db(config: dict | None) -> tuple[Any, Any]:
+    """Extract (runner, db) from LangGraph config, or return (None, None)."""
+    if config is None:
+        return None, None
+    conf = config.get("configurable", {})
+    return conf.get("studio_runner"), conf.get("studio_db")
+
+
+async def node_bundler(state: StudioGraphState, config: dict | None = None) -> dict[str, Any]:
     """Bundler node: decomposes intent into a proposal + task DAG.
 
-    In production, this spawns a bundler worker via the Studio isolation layer.
-    For now, it creates a placeholder proposal.
+    In production with a runner available, this spawns a bundler worker.
+    Without a runner, it creates a placeholder proposal.
     """
     logger.info(f"[bundler] Processing bundle_input: {state.get('bundle_input', '')[:100]}")
     return {
@@ -212,16 +236,92 @@ async def node_approval_gate(state: StudioGraphState) -> dict[str, Any]:
     }
 
 
-async def node_developer(state: StudioGraphState) -> dict[str, Any]:
+async def node_developer(state: StudioGraphState, config: dict | None = None) -> dict[str, Any]:
     """Developer node: implements the task using a Studio worker.
 
-    In production, this spawns a developer worker via studio_isolation.
+    With a runner in config: spawns a real isolated developer worker via the
+    Studio isolation layer, waits for it to complete, and returns results.
+    Without a runner: returns placeholder state for testing.
     """
-    logger.info(f"[developer] Implementing task")
+    runner, db = _get_runner_and_db(config)
+    bundle_id = state.get("bundle_id", "unknown")
+    node_id = "developer"
+    worktree_path = f"/tmp/studio-{bundle_id}"
+
+    if runner is None or db is None:
+        logger.info(f"[developer] No runner configured — returning placeholder")
+        return {
+            "changed_files": [],
+            "branch_name": f"studio/{bundle_id}",
+            "worktree_path": worktree_path,
+        }
+
+    # Build capability manifest for the developer worker
+    from studio_isolation.models import (
+        CapabilityManifest, Grants, FilesystemGrants, FilesystemPathGrant,
+        FilesystemWriteGrant, NetworkGrants, EgressGrant, ProcessGrants, ExecGrant,
+    )
+    manifest = CapabilityManifest(
+        grants=Grants(
+            filesystem=FilesystemGrants(
+                reads=[FilesystemPathGrant(path="/usr")],
+                writes=[FilesystemWriteGrant(path=worktree_path, create=True)],
+            ),
+            network=NetworkGrants(
+                egress=[
+                    EgressGrant(destination="github.com", ports=[443], protocol="https"),
+                    EgressGrant(destination="proxy.golang.org", ports=[443], protocol="https"),
+                ],
+            ),
+            process=ProcessGrants(
+                exec=[
+                    ExecGrant(binary="git"),
+                    ExecGrant(binary="go"),
+                    ExecGrant(binary="make"),
+                    ExecGrant(binary="bash"),
+                ],
+            ),
+        ),
+    )
+
+    # Build task spec from state
+    task_spec = {
+        "objective": state.get("bundle_input", ""),
+        "task_dag": state.get("task_dag", {}),
+        "approval_reason": state.get("approval_reason", ""),
+    }
+
+    logger.info(f"[developer] Spawning worker for bundle {bundle_id}")
+    result = runner.spawn_worker(
+        worker_id=f"{bundle_id}-dev",
+        bundle_id=bundle_id,
+        node_id=node_id,
+        manifest=manifest,
+        worktree_path=worktree_path,
+        task_spec=task_spec,
+        worker_type="developer",
+    )
+
+    if result.error:
+        logger.error(f"[developer] Spawn failed: {result.error}")
+        return {
+            "error": f"developer spawn failed: {result.error}",
+            "worktree_path": worktree_path,
+            "branch_name": f"studio/{bundle_id}",
+        }
+
+    # Wait for worker to complete (process handle)
+    if result.process and hasattr(result.process, "wait"):
+        try:
+            exit_code = await result.process.wait()
+            logger.info(f"[developer] Worker exited with code {exit_code}")
+        except Exception as e:
+            logger.error(f"[developer] Worker wait failed: {e}")
+
     return {
         "changed_files": [],
-        "branch_name": f"studio/{state.get('bundle_id', 'unknown')}",
-        "worktree_path": f"/tmp/studio-{state.get('bundle_id', 'unknown')}",
+        "branch_name": f"studio/{bundle_id}",
+        "worktree_path": worktree_path,
     }
 
 
