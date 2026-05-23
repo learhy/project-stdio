@@ -358,13 +358,15 @@ class TestBoundaryFireFullPipeline:
         """Verify decomposed intent flows through the graph correctly."""
         from studio_isolation.langgraph_adapter import StudioGraphRunner
 
-        # Pre-decompose the intent
+        # Pre-decompose the intent (rate-limiter = high risk, auto_ship=False)
         orch = MetaOrchestrator.__new__(MetaOrchestrator)
         decomposed = orch.decompose_intent(
             intent="Add rate limiter to controller interceptor",
             bundle_id="boundary-dag-test",
             target_repo="learhy/boundary",
         )
+        # Override auto_ship for the graph test
+        decomposed.auto_ship = True
 
         runner = await StudioGraphRunner.create(db_path=":memory:")
         try:
@@ -419,12 +421,14 @@ class TestRunnerInjection:
                 bundle_id="inject-test-001",
                 auto_ship=True,
             )
-            # node_developer should have called spawn_worker
-            mock_runner.spawn_worker.assert_called_once()
-            call_kwargs = mock_runner.spawn_worker.call_args.kwargs
-            assert call_kwargs["bundle_id"] == "inject-test-001"
-            assert call_kwargs["node_id"] == "developer"
-            assert call_kwargs["worker_type"] == "developer"
+            # node_developer AND other nodes should have called spawn_worker
+            assert mock_runner.spawn_worker.call_count >= 6  # bundler + 3 reviews + developer + qa
+            # Verify at least one call was for the developer node
+            developer_calls = [
+                c for c in mock_runner.spawn_worker.call_args_list
+                if c.kwargs.get("node_id") == "developer"
+            ]
+            assert len(developer_calls) == 1
             # Graph still completes successfully
             assert state["approved"] is True
             assert state["qa_passed"] is True
@@ -494,7 +498,8 @@ class TestRunnerInjection:
                 target_repo="learhy/boundary",
             )
             assert result.success is True
-            mock_runner.spawn_worker.assert_called_once()
+            # All 6 nodes (bundler + 3 reviews + developer + qa) spawn workers
+            assert mock_runner.spawn_worker.call_count >= 6
         finally:
             await orch.close()
 
@@ -623,3 +628,193 @@ class TestBoundaryWorktreeFire:
                 cwd=str(boundary_repo), capture_output=True,
             )
             await runner.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Crown jewel: Full fire test — make real code changes in a boundary
+# worktree through the LangGraph adapter, run go vet, and verify.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestBoundaryFullFire:
+    """Real boundary worktree → code change → go vet → verify via full graph.
+
+    This is the crown jewel: the complete pipeline from intent to
+    verified code change in a real boundary worktree, driven end-to-end
+    by the LangGraph adapter and Studio isolation layer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_graph_driven_code_change_in_boundary(self):
+        """A custom runner wired into the graph that:
+        1. Creates a real boundary git worktree
+        2. Makes a real code change (adds a doc comment)
+        3. Runs go vet on the changed package
+        4. Verifies the change is in place
+
+        The developer node does the real work; bundler/review/qa nodes
+        are noops (they don't have enough context to produce useful
+        output without an orchestrator backend).
+        """
+        from studio_isolation.langgraph_adapter import StudioGraphRunner, StudioGraphState
+        from studio_isolation.runner import WorkerSpawnResult
+        import subprocess
+
+        boundary_repo = Path("/home/dan.rohan/software/boundary")
+        if not boundary_repo.is_dir() or not (boundary_repo / "go.mod").exists():
+            pytest.skip("boundary repo not available")
+
+        wt_dir = tempfile.mkdtemp(prefix="studio-boundary-full-fire-")
+        changed_file_ref: list[str] = []  # Mutable container for nested class access
+
+        # Mock DB — required so node guards pass; FullFireRunner ignores it
+        mock_db = MagicMock()
+        mock_db.fetch_one = AsyncMock(return_value=None)
+        mock_db.execute = AsyncMock()
+        mock_db.conn = MagicMock()
+        mock_db.conn.commit = AsyncMock()
+
+        class FullFireRunner:
+            """Runner that does real work in the developer node, noops elsewhere.
+
+            Node order in the graph:
+              bundler → review_adversary → review_security → review_qa
+                     → approval_gate → *developer* → qa_verification → complete
+
+            Only the developer node does real work. The other nodes return
+            immediate placeholders (WorkerSpawnResult with no process).
+            """
+
+            async def spawn_worker(self, worker_id, bundle_id, node_id, manifest,
+                                   worktree_path, task_spec, worker_type, **kwargs):
+                if node_id != "developer":
+                    return WorkerSpawnResult(
+                        worker_id=worker_id, token="noop",
+                        node_id=node_id,
+                    )
+
+                # ── DEVELOPER NODE: real boundary work ──────────────────
+                # 1. Create a git worktree from Boundary
+                subprocess.run(
+                    ["git", "worktree", "add", "--detach", str(wt_dir), "HEAD"],
+                    cwd=str(boundary_repo), capture_output=True, check=True,
+                )
+
+                # 2. Find the internal/errors package (well-known, stable)
+                pkg_dir = Path(wt_dir) / "internal" / "errors"
+                if not pkg_dir.exists():
+                    return WorkerSpawnResult(
+                        worker_id=worker_id, token="fire-token",
+                        node_id=node_id,
+                        error=f"internal/errors not found in boundary worktree",
+                    )
+
+                # 3. Read the first .go file in that package
+                go_files = sorted(pkg_dir.glob("*.go"))
+                if not go_files:
+                    return WorkerSpawnResult(
+                        worker_id=worker_id, token="fire-token",
+                        node_id=node_id,
+                        error="No .go files in internal/errors",
+                    )
+
+                first_file = go_files[0]
+                original = first_file.read_text()
+                changed_file_ref.append(str(first_file.relative_to(wt_dir)))
+
+                # 4. Check if the package declaration already has our doc comment
+                if "// Studio fire-test marker: this package" in original:
+                    # Already modified — clean up and pass
+                    return WorkerSpawnResult(
+                        worker_id=worker_id, token="fire-token",
+                        node_id=node_id,
+                    )
+
+                # 5. Add a doc comment after the package declaration
+                modified = original.replace(
+                    "package errors",
+                    "// Package errors provides boundary error types and constructors.\n// Studio fire-test marker: this package was examined by the LangGraph adapter.\npackage errors",
+                    1,  # only first occurrence
+                )
+                if modified == original:
+                    # Try alternate package name format
+                    modified = original.replace(
+                        "package errors",
+                        "// Studio fire-test marker: boundary package examined by full fire test.\npackage errors",
+                        1,
+                    )
+
+                first_file.write_text(modified)
+
+                # 6. Run go vet on the changed package
+                changed_rel = changed_file_ref[0] if changed_file_ref else "."
+                vet_result = subprocess.run(
+                    ["go", "vet", f"./{changed_rel.rsplit('/', 1)[0]}"],
+                    cwd=str(wt_dir), capture_output=True, text=True, timeout=60,
+                )
+
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token="fire-token",
+                    node_id=node_id,
+                    error="" if vet_result.returncode == 0 else vet_result.stderr[:500],
+                )
+
+        runner = await StudioGraphRunner.create(
+            db_path=":memory:",
+            studio_runner=FullFireRunner(),
+            studio_db=mock_db,  # Required by node guards; not used by FullFireRunner
+        )
+        try:
+            intent = "Add package-level documentation to the internal/errors package"
+            state = await runner.run(
+                bundle_input=intent,
+                bundle_id="boundary-full-fire-001",
+                auto_ship=True,
+            )
+
+            # ── Verify the graph completed ──────────────────────────
+            assert state["bundle_id"] == "boundary-full-fire-001"
+            assert state["approved"] is True
+            assert state["qa_passed"] is True
+            assert state.get("error") is None or state["error"] == ""
+
+            # ── Verify the code change is real ──────────────────────
+            assert len(changed_file_ref) > 0, "No file was modified"
+            changed_file = changed_file_ref[0]
+            modified_path = Path(wt_dir) / changed_file
+            assert modified_path.exists(), f"Modified file missing: {modified_path}"
+            file_content = modified_path.read_text()
+            assert "Studio fire-test marker" in file_content, (
+                f"Doc comment not found in {changed_file}. Content:\n{file_content[:500]}"
+            )
+
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(wt_dir)],
+                cwd=str(boundary_repo), capture_output=True,
+            )
+            await runner.close()
+
+    @pytest.mark.asyncio
+    async def test_boundary_errors_package_is_stable(self):
+        """Sanity check: internal/errors should exist and be vet-clean."""
+        import subprocess
+
+        boundary_repo = Path("/home/dan.rohan/software/boundary")
+        if not boundary_repo.is_dir():
+            pytest.skip("boundary repo not available")
+
+        pkg = boundary_repo / "internal" / "errors"
+        assert pkg.is_dir(), f"internal/errors not found at {pkg}"
+
+        go_files = list(pkg.glob("*.go"))
+        assert len(go_files) > 0, "No .go files in internal/errors"
+
+        vet = subprocess.run(
+            ["go", "vet", "./internal/errors/..."],
+            cwd=str(boundary_repo), capture_output=True, text=True, timeout=60,
+        )
+        assert vet.returncode == 0, (
+            f"go vet on internal/errors failed (package may have changed):\n"
+            f"{vet.stderr[:500]}"
+        )
