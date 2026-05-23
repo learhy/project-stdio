@@ -166,4 +166,12 @@ from studio_isolation.langgraph_adapter import (
     get_graph_mermaid,
 )
 
+# ── Meta-Orchestrator ────────────────────────────────────────────────────────
+from studio_isolation.meta_orchestrator import (
+    MetaOrchestrator,
+    DecomposedIntent,
+    ExecutionResult,
+    SignalRelay,
+)
+
 __version__ = "0.2.0"
