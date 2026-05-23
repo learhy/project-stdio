@@ -157,4 +157,13 @@ from studio_isolation.tls import (
     create_client_tls_context,
 )
 
-__version__ = "0.1.0"
+# ── LangGraph Adapter ─────────────────────────────────────────────────────────
+from studio_isolation.langgraph_adapter import (
+    StudioGraphState,
+    StudioGraphRunner,
+    build_studio_graph,
+    run_studio_graph,
+    get_graph_mermaid,
+)
+
+__version__ = "0.2.0"

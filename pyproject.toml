@@ -18,6 +18,8 @@ dependencies = [
     "asyncssh>=2.23.0",
     "kubernetes-asyncio>=35.0.1",
     "docker>=7.1.0",
+    "langgraph>=0.5.0",
+    "langgraph-checkpoint-sqlite>=2.0.0",
 ]
 
 [project.optional-dependencies]
