@@ -630,7 +630,7 @@ class TestApprovalMatrixStub:
             "01TEST", "approval-matrix"
         )
         app.sm.transition_6_start_execution.assert_called_once_with("01TEST")
-        app.executor.start_bundle.assert_called_once_with("01TEST")
+        # Phase 5: executor.start_bundle is no longer called — LangGraph handles execution
 
 
 class TestMemoryRootSetting:

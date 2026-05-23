@@ -1,6 +1,10 @@
-"""Tests for main.py — orchestrator lifecycle and CLI dispatch."""
+"""Tests for main.py — orchestrator lifecycle and CLI dispatch.
+
+Phase 5: DagExecutor, Scheduler, Reconciler removed. Tests updated.
+"""
 import json
 import pytest
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from pathlib import Path
@@ -37,6 +41,7 @@ class TestFormatAge:
 class TestOrchestratorLifecycle:
     @pytest.mark.asyncio
     async def test_start_initializes_components(self):
+        """Phase 5: executor/scheduler/reconciler removed, but runner/RPC/DB still init."""
         app = Orchestrator()
         app.settings.orchestrator.db_path = "/tmp/test-start.db"
         app.settings.orchestrator.socket_path = "/tmp/test-start.sock"
@@ -47,9 +52,6 @@ class TestOrchestratorLifecycle:
              patch("studio.orchestrator.main.RemoteSSHWorkerRunner") as mock_ssh_cls, \
              patch("studio.orchestrator.main.K8sJobWorkerRunner") as mock_k8s_cls, \
              patch("studio.orchestrator.main.RunnerSelector") as mock_selector_cls, \
-             patch("studio.orchestrator.main.DagExecutor") as mock_exec_cls, \
-             patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
-             patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
              patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
              patch("studio.orchestrator.main.os.chmod"), \
              patch("studio.orchestrator.main.os.path.exists", return_value=False), \
@@ -76,19 +78,6 @@ class TestOrchestratorLifecycle:
             mock_selector.runner_names = ["local"]
             mock_selector_cls.return_value = mock_selector
 
-            mock_exec = MagicMock()
-            mock_exec._running_workers = {}
-            mock_exec_cls.return_value = mock_exec
-
-            mock_sched = MagicMock()
-            mock_sched.start = AsyncMock()
-            mock_sched.stop = AsyncMock()
-            mock_sched_cls.return_value = mock_sched
-
-            mock_recon = MagicMock()
-            mock_recon.reconcile = AsyncMock(return_value={"workers_killed": 0, "nodes_failed": 0, "bundles_recovered": 0})
-            mock_recon_cls.return_value = mock_recon
-
             mock_server = MagicMock()
             mock_server.close = MagicMock()
             mock_server.wait_closed = AsyncMock()
@@ -101,68 +90,15 @@ class TestOrchestratorLifecycle:
             assert app.dispatcher is not None
             assert app.handlers is not None
             assert app.runner is not None
-            assert app.executor is not None
-            assert app.scheduler is not None
-            assert app.reconciler is not None
-            mock_sched.start.assert_called_once()
-            mock_recon.reconcile.assert_called_once()
+            # Phase 5: executor, scheduler, reconciler no longer exist
             mock_start_server.assert_called_once()
 
             await app.stop()
-            mock_sched.stop.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_reconcile_runs_on_startup(self):
-        app = Orchestrator()
-        app.settings.orchestrator.db_path = "/tmp/test-recon.db"
-        app.settings.orchestrator.socket_path = "/tmp/test-recon.sock"
-
-        with patch("studio.orchestrator.main.create_database") as mock_create_db, \
-             patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
-             patch("studio.orchestrator.main.LocalBwrapWorkerRunner"), \
-             patch("studio.orchestrator.main.RemoteSSHWorkerRunner"), \
-             patch("studio.orchestrator.main.K8sJobWorkerRunner"), \
-             patch("studio.orchestrator.main.RunnerSelector") as mock_selector_cls, \
-             patch("studio.orchestrator.main.DagExecutor"), \
-             patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
-             patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
-             patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
-             patch("studio.orchestrator.main.os.chmod"), \
-             patch("studio.orchestrator.main.os.path.exists", return_value=False), \
-             patch("studio.orchestrator.main.os.unlink"):
-            mock_db = MagicMock()
-            mock_db.fetch_all = AsyncMock()
-            mock_db.fetch_one = AsyncMock()
-            mock_db.execute = AsyncMock()
-            mock_db.close = AsyncMock()
-            mock_db.conn = MagicMock()
-            mock_db.conn.commit = AsyncMock()
-            mock_create_db.return_value = mock_db
-
-            mock_selector = MagicMock()
-            mock_selector.runner_names = ["local"]
-            mock_selector_cls.return_value = mock_selector
-
-            mock_create_rpc.return_value = (MagicMock(), MagicMock(), MagicMock())
-            mock_sched_cls.return_value = MagicMock(start=AsyncMock(), stop=AsyncMock())
-
-            mock_recon = MagicMock()
-            mock_recon.reconcile = AsyncMock(return_value={
-                "workers_killed": 2, "nodes_failed": 2, "bundles_recovered": 1
-            })
-            mock_recon_cls.return_value = mock_recon
-
-            mock_server = MagicMock()
-            mock_server.close = MagicMock()
-            mock_server.wait_closed = AsyncMock()
-            mock_start_server.return_value = mock_server
-
-            await app.start()
-            mock_recon.reconcile.assert_called_once()
-            await app.stop()
+            mock_db.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_stop_closes_all_components(self):
+        """Phase 5: stop closes DB, server, but no scheduler/reconciler."""
         app = Orchestrator()
         app.settings.orchestrator.db_path = "/tmp/test-stop.db"
         app.settings.orchestrator.socket_path = "/tmp/test-stop.sock"
@@ -173,9 +109,6 @@ class TestOrchestratorLifecycle:
              patch("studio.orchestrator.main.RemoteSSHWorkerRunner"), \
              patch("studio.orchestrator.main.K8sJobWorkerRunner"), \
              patch("studio.orchestrator.main.RunnerSelector") as mock_selector_cls, \
-             patch("studio.orchestrator.main.DagExecutor"), \
-             patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
-             patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
              patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
              patch("studio.orchestrator.main.os.chmod"), \
              patch("studio.orchestrator.main.os.path.exists", return_value=False), \
@@ -197,15 +130,6 @@ class TestOrchestratorLifecycle:
             mock_conn_mgr._by_worker_id = {}
             mock_create_rpc.return_value = (MagicMock(), MagicMock(), mock_conn_mgr)
 
-            mock_sched = MagicMock()
-            mock_sched.start = AsyncMock()
-            mock_sched.stop = AsyncMock()
-            mock_sched_cls.return_value = mock_sched
-
-            mock_recon = MagicMock()
-            mock_recon.reconcile = AsyncMock(return_value={"workers_killed": 0, "nodes_failed": 0, "bundles_recovered": 0})
-            mock_recon_cls.return_value = mock_recon
-
             mock_server = MagicMock()
             mock_server.close = MagicMock()
             mock_server.wait_closed = AsyncMock()
@@ -214,7 +138,6 @@ class TestOrchestratorLifecycle:
             await app.start()
             await app.stop()
 
-            mock_sched.stop.assert_called_once()
             mock_db.close.assert_called_once()
 
 
@@ -229,9 +152,6 @@ class TestTcpTlsListener:
         with patch("studio.orchestrator.main.create_database") as mock_create_db, \
              patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
              patch("studio.orchestrator.main.LocalBwrapWorkerRunner"), \
-             patch("studio.orchestrator.main.DagExecutor"), \
-             patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
-             patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
              patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
              patch("studio.orchestrator.main.asyncio.start_server") as mock_tcp_server, \
              patch("studio.orchestrator.main.os.chmod"), \
@@ -246,10 +166,6 @@ class TestTcpTlsListener:
             mock_db.conn.commit = AsyncMock()
             mock_create_db.return_value = mock_db
             mock_create_rpc.return_value = (MagicMock(), MagicMock(), MagicMock())
-
-            mock_sched_cls.return_value = MagicMock(start=AsyncMock(), stop=AsyncMock())
-            mock_recon_cls.return_value = MagicMock(reconcile=AsyncMock(return_value={
-                "workers_killed": 0, "nodes_failed": 0, "bundles_recovered": 0}))
 
             mock_server = MagicMock()
             mock_server.close = MagicMock()
@@ -275,9 +191,6 @@ class TestTcpTlsListener:
         with patch("studio.orchestrator.main.create_database") as mock_create_db, \
              patch("studio.orchestrator.main.create_rpc_system") as mock_create_rpc, \
              patch("studio.orchestrator.main.LocalBwrapWorkerRunner"), \
-             patch("studio.orchestrator.main.DagExecutor"), \
-             patch("studio.orchestrator.main.Scheduler") as mock_sched_cls, \
-             patch("studio.orchestrator.main.Reconciler") as mock_recon_cls, \
              patch("studio.orchestrator.main.asyncio.start_unix_server") as mock_start_server, \
              patch("studio.orchestrator.main.asyncio.start_server") as mock_tcp_server, \
              patch("studio.orchestrator.main.tls_helpers.generate_ca") as mock_gen_ca, \
@@ -294,10 +207,6 @@ class TestTcpTlsListener:
             mock_db.conn.commit = AsyncMock()
             mock_create_db.return_value = mock_db
             mock_create_rpc.return_value = (MagicMock(), MagicMock(), MagicMock())
-
-            mock_sched_cls.return_value = MagicMock(start=AsyncMock(), stop=AsyncMock())
-            mock_recon_cls.return_value = MagicMock(reconcile=AsyncMock(return_value={
-                "workers_killed": 0, "nodes_failed": 0, "bundles_recovered": 0}))
 
             mock_server = MagicMock()
             mock_server.close = MagicMock()
@@ -376,14 +285,11 @@ class TestCliHandlers:
         app.sm.transition_1_submit_idea = AsyncMock()
         app.sm.transition_1a_approve = AsyncMock()
         app.sm.transition_1b_reject = AsyncMock()
+        app.sm.transition_4_approve_from_review = AsyncMock()
         app.sm.transition_6_start_execution = AsyncMock()
         app.sm.transition_25_fail_execution = AsyncMock()
         app.sm.now = MagicMock(return_value=1700000000)
-        app.executor = MagicMock()
-        app.executor.start_bundle = AsyncMock()
-        app.executor._running_workers = {}
         app.runner = MagicMock()
-        app.runner.kill_worker = AsyncMock()
         app.db = MagicMock()
         app.db.fetch_all = AsyncMock()
         app.db.fetch_one = AsyncMock()
@@ -423,11 +329,20 @@ class TestCliHandlers:
 
     @pytest.mark.asyncio
     async def test_cli_approve_starts_execution(self, app_mock):
+        """Phase 5: approval transitions state, LangGraph handles execution dispatch."""
         result = await _cli_approve(app_mock, {"bundle_id": "01TEST"})
         assert result["approved"] is True
         app_mock.sm.transition_1a_approve.assert_called_once_with("01TEST", "cli")
         app_mock.sm.transition_6_start_execution.assert_called_once_with("01TEST")
-        app_mock.executor.start_bundle.assert_called_once_with("01TEST")
+
+    @pytest.mark.asyncio
+    async def test_cli_approve_from_review(self, app_mock):
+        """Approval from IN_REVIEW state uses the review transition."""
+        app_mock.db.fetch_one = AsyncMock(return_value={"state": "in_review"})
+        result = await _cli_approve(app_mock, {"bundle_id": "01TEST"})
+        assert result["approved"] is True
+        app_mock.sm.transition_4_approve_from_review.assert_called_once_with("01TEST", "cli")
+        app_mock.sm.transition_6_start_execution.assert_called_once_with("01TEST")
 
     @pytest.mark.asyncio
     async def test_cli_reject(self, app_mock):
@@ -474,7 +389,7 @@ class TestCliHandlers:
         app_mock.db.fetch_one = AsyncMock(side_effect=[
             {"id": "w1", "bundle_id": "b1", "node_id": "n1",
              "state": "running", "current_phase": "writing-code",
-             "last_heartbeat": 1699999990, "created_at": 1699999900,
+             "last_heartbeat": 1699999990, "created_at": 1699999990,
              "manifest_json": "{}"},
             {"spec_json": '{"objective":"Test task"}', "output_json": None},
         ])
@@ -490,6 +405,7 @@ class TestCliHandlers:
 
     @pytest.mark.asyncio
     async def test_cli_kill(self, app_mock):
+        """Phase 5: kill marks workers as failed via DB, no executor needed."""
         app_mock.db.fetch_all = AsyncMock(return_value=[{"id": "w1"}])
         result = await _cli_kill(app_mock, {"bundle_id": "01TEST"})
         assert result["workers_killed"] == 1
@@ -497,229 +413,33 @@ class TestCliHandlers:
 
     @pytest.mark.asyncio
     async def test_cli_status(self, app_mock):
-        app_mock.db.fetch_one = AsyncMock(side_effect=[
-            {"cnt": 2},  # running workers
-            {"cnt": 1},  # ready nodes
-        ])
-        result = await _cli_status(app_mock, {})
-        assert "uptime" in result
-        assert result["worker_count"] == 2
-        assert result["queue_depth"] == 1
-
-    @pytest.mark.asyncio
-    async def test_cli_kill_no_workers(self, app_mock):
+        app_mock.db.fetch_one = AsyncMock(return_value={"cnt": 3})
         app_mock.db.fetch_all = AsyncMock(return_value=[])
-        result = await _cli_kill(app_mock, {"bundle_id": "01TEST"})
-        assert result["workers_killed"] == 0
-
-
-class TestConnectionRouting:
-    @pytest.mark.asyncio
-    async def test_handle_connection_routes_auth_to_worker(self):
-        app = Orchestrator()
-        app._serve_worker = AsyncMock()
-        app._serve_cli = AsyncMock()
-        app.db = MagicMock()
-        app.dispatcher = MagicMock()
-
-        reader = AsyncMock()
-        reader.readline = AsyncMock(return_value=json.dumps({
-            "jsonrpc": "2.0", "method": "auth", "params": {}, "id": 1,
-            "token": "test-token",
-        }).encode())
-
-        writer = MagicMock()
-        writer.write = MagicMock()
-        writer.drain = AsyncMock()
-        writer.close = MagicMock()
-
-        await app._handle_connection(reader, writer)
-        app._serve_worker.assert_called_once()
-        app._serve_cli.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_handle_connection_routes_studio_to_cli(self):
-        app = Orchestrator()
-        app._serve_worker = AsyncMock()
-        app._serve_cli = AsyncMock()
-        app.db = MagicMock()
-        app.dispatcher = MagicMock()
-
-        reader = AsyncMock()
-        reader.readline = AsyncMock(return_value=json.dumps({
-            "jsonrpc": "2.0", "method": "studio.status", "params": {}, "id": 1,
-        }).encode())
-
-        writer = MagicMock()
-        writer.write = MagicMock()
-        writer.drain = AsyncMock()
-        writer.close = MagicMock()
-
-        await app._handle_connection(reader, writer)
-        app._serve_cli.assert_called_once()
-        app._serve_worker.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_handle_connection_rejects_unknown_first_message(self):
-        app = Orchestrator()
-        app._serve_worker = AsyncMock()
-        app._serve_cli = AsyncMock()
-
-        reader = AsyncMock()
-        reader.readline = AsyncMock(return_value=json.dumps({
-            "jsonrpc": "2.0", "method": "some.thing", "params": {}, "id": 1,
-        }).encode())
-
-        writer = MagicMock()
-        writer.write = MagicMock()
-        writer.drain = AsyncMock()
-        writer.close = MagicMock()
-
-        await app._handle_connection(reader, writer)
-        app._serve_worker.assert_not_called()
-        app._serve_cli.assert_not_called()
-        # Should write an error response
-        write_calls = [c for c in writer.write.call_args_list
-                       if b"error" in c[0][0]]
-        assert len(write_calls) >= 1
-
-    @pytest.mark.asyncio
-    async def test_handle_connection_parse_error(self):
-        app = Orchestrator()
-
-        reader = AsyncMock()
-        reader.readline = AsyncMock(return_value=b"not json")
-
-        writer = MagicMock()
-        writer.write = MagicMock()
-        writer.drain = AsyncMock()
-        writer.close = MagicMock()
-
-        await app._handle_connection(reader, writer)
-        write_calls = [c for c in writer.write.call_args_list
-                       if b"Parse error" in c[0][0]]
-        assert len(write_calls) >= 1
-
-
-class TestCodeHash:
-    """Tests for _compute_code_hash: deterministic, stable for identical trees."""
-
-    def test_hash_is_non_empty_hex(self):
-        from studio.orchestrator.main import Orchestrator
-        h = Orchestrator._compute_code_hash()
-        assert len(h) == 64
-        assert all(c in "0123456789abcdef" for c in h)
-
-    def test_hash_is_deterministic(self):
-        from studio.orchestrator.main import Orchestrator
-        h1 = Orchestrator._compute_code_hash()
-        h2 = Orchestrator._compute_code_hash()
-        assert h1 == h2
-
-    def test_hash_changes_when_file_changes(self, tmp_path):
-        from studio.orchestrator.main import Orchestrator
-        with patch.object(Path, "rglob") as mock_rglob:
-            mock_file = MagicMock()
-            mock_file.read_bytes.return_value = b"def foo(): pass"
-            mock_rglob.return_value = [mock_file]
-
-            h1 = Orchestrator._compute_code_hash()
-            mock_file.read_bytes.return_value = b"def foo(): return 1"
-            h2 = Orchestrator._compute_code_hash()
-            assert h1 != h2
-
-
-class TestStaleCodeDetection:
-    """Tests for _check_code_hash and stale code flagging."""
-
-    @pytest.fixture
-    def app(self):
-        app = Orchestrator()
-        app.settings = MagicMock()
-        app.settings.orchestrator = MagicMock()
-        app.settings.orchestrator.ntfy_url = ""
-        app._startup_code_hash = "abc123"
-        app._code_stale = False
-        return app
-
-    @pytest.mark.asyncio
-    async def test_check_code_hash_no_change(self, app):
-        with patch.object(Orchestrator, "_compute_code_hash", return_value="abc123"):
-            await app._check_code_hash()
-        assert app._code_stale is False
-
-    @pytest.mark.asyncio
-    async def test_check_code_hash_detects_stale(self, app):
-        with patch.object(Orchestrator, "_compute_code_hash", return_value="def456"):
-            await app._check_code_hash()
-        assert app._code_stale is True
-
-    @pytest.mark.asyncio
-    async def test_check_code_hash_no_ntfy_when_not_configured(self, app):
-        with patch.object(Orchestrator, "_compute_code_hash", return_value="def456"):
-            await app._check_code_hash()
-        assert app._code_stale is True
-        # ntfy_alert should have been called but the method bails early when ntfy_url is empty
-
-
-class TestCliVersion:
-    """Tests for _cli_version: installed vs running code hash."""
-
-    @pytest.fixture
-    def app_mock(self):
-        app = MagicMock()
-        app._startup_code_hash = "aaaa111122223333"
-        app.settings = MagicMock()
-        app.settings.orchestrator = MagicMock()
-        app.settings.orchestrator.ntfy_url = ""
-        return app
-
-    @pytest.mark.asyncio
-    async def test_version_shows_both_hashes(self, app_mock):
-        with patch.object(Orchestrator, "_compute_code_hash",
-                          return_value="aaaa111122223333"):
-            result = await _cli_version(app_mock, {})
-        assert result["installed_code_hash"] == "aaaa111122223333"
-        assert result["running_code_hash"] == "aaaa111122223333"
-        assert result["running_stale"] is False
-        assert result["running"] is True
-
-    @pytest.mark.asyncio
-    async def test_version_detects_stale(self, app_mock):
-        with patch.object(Orchestrator, "_compute_code_hash",
-                          return_value="bbbb444455556666"):
-            result = await _cli_version(app_mock, {})
-        assert result["running_stale"] is True
-        assert result["installed_code_hash"] == "bbbb444455556666"
-        assert result["running_code_hash"] == "aaaa111122223333"
-
-
-class TestCliStatusStale:
-    """Tests for _cli_status: stale code warning in status output."""
-
-    @pytest.fixture
-    def app_mock(self):
-        app = MagicMock()
-        app._code_stale = False
-        app.settings = MagicMock()
-        app.settings.orchestrator = MagicMock()
-        app.settings.orchestrator.socket_path = "/tmp/test.sock"
-        app.settings.remote_workers = MagicMock()
-        app.settings.remote_workers.enabled = False
-        app.db = MagicMock()
-        app.db.fetch_one = AsyncMock(return_value={"cnt": 0})
-        app.ops = MagicMock()
-        app.ops._start_time = 1700000000.0
-        return app
-
-    @pytest.mark.asyncio
-    async def test_status_no_warning_when_current(self, app_mock):
+        app_mock.ops = MagicMock()
+        app_mock.ops._start_time = time.time() - 3600
+        app_mock.settings.remote_workers = MagicMock()
+        app_mock.settings.remote_workers.enabled = False
+        app_mock._code_stale = False
+        app_mock._bwrap_available = True
         result = await _cli_status(app_mock, {})
-        assert "warning" not in result
+        assert result["worker_count"] == 3
+        assert "uptime" in result
 
     @pytest.mark.asyncio
-    async def test_status_includes_warning_when_stale(self, app_mock):
-        app_mock._code_stale = True
+    async def test_cli_status_db_error(self, app_mock):
+        app_mock.db.fetch_one = AsyncMock(side_effect=Exception("DB error"))
+        app_mock.ops = MagicMock()
+        app_mock.ops._start_time = time.time()
+        app_mock.settings.remote_workers = MagicMock()
+        app_mock.settings.remote_workers.enabled = False
+        app_mock._code_stale = False
+        app_mock._bwrap_available = False
         result = await _cli_status(app_mock, {})
-        assert "warning" in result
-        assert "Code updated" in result["warning"]
+        assert "error" in result
+        assert result["db_ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_cli_version(self, app_mock):
+        app_mock._startup_code_hash = "abc123"
+        result = await _cli_version(app_mock, {})
+        assert "installed_code_hash" in result

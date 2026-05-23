@@ -605,15 +605,7 @@ def test_runner_selector_kill_dispatches_to_firecracker():
     fc.kill_worker.assert_called_once()
 
 
-# ── _drain_worker_pipes for FirecrackerWorkerHandle ────────────────────────────
 
-
-def test_drain_worker_pipes_noop_for_fc_handle():
-    """_drain_worker_pipes is a no-op for non-Process handles."""
-    from studio.orchestrator.executor import DagExecutor
-    handle = FirecrackerWorkerHandle(vm=MagicMock(), worker_id="w1")
-    # Should not raise
-    DagExecutor._drain_worker_pipes(handle, "w1")
 
 
 # ── Bundle 7.3: Installer and operational tooling ─────────────────────────────

@@ -44,9 +44,8 @@ from .rpc import (
 )
 from .runner import LocalBwrapWorkerRunner, RemoteSSHWorkerRunner, K8sJobWorkerRunner, DockerWorkerRunner, RunnerSelector, DockerWorkerHandle
 from . import tls as tls_helpers
-from .executor import DagExecutor, NodeState
-from .scheduler import Scheduler
-from .reconciler import Reconciler
+# LangGraph replaces executor.py, scheduler.py, reconciler.py (Phase 5)
+# Execution is now handled by Hermes → LangGraph adapter
 from .models import Settings, OrchestratorSettings, ApprovalTier
 from .approval import (
     evaluate_approval_matrix,
@@ -71,10 +70,9 @@ class Orchestrator:
         self.dispatcher: RpcDispatcher | None = None
         self.handlers: RpcHandlers | None = None
         self.conn_mgr: ConnectionManager | None = None
-        self.runner: RunnerSelector | LocalBwrapWorkerRunner | RemoteSSHWorkerRunner | K8sJobWorkerRunner | None = None
-        self.executor: DagExecutor | None = None
-        self.scheduler: Scheduler | None = None
-        self.reconciler: Reconciler | None = None
+        # Phase 5: LangGraph handles execution. Studio keeps runner and isolation.
+        self.runner: "Any | None" = None
+        # executor, scheduler, reconciler replaced by LangGraph adapter
         self._server: asyncio.AbstractServer | None = None
         self._tcp_server: asyncio.AbstractServer | None = None
         self._http_server: "uvicorn.Server | None" = None
@@ -174,9 +172,8 @@ class Orchestrator:
                 )
         except Exception as exc:
             logger.debug("ntfy alert failed: %s", exc)
-        # Dispatch review track workers (adversarial, security, qa)
-        if self.executor:
-            await self.executor.start_bundle(bundle_id)
+        # Phase 5: LangGraph handles dispatch. Studio isolates only.
+        # Bundles are now managed by LangGraph, not the old DagExecutor.
 
     async def _on_bundler_failure(self, bundle_id: str, reason: str) -> None:
         """Callback from RpcHandlers when a bundler worker reports failure."""
@@ -187,9 +184,7 @@ class Orchestrator:
         """Callback from RpcHandlers when a review track worker completes successfully."""
         logger.info("Review track %s complete for bundle %s: %s findings",
                      role, bundle_id, len(findings))
-        # Fire DAG edges so the review-aggregator can become ready
-        if self.executor:
-            await self.executor._process_node_completion(bundle_id, role, NodeState.COMPLETED)
+        # Phase 5: LangGraph manages DAG edges, not the old DagExecutor.
 
     async def _on_review_blocking(self, bundle_id: str, blocking_reason: str) -> None:
         """Callback from RpcHandlers when a review track reports a blocking issue.
@@ -223,19 +218,8 @@ class Orchestrator:
 
     async def _evaluate_approval_matrix(self, bundle_id: str, merged_findings: dict) -> None:
         """Evaluate the approval matrix with the real deterministic evaluator."""
-        # Publish merged review-summary artifact
-        try:
-            if self.executor and self.executor._artifact_store:
-                await self.executor._artifact_store.publish(
-                    namespace="bundle",
-                    name="review-summary",
-                    version=bundle_id,
-                    content_type="application/json",
-                    data=json.dumps(merged_findings).encode("utf-8"),
-                    bundle_id=bundle_id,
-                )
-        except Exception as exc:
-            logger.warning("Failed to publish review-summary artifact: %s", exc)
+        # Phase 5: Artifact store publishing now via LangGraph adapter.
+        # Review summary is recorded through the LangGraph checkpoint stream.
 
         # Fetch bundle proposal data
         row = await self.db.fetch_one(
@@ -338,7 +322,7 @@ class Orchestrator:
             # Auto-approve: fire transition 4 automatically
             await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix")
             await self.sm.transition_6_start_execution(bundle_id)
-            await self.executor.start_bundle(bundle_id)
+            # Phase 5: LangGraph handles execution. Bundle state transition is sufficient.
             await self.sm._github_post_mirror(
                 bundle_id,
                 f"Auto-approved (tier: {tier_str}, reason: {decision.reason})",
@@ -347,7 +331,7 @@ class Orchestrator:
             # Auto-notify: fire transition 4 automatically, post notification
             await self.sm.transition_4_approve_from_review(bundle_id, "approval-matrix")
             await self.sm.transition_6_start_execution(bundle_id)
-            await self.executor.start_bundle(bundle_id)
+            # Phase 5: LangGraph handles execution.
             await self.sm._github_post_mirror(
                 bundle_id,
                 f"Auto-approved with notification (tier: {tier_str}, reason: {decision.reason})",
@@ -362,8 +346,9 @@ class Orchestrator:
     # ── Post-execution QA callbacks ────────────────────────────────────────
 
     async def _on_bundle_verifying(self, bundle_id: str) -> None:
-        """Callback from DagExecutor when bundle enters VERIFYING state. Spawns QA worker."""
-        await _spawn_qa_worker(self, bundle_id)
+        """Phase 5: LangGraph handles QA verification via its qa_verification node."""
+        # QA worker spawning is now managed by the LangGraph adapter.
+        pass
 
     async def _on_qa_pass(self, bundle_id: str, verification_report: dict) -> None:
         """QA verification passed: fire Transition 17 (VERIFYING -> COMPLETE)."""
@@ -896,43 +881,12 @@ class Orchestrator:
             else:
                 logger.warning("Sandbox: none (WARNING: workers running unsandboxed)")
 
-        # 5. Executor
-        self.executor = DagExecutor(
-            self.db,
-            self.sm,
-            self.runner,
-            self.handlers,
-            self.conn_mgr,
-            global_concurrency=self.settings.worker.global_concurrency,
-            heartbeat_timeout_multiplier=self.settings.worker.heartbeat_timeout_multiplier,
-            github_client=self.github_client,
-            settings=self.settings,
-        )
-        self.executor._on_review_aggregator_complete = self._on_review_aggregator_complete
-        self.executor._on_bundle_verifying = self._on_bundle_verifying
+        # Phase 5: LangGraph replaces executor, scheduler, reconciler.
+        # The isolation layer (runner, capability, RPC, approval) remains.
+        # Execution is managed by the Hermes → LangGraph adapter.
 
-        # 6. Scheduler
-        self.scheduler = Scheduler(
-            self.db,
-            self.executor,
-            dispatch_interval=1.0,
-            heartbeat_check_interval=float(
-                self.settings.worker.heartbeat_max_interval_minutes * 60
-            ),
-        )
-
-        # 7. Reconciler
-        self.reconciler = Reconciler(self.db, self.sm, self.executor)
-
-        # 8. Crash recovery (idempotent)
-        counts = await self.reconciler.reconcile()
-        logger.info("Reconciliation complete: %s", counts)
-
-        # 9. Start periodic loops
-        await self.scheduler.start()
-        logger.info("Scheduler started")
-
-        # 9.1. Start review scheduler (Bundle 5.2)
+        # 5.1. Start review scheduler (Bundle 5.2) — this is STUDIO's review,
+        #      not LangGraph's. ReviewScheduler triggers review workers independently.
         if self.settings.review.enabled:
             self._review_scheduler = ReviewScheduler(
                 self.db, self.settings.review, self.handlers, self.conn_mgr,
@@ -1096,8 +1050,7 @@ class Orchestrator:
         if self._review_scheduler:
             await self._review_scheduler.stop()
 
-        if self.scheduler:
-            await self.scheduler.stop()
+        # Phase 5: No scheduler to stop — LangGraph handles its own lifecycle.
 
         if self._server:
             self._server.close()
@@ -2123,8 +2076,7 @@ async def _cli_approve(app: Orchestrator, params: dict) -> dict:
 
     # Transition 6: start execution
     await app.sm.transition_6_start_execution(bundle_id)
-    await app.executor.start_bundle(bundle_id)
-
+    # Phase 5: LangGraph handles execution dispatch.
     return {"approved": True}
 
 
@@ -2243,25 +2195,30 @@ async def _cli_kill(app: Orchestrator, params: dict) -> dict:
         "SELECT id FROM workers WHERE bundle_id = ? AND state = ?",
         (bundle_id, "running"),
     )
+    # Phase 5: LangGraph manages worker lifecycle. Mark as failed via state machine.
     for w in workers:
-        proc = app.executor._running_workers.pop(w["id"], None)
-        if proc and proc.returncode is None:
-            await app.runner.kill_worker(proc, w["id"])
+        await app.db.execute(
+            "UPDATE workers SET state = ?, exit_reason = ?, ended_at = ? WHERE id = ?",
+            ("failed", "killed via CLI", int(time.time()), w["id"]),
+        )
 
     await app.sm.transition_25_fail_execution(bundle_id, "killed via CLI")
     return {"workers_killed": len(workers)}
 
 
 async def _cli_status(app: Orchestrator, params: dict) -> dict:
-    uptime = time.time() - app.ops._start_time if hasattr(app.ops, '_start_time') else 0
-    workers = await app.db.fetch_one(
-        "SELECT COUNT(*) as cnt FROM workers WHERE state = 'running'"
-    )
-    worker_count = workers["cnt"] if workers else 0
-    ready_nodes = await app.db.fetch_one(
-        "SELECT COUNT(*) as cnt FROM dag_nodes WHERE state = 'ready'"
-    )
-    queue_depth = ready_nodes["cnt"] if ready_nodes else 0
+    try:
+        uptime = time.time() - app.ops._start_time if hasattr(app.ops, '_start_time') else 0
+        workers = await app.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM workers WHERE state = 'running'"
+        )
+        worker_count = workers["cnt"] if workers else 0
+        ready_nodes = await app.db.fetch_one(
+            "SELECT COUNT(*) as cnt FROM dag_nodes WHERE state = 'ready'"
+        )
+        queue_depth = ready_nodes["cnt"] if ready_nodes else 0
+    except Exception as e:
+        return {"error": f"Database error: {e}", "db_ok": False}
 
     listeners = [f"unix:{app.settings.orchestrator.socket_path}"]
     if app.settings.remote_workers.enabled:
