@@ -87,7 +87,7 @@ class ExecutionResult:
 
     bundle_id: str
     success: bool
-    state: StudioGraphState
+    state: dict[str, Any]
     pr_url: str = ""
     commit_sha: str = ""
     error: str = ""
@@ -182,8 +182,22 @@ class MetaOrchestrator:
         logger.info(f"[{bundle_id}] Launching graph, auto_ship={auto_ship}")
 
         try:
-            from langgraph.errors import GraphInterrupt
             final_state = await self.runner.graph.ainvoke(initial, config)
+
+            # Detecting interrupt: ainvoke() returns state with __interrupt__
+            # when the graph pauses at an interrupt() node. GraphInterrupt
+            # is only raised on a second ainvoke() without Command(resume=...).
+            if "__interrupt__" in final_state:
+                checkpointed_state = {
+                    k: v for k, v in final_state.items()
+                    if k != "__interrupt__"
+                }
+                return await self._handle_interrupt(
+                    bundle_id=bundle_id,
+                    config=config,
+                    state=checkpointed_state,
+                    relay=active_relay,
+                )
 
             # Graph completed without interrupt
             return ExecutionResult(
@@ -192,15 +206,6 @@ class MetaOrchestrator:
                 state=final_state,
                 pr_url=final_state.get("pr_url", ""),
                 commit_sha=final_state.get("commit_sha", ""),
-            )
-
-        except GraphInterrupt:
-            # Human-in-the-loop interrupt caught by LangGraph
-            return await self._handle_interrupt(
-                bundle_id=bundle_id,
-                config=config,
-                state=initial,  # Start from initial for resume
-                relay=active_relay,
             )
 
         except Exception as e:
@@ -218,7 +223,7 @@ class MetaOrchestrator:
         self,
         bundle_id: str,
         config: dict,
-        state: StudioGraphState,
+        state: dict[str, Any],
         relay: SignalRelay | None,
     ) -> ExecutionResult:
         """Handle a LangGraph interrupt — relay to human if configured."""
@@ -433,6 +438,28 @@ class MetaOrchestrator:
     async def close(self) -> None:
         """Close the orchestrator and underlying runner."""
         await self.runner.close()
+
+    async def _get_checkpointed_state(self, bundle_id: str) -> dict[str, Any]:
+        """Retrieve the checkpointed state at the latest interrupt point.
+
+        After a GraphInterrupt, LangGraph writes the current state to the
+        checkpointer. This method reads it back to provide rich context
+        for the relay message (bundler output, review findings) instead
+        of just the pre-graph decomposition.
+
+        Returns the checkpointed state dict, or an empty dict on failure
+        (graceful degradation — the relay message falls back to bundle_id).
+        """
+        try:
+            state = await self.runner.graph.aget_state(
+                self.runner.config_for(bundle_id),
+            )
+            if state and state.values:
+                # aget_state returns a StateSnapshot; .values is the state dict
+                return state.values
+        except Exception as e:
+            logger.warning(f"[{bundle_id}] Could not retrieve checkpointed state: {e}")
+        return {}
 
     # ── Intent decomposition (AI-powered) ──────────────────────────────────────
     #

@@ -335,21 +335,30 @@ class TestBoundaryFireFullPipeline:
 
     @pytest.mark.asyncio
     async def test_full_pipeline_rejection_path(self):
-        """Rejected bundles go through all review nodes but stop at gate."""
+        """Rejected bundles go through all review nodes but stop at gate.
+
+        With auto_ship=False and no relay configured, the graph reaches
+        the interrupt but cannot proceed. The state contains all review
+        findings accumulated before the gate.
+        """
         orch = await MetaOrchestrator.create(db_path=":memory:")
         try:
             # High complexity + high risk = requires human approval
-            # Since no relay is configured, this should fail
+            # Since no relay is configured, the interrupt fires but fails
             result = await orch.execute(
                 intent="Rewrite the entire auth system and change the encryption scheme",
                 bundle_id="boundary-fire-full-002",
                 auto_ship=False,  # Force human review
                 target_repo="learhy/boundary",
             )
-            # Without a relay, the interrupt fails
-            assert result.was_interrupted is False
-            # But decomposition still works
+            # Without a relay, the interrupt fires and we can't proceed
+            assert result.was_interrupted is True
+            assert result.success is False
+            assert "No relay configured" in result.error
+            # Decomposition still worked
             assert result.bundle_id == "boundary-fire-full-002"
+            # State contains review findings accumulated before the gate
+            assert len(result.state.get("review_findings", [])) == 3
         finally:
             await orch.close()
 

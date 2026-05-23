@@ -8,6 +8,27 @@ from studio_isolation.meta_orchestrator import (
 )
 
 
+# ── Relay helpers for interrupt tests ──────────────────────────────────────
+
+
+def _make_approve_relay():
+    """Return a relay that always approves."""
+
+    async def _approve(message: str) -> str:
+        return "approve"
+
+    return _approve
+
+
+def _make_reject_relay(reason: str):
+    """Return a relay that always rejects with the given reason."""
+
+    async def _reject(message: str) -> str:
+        return f"reject: {reason}"
+
+    return _reject
+
+
 class TestIntentDecomposition:
     """Verify intent → DecomposedIntent conversion."""
 
@@ -224,5 +245,57 @@ class TestMetaOrchestratorLifecycle:
             assert r1.bundle_id == "intent-a"
             assert r2.bundle_id == "intent-b"
             assert r1.state["bundle_input"] != r2.state["bundle_input"]
+        finally:
+            await orch.close()
+
+    @pytest.mark.asyncio
+    async def test_interrupt_resume_with_relay(self):
+        """Full interrupt→resume cycle: graph pauses, relay fires, resume completes.
+
+        This exercises the checkpoint retrieval path (_get_checkpointed_state),
+        the relay message formatting, and the Command(resume=...) path through
+        LangGraph's checkpointer. The checkpointed state at interrupt time
+        contains bundler output and review findings — not just the pre-graph
+        decomposition.
+        """
+        orch = await MetaOrchestrator.create(
+            db_path=":memory:",
+            relay=_make_approve_relay(),
+        )
+        try:
+            # auto_ship=False forces the interrupt at approval_gate
+            result = await orch.execute(
+                intent="Add structured logging middleware to gRPC interceptor chain",
+                bundle_id="test-interrupt-resume",
+                auto_ship=False,
+            )
+            assert result.success is True
+            assert result.was_interrupted is True
+            assert result.human_decision == "approved"
+            # After resume, the graph completed all nodes
+            assert result.state["approved"] is True
+            assert result.state["qa_passed"] is True
+            assert result.state["bundle_id"] == "test-interrupt-resume"
+        finally:
+            await orch.close()
+
+    @pytest.mark.asyncio
+    async def test_interrupt_reject_stops_graph(self):
+        """Rejecting at the interrupt gate halts execution before developer."""
+        orch = await MetaOrchestrator.create(
+            db_path=":memory:",
+            relay=_make_reject_relay(reason="too risky"),
+        )
+        try:
+            result = await orch.execute(
+                intent="Rewrite the entire auth module with a new encryption scheme",
+                bundle_id="test-interrupt-reject",
+                auto_ship=False,
+            )
+            assert result.success is False
+            assert result.was_interrupted is True
+            assert result.human_decision == "rejected"
+            # The graph stopped before developer/qa
+            assert result.state.get("qa_passed") is not True
         finally:
             await orch.close()
