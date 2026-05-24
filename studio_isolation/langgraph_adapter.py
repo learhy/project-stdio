@@ -659,9 +659,34 @@ async def node_qa_verification(state: StudioGraphState, config: Optional[Runnabl
 
 
 async def node_complete(state: StudioGraphState) -> dict[str, Any]:
-    """Completion node: marks the bundle as complete."""
-    logger.info(f"[complete] Bundle {state.get('bundle_id')} complete")
-    return {}
+    """Completion node: marks the bundle as complete, aggregates final state.
+
+    Produces a summary that the meta-orchestrator can relay:
+    - pr_url: set if a commit_sha was produced by the developer node
+    - Final state aggregation for reporting
+    """
+    bundle_id = state.get("bundle_id", "unknown")
+    commit_sha = state.get("commit_sha", "")
+    branch = state.get("branch_name", "")
+    target = state.get("target_repo", "")
+    changed = state.get("changed_files", [])
+
+    logger.info(f"[complete] Bundle {bundle_id} complete"
+                + (f", branch={branch}" if branch else "")
+                + (f", commit={commit_sha[:8]}" if commit_sha else ""))
+
+    # Build PR URL from available state
+    pr_url = ""
+    if commit_sha and target:
+        # gh CLI format: https://github.com/{repo}/pull/{pr_number}
+        # Without PR number, surface the branch for manual PR creation
+        pr_url = f"https://github.com/{target}/compare/{branch}" if branch else ""
+
+    return {
+        "pr_url": state.get("pr_url", pr_url),
+        "commit_sha": commit_sha,
+        "changed_files": changed,
+    }
 
 
 # ── Conditional routing ────────────────────────────────────────────────────────

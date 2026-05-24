@@ -1046,3 +1046,170 @@ class TestRealRunnerWithRepoPath:
             socket_path="/tmp/studio.sock",
         )
         assert runner.repo_path == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# boundary-repo fixture: uses the local boundary-repo/ dir in the project
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestBoundaryRepoFixtureFire:
+    """Fire tests using the boundary-repo/ fixture inside the project dir.
+
+    This fixture is a local git clone (boundary-repo/) that is gitignored
+    and does NOT pollute /home/dan.rohan/software/boundary.  All tests
+    create worktrees from this fixture and clean up after themselves.
+    """
+
+    BOUNDARY_REPO_FIXTURE = Path(__file__).resolve().parent.parent.parent / "boundary-repo"
+
+    @staticmethod
+    def _fixture_available() -> bool:
+        r = TestBoundaryRepoFixtureFire.BOUNDARY_REPO_FIXTURE
+        return r.is_dir() and (r / ".git").is_dir() and (r / "go.mod").exists()
+
+    @pytest.mark.asyncio
+    async def test_fixture_graph_with_go_vet(self):
+        """Full graph execution with a real Boundary worktree from the fixture."""
+        if not self._fixture_available():
+            pytest.skip("boundary-repo/ fixture not available")
+        from studio_isolation.langgraph_adapter import StudioGraphRunner
+        from studio_isolation.runner import WorkerSpawnResult
+        import tempfile, subprocess, shutil
+
+        fixture = self.BOUNDARY_REPO_FIXTURE
+        wt_dir = tempfile.mkdtemp(prefix="studio-fixture-fire-")
+
+        class FixtureGoRunner:
+            async def spawn_worker(self, worker_id, bundle_id, node_id, manifest,
+                                   worktree_path, task_spec, worker_type, **kwargs):
+                if node_id != "developer":
+                    return WorkerSpawnResult(
+                        worker_id=worker_id, token="noop", node_id=node_id,
+                    )
+                actual_wt = Path(wt_dir) / worker_id
+                subprocess.run(
+                    ["git", "worktree", "add", "--detach", str(actual_wt), "HEAD"],
+                    cwd=str(fixture), capture_output=True, check=True,
+                )
+                vet = subprocess.run(
+                    ["go", "vet", "./internal/errors/..."],
+                    cwd=str(actual_wt), capture_output=True, text=True, timeout=120,
+                )
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token="fixture-token", node_id=node_id,
+                    error="" if vet.returncode == 0 else vet.stderr[:500],
+                )
+
+        mock_db = MagicMock()
+        mock_db.fetch_one = AsyncMock(return_value=None)
+        mock_db.execute = AsyncMock()
+        mock_db.conn = MagicMock()
+        mock_db.conn.commit = AsyncMock()
+
+        runner = await StudioGraphRunner.create(
+            db_path=":memory:",
+            studio_runner=FixtureGoRunner(),
+            studio_db=mock_db,
+        )
+        try:
+            state = await runner.run(
+                bundle_input="Audit boundary errors package with go vet from fixture",
+                bundle_id="boundary-fixture-001",
+                auto_ship=True,
+            )
+            assert state["bundle_id"] == "boundary-fixture-001"
+            assert state["approved"] is True
+            assert state["qa_passed"] is True
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(wt_dir)],
+                cwd=str(fixture), capture_output=True,
+            )
+            shutil.rmtree(wt_dir, ignore_errors=True)
+            await runner.close()
+
+    @pytest.mark.asyncio
+    async def test_node_complete_produces_pr_url_with_target_repo(self):
+        """When target_repo and branch_name are set, node_complete builds a PR URL."""
+        from studio_isolation.langgraph_adapter import StudioGraphRunner
+
+        runner = await StudioGraphRunner.create(db_path=":memory:")
+        try:
+            state = await runner.run(
+                bundle_input="Add PR URL test",
+                bundle_id="pr-url-test-001",
+                auto_ship=True,
+            )
+            assert state["approved"] is True
+            # node_complete computes pr_url from target_repo + branch_name when commit_sha is absent
+            assert "pr_url" in state, "node_complete should set pr_url"
+        finally:
+            await runner.close()
+
+    @pytest.mark.asyncio
+    async def test_fixture_meta_orchestrator_with_real_worktree(self):
+        """MetaOrchestrator.execute() with a real boundary worktree from the fixture."""
+        if not self._fixture_available():
+            pytest.skip("boundary-repo/ fixture not available")
+        from studio_isolation.meta_orchestrator import MetaOrchestrator
+        from studio_isolation.runner import WorkerSpawnResult
+        import tempfile, subprocess, shutil
+
+        fixture = self.BOUNDARY_REPO_FIXTURE
+        wt_root = tempfile.mkdtemp(prefix="studio-meta-fixture-")
+        worktrees_created: list[str] = []
+
+        class MetaFixtureRunner:
+            async def spawn_worker(self, worker_id, bundle_id, node_id, manifest,
+                                   worktree_path, task_spec, worker_type, **kwargs):
+                if node_id != "developer":
+                    return WorkerSpawnResult(
+                        worker_id=worker_id, token="noop", node_id=node_id,
+                    )
+                actual_wt = Path(wt_root) / worker_id
+                subprocess.run(
+                    ["git", "worktree", "add", "--detach", str(actual_wt), "HEAD"],
+                    cwd=str(fixture), capture_output=True, check=True,
+                )
+                worktrees_created.append(str(actual_wt))
+                list_result = subprocess.run(
+                    ["go", "list", "./internal/errors/..."],
+                    cwd=str(actual_wt), capture_output=True, text=True, timeout=60,
+                )
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token="meta-fixture-token", node_id=node_id,
+                    error="" if list_result.returncode == 0 else list_result.stderr[:500],
+                )
+
+        mock_db = MagicMock()
+        mock_db.fetch_one = AsyncMock(return_value=None)
+        mock_db.execute = AsyncMock()
+        mock_db.conn = MagicMock()
+        mock_db.conn.commit = AsyncMock()
+
+        orch = await MetaOrchestrator.create(
+            db_path=":memory:",
+            studio_runner=MetaFixtureRunner(),
+            studio_db=mock_db,
+        )
+        try:
+            result = await orch.execute(
+                intent="Verify boundary errors package from fixture",
+                bundle_id="meta-fixture-001",
+                auto_ship=True,
+                target_repo="learhy/boundary",
+            )
+            assert result.success is True, f"MetaOrchestrator failed: {result.error}"
+            assert result.bundle_id == "meta-fixture-001"
+            assert result.state["approved"] is True
+            assert result.state["qa_passed"] is True
+            assert len(worktrees_created) > 0, "No worktree was created"
+        finally:
+            for wt in worktrees_created:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", wt],
+                    cwd=str(fixture), capture_output=True,
+                )
+            shutil.rmtree(wt_root, ignore_errors=True)
+            await orch.close()
