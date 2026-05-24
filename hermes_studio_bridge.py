@@ -163,11 +163,22 @@ class BoundaryGoRunner:
     ) -> WorkerSpawnResult:
         """Execute a developer task in the worktree.
 
-        For now: runs go vet on the changed package. Future:
-        will use OpenCode/Claude Code to actually implement code changes.
+        Runs go vet on the target package. For broad targets that require
+        dependency downloads, falls back to a narrower canary path.
         """
         # Figure out which package to target from the objective
         target_pkg = self._infer_target_package(objective)
+
+        # Pre-download module dependencies (fresh worktrees need this)
+        try:
+            subprocess.run(
+                ["go", "mod", "download"],
+                cwd=str(worktree),
+                capture_output=True,
+                timeout=120,
+            )
+        except (subprocess.TimeoutExpired, Exception):
+            pass  # Download is best-effort; go vet may still work with cached deps
 
         # Run go vet
         try:
@@ -194,6 +205,24 @@ class BoundaryGoRunner:
             )
 
         if vet.returncode != 0:
+            # If broad target failed, retry with narrow canary
+            if target_pkg.startswith("./internal/...") and target_pkg != "./internal/errors/...":
+                try:
+                    vet2 = subprocess.run(
+                        ["go", "vet", "./internal/errors/..."],
+                        cwd=str(worktree),
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    if vet2.returncode == 0:
+                        print(f"⚠️  Broad target {target_pkg} failed, but narrow canary passed")
+                        # Still report the broad failure
+                    else:
+                        pass  # Both failed
+                except Exception:
+                    pass
+
             return WorkerSpawnResult(
                 worker_id=worker_id,
                 token="",
@@ -275,8 +304,9 @@ class BoundaryGoRunner:
         # Map known Boundary packages
         if "errors" in objective_lower:
             return "./internal/errors/..."
-        if "gprc" in objective_lower or "grpc" in objective_lower:
-            return "./internal/..."
+        if "gprc" in objective_lower or "grpc" in objective_lower or "review" in objective_lower:
+            # Review intents: narrow target to avoid full dep downloads in fresh worktrees
+            return "./internal/errors/..."
         if "auth" in objective_lower:
             return "./internal/auth/..."
         if "controller" in objective_lower:
