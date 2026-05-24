@@ -4,10 +4,14 @@ LangGraph adapter for Studio's isolation layer.
 This module defines the canonical Studio StateGraph that replaces
 executor.py, scheduler.py, reconciler.py, reducers.py, and expression.py.
 
-Architecture (sequential — parallel fan-out via Send() in Phase 3):
-    bundler → review_adversary → review_security → review_qa
-           → approval_gate (interrupt for human-in-the-loop)
-           → developer → qa_verification → complete
+Architecture (parallel review fan-out via LangGraph Send()):
+    START → bundler → continue_to_reviews (condition)
+        → Send → review_adversary ─┐
+        → Send → review_security  ─┤ → review_aggregator
+        → Send → review_qa        ─┘       │
+                                            ▼
+    approval_gate (interrupt for human-in-the-loop)
+        → developer → qa_verification → complete → END
 
 Each node wraps a Studio runner from studio_isolation. The graph uses
 SQLite checkpointing to survive restarts.
@@ -36,12 +40,13 @@ Usage:
 """
 
 import logging
-from typing import Any, Optional
+import operator
+from typing import Any, Optional, Annotated
 
 import aiosqlite
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.types import interrupt
+from langgraph.types import interrupt, Send
 
 # LangChain's RunnableConfig — the type LangGraph nodes use for config
 from langchain_core.runnables.config import RunnableConfig
@@ -53,12 +58,16 @@ logger = logging.getLogger(__name__)
 
 from typing import TypedDict
 
-
 class StudioGraphState(TypedDict, total=False):
     """The canonical state for the Studio LangGraph.
 
     This is the shared state object that flows through every node.
     Each node reads from and writes to this state.
+
+    Fields using Annotated[..., operator.add] are merge-reduced across
+    parallel fan-out nodes (LangGraph's Send() mechanism).  When three
+    review nodes run in parallel, each returns {"review_findings": [...],
+    ...} and LangGraph concatenates the lists automatically.
     """
 
     # Input
@@ -69,8 +78,8 @@ class StudioGraphState(TypedDict, total=False):
     proposal: dict[str, Any]
     task_dag: dict[str, Any]
 
-    # Review outputs
-    review_findings: list[dict[str, Any]]
+    # Review outputs — Annotated for parallel merge
+    review_findings: Annotated[list[dict[str, Any]], operator.add]
     approval_tier: str
     auto_ship: bool
 
@@ -213,13 +222,15 @@ async def node_bundler(state: StudioGraphState, config: Optional[RunnableConfig]
 
 
 async def node_review_adversary(state: StudioGraphState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
-    """Adversarial review: challenge assumptions in the proposal."""
+    """Adversarial review: challenge assumptions in the proposal.
+
+    Returns only its own finding — LangGraph merges parallel review
+    findings via the Annotated[..., operator.add] reducer on review_findings.
+    """
     logger.info("[review:adversary] Reviewing proposal")
-    findings: list[dict[str, Any]] = list(state.get("review_findings", []))
 
     runner, db = _get_runner_and_db(config)
     if runner is not None and db is not None:
-        # Real review worker — spawn a lightweight review run
         bundle_id = state.get("bundle_id", "unknown")
         from studio_isolation.models import (
             CapabilityManifest, Grants, FilesystemGrants, FilesystemPathGrant,
@@ -259,18 +270,16 @@ async def node_review_adversary(state: StudioGraphState, config: Optional[Runnab
             except Exception as e:
                 logger.error(f"[review:adversary] Review wait failed: {e}")
 
-    findings.append({
+    return {"review_findings": [{
         "role": "adversary",
         "finding": "Proposal assumptions are reasonable (placeholder)",
         "severity": "info",
-    })
-    return {"review_findings": findings}
+    }]}
 
 
 async def node_review_security(state: StudioGraphState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Security review: check for vulnerabilities, sensitive paths."""
     logger.info("[review:security] Reviewing security posture")
-    findings: list[dict[str, Any]] = list(state.get("review_findings", []))
 
     runner, db = _get_runner_and_db(config)
     if runner is not None and db is not None:
@@ -312,18 +321,16 @@ async def node_review_security(state: StudioGraphState, config: Optional[Runnabl
             except Exception as e:
                 logger.error(f"[review:security] Review wait failed: {e}")
 
-    findings.append({
+    return {"review_findings": [{
         "role": "security",
         "finding": "No security concerns detected (placeholder)",
         "severity": "info",
-    })
-    return {"review_findings": findings}
+    }]}
 
 
 async def node_review_qa(state: StudioGraphState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """QA review: check completeness, test coverage, acceptance criteria."""
     logger.info("[review:qa] Reviewing quality")
-    findings: list[dict[str, Any]] = list(state.get("review_findings", []))
 
     runner, db = _get_runner_and_db(config)
     if runner is not None and db is not None:
@@ -365,12 +372,42 @@ async def node_review_qa(state: StudioGraphState, config: Optional[RunnableConfi
             except Exception as e:
                 logger.error(f"[review:qa] Review wait failed: {e}")
 
-    findings.append({
+    return {"review_findings": [{
         "role": "qa",
         "finding": "QA plan looks adequate (placeholder)",
         "severity": "info",
-    })
-    return {"review_findings": findings}
+    }]}
+
+
+async def node_review_aggregator(state: StudioGraphState) -> dict[str, Any]:
+    """Review aggregator: collects findings from parallel review nodes.
+
+    By the time LangGraph routes to this node, all parallel review
+    Send() nodes have completed and their findings have been merged
+    into state.review_findings via operator.add. This node is a
+    pass-through that simply acknowledges aggregation is complete.
+    """
+    findings = state.get("review_findings", [])
+    logger.info(f"[review_aggregator] Collected {len(findings)} review findings")
+    # Log a summary for observability
+    for f in findings:
+        logger.info(f"  [{f.get('role', '?')}] {f.get('severity', 'info')}: {f.get('finding', '')[:80]}")
+    return {}
+
+
+def continue_to_reviews(state: StudioGraphState) -> list[Send]:
+    """Fan-out: send the current state to all three parallel review nodes.
+
+    LangGraph invokes this after the bundler completes. It returns a list
+    of Send() objects, one per review node. Each review runs in parallel
+    with its own copy of the state. When all complete, LangGraph routes
+    to the review_aggregator node.
+    """
+    return [
+        Send("review_adversary", state),
+        Send("review_security", state),
+        Send("review_qa", state),
+    ]
 
 
 async def node_approval_gate(state: StudioGraphState) -> dict[str, Any]:
@@ -755,9 +792,18 @@ class StudioGraphRunner:
 def _make_graph() -> StateGraph:
     """Build (but do not compile) the Studio StateGraph.
 
-    Graph topology (sequential, parallel fan-out via Send() in Phase 3):
-        bundler → review_adversary → review_security → review_qa
-               → approval_gate → developer → qa_verification → complete
+    Graph topology (parallel review fan-out via LangGraph Send()):
+        START → bundler → continue_to_reviews (condition)
+            → Send → review_adversary ─┐
+            → Send → review_security  ─┤ → review_aggregator
+            → Send → review_qa        ─┘       │
+                                                ▼
+        approval_gate → developer → qa_verification → complete → END
+
+    The continue_to_reviews function returns a list of Send() objects.
+    LangGraph fans out to all three review nodes in parallel. When all
+    complete, they converge at review_aggregator, which forwards to the
+    approval gate.
     """
     builder = StateGraph(StudioGraphState)
 
@@ -765,18 +811,31 @@ def _make_graph() -> StateGraph:
     builder.add_node("review_adversary", node_review_adversary)
     builder.add_node("review_security", node_review_security)
     builder.add_node("review_qa", node_review_qa)
+    builder.add_node("review_aggregator", node_review_aggregator)
     builder.add_node("approval_gate", node_approval_gate)
     builder.add_node("developer", node_developer)
     builder.add_node("qa_verification", node_qa_verification)
     builder.add_node("complete", node_complete)
 
-    builder.set_entry_point("bundler")
+    # Entry: start at bundler
+    builder.add_edge(START, "bundler")
 
-    # Sequential edges
-    builder.add_edge("bundler", "review_adversary")
-    builder.add_edge("review_adversary", "review_security")
-    builder.add_edge("review_security", "review_qa")
-    builder.add_edge("review_qa", "approval_gate")
+    # After bundler: fan-out to parallel reviews via Send()
+    builder.add_conditional_edges(
+        "bundler",
+        continue_to_reviews,
+        # continue_to_reviews returns Send objects; LangGraph handles
+        # the parallel fan-out automatically. No path map needed.
+        ["review_adversary", "review_security", "review_qa"],
+    )
+
+    # All three review nodes converge at the aggregator
+    builder.add_edge("review_adversary", "review_aggregator")
+    builder.add_edge("review_security", "review_aggregator")
+    builder.add_edge("review_qa", "review_aggregator")
+
+    # Aggregator → approval gate → conditional routing
+    builder.add_edge("review_aggregator", "approval_gate")
 
     # Conditional: approval → developer or complete
     builder.add_conditional_edges(

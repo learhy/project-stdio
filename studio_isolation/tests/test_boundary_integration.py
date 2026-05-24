@@ -366,10 +366,11 @@ class TestBoundaryEndToEnd:
                 node_name = list(event.keys())[0]
                 nodes_visited.append(node_name)
 
-            # Must visit all 8 nodes
-            assert len(nodes_visited) == 8
+            # Must visit all 9 nodes (added review_aggregator for parallel reviews)
+            assert len(nodes_visited) == 9
             assert nodes_visited[0] == "bundler"
             assert nodes_visited[-1] == "complete"
+            assert "review_aggregator" in nodes_visited
             assert "approval_gate" in nodes_visited
             assert "developer" in nodes_visited
             assert "qa_verification" in nodes_visited

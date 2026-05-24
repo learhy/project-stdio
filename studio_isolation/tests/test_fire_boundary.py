@@ -275,7 +275,12 @@ class TestBoundaryGraphRunner:
 
     @pytest.mark.asyncio
     async def test_graph_topology_traversal(self):
-        """Verify all nodes in the canonical graph are visited for Boundary."""
+        """Verify all nodes in the canonical graph are visited for Boundary.
+
+        With parallel review fan-out, reviews may arrive in any order.
+        We verify all required nodes are present and the boundary nodes
+        (bundler first, complete last) have correct positions.
+        """
         from studio_isolation.langgraph_adapter import StudioGraphRunner
 
         runner = await StudioGraphRunner.create(db_path=":memory:")
@@ -292,20 +297,24 @@ class TestBoundaryGraphRunner:
                 node_name = list(event.keys())[0]
                 nodes_visited.append(node_name)
 
-            # Verify the expected node sequence (sequential graph)
-            expected = [
-                "bundler",
-                "review_adversary",
-                "review_security",
-                "review_qa",
-                "approval_gate",
-                "developer",
-                "qa_verification",
-                "complete",
-            ]
-            assert nodes_visited == expected, (
-                f"Expected node sequence {expected}, got {nodes_visited}"
+            # Verify all required nodes are present (reviews may be in any order)
+            required = {
+                "bundler", "review_adversary", "review_security", "review_qa",
+                "review_aggregator", "approval_gate", "developer",
+                "qa_verification", "complete",
+            }
+            assert set(nodes_visited) == required, (
+                f"Expected nodes {sorted(required)}, got {sorted(set(nodes_visited))}"
             )
+            # Entry and exit nodes must be in correct position
+            assert nodes_visited[0] == "bundler"
+            assert nodes_visited[-1] == "complete"
+            # Review nodes run in parallel → review_aggregator comes after all reviews
+            # approval_gate comes after aggregator → developer → qa → complete
+            assert nodes_visited.index("review_aggregator") > nodes_visited.index("bundler")
+            assert nodes_visited.index("approval_gate") > nodes_visited.index("review_aggregator")
+            assert nodes_visited.index("developer") > nodes_visited.index("approval_gate")
+            assert nodes_visited.index("qa_verification") > nodes_visited.index("developer")
         finally:
             await runner.close()
 
