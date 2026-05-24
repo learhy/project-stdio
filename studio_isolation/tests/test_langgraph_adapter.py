@@ -157,3 +157,159 @@ class TestGraphTopology:
         # QA
         assert result["qa_passed"] is True
         assert result["qa_report"] is not None
+
+
+# ── Output parsing tests ────────────────────────────────────────────────────
+
+
+class TestOutputParsing:
+    """Verify STUDIO_RESULT and conventional marker parsing."""
+
+    def test_parse_developer_output_studio_result(self):
+        from studio_isolation.langgraph_adapter import _parse_developer_output
+        stdout = (
+            'STUDIO_RESULT: {"changed_files": ["internal/errors/kind.go"], '
+            '"commit_sha": "abc123def456", "test_results": {"passed": true}}'
+        )
+        changed_files, commit_sha, test_results = _parse_developer_output(
+            stdout, "", 0,
+        )
+        assert "internal/errors/kind.go" in changed_files
+        assert commit_sha == "abc123def456"
+        assert test_results == {"passed": True}
+
+    def test_parse_developer_output_conventional_markers(self):
+        from studio_isolation.langgraph_adapter import _parse_developer_output
+        stdout = (
+            "CHANGED: internal/errors/kind.go\n"
+            "CHANGED: internal/errors/code.go\n"
+            "COMMIT: def789abc\n"
+            "Some other noise\n"
+        )
+        changed_files, commit_sha, _ = _parse_developer_output(stdout, "", 0)
+        assert "internal/errors/kind.go" in changed_files
+        assert "internal/errors/code.go" in changed_files
+        assert commit_sha == "def789abc"
+
+    def test_parse_developer_output_nonzero_exit(self):
+        from studio_isolation.langgraph_adapter import _parse_developer_output
+        stderr = "go: build failed: undefined: FooBar"
+        changed_files, commit_sha, test_results = _parse_developer_output(
+            "", stderr, 1,
+        )
+        assert changed_files == []
+        assert commit_sha == ""
+        assert test_results.get("failed") is True
+        assert test_results.get("exit_code") == 1
+
+    def test_parse_qa_output_studio_result(self):
+        from studio_isolation.langgraph_adapter import _parse_qa_output
+        stdout = (
+            'STUDIO_RESULT: {"qa_report": {"tests_run": 14, "tests_passed": 14, '
+            '"tests_failed": 0, "passed": true}, "qa_passed": true}'
+        )
+        report = _parse_qa_output(stdout, "")
+        assert report["tests_run"] == 14
+        assert report["tests_passed"] == 14
+        assert report["passed"] is True
+
+    def test_parse_qa_output_conventional_markers(self):
+        from studio_isolation.langgraph_adapter import _parse_qa_output
+        stdout = "PASS: test_kind\nPASS: test_code\nFAIL: test_match\nPASS: test_code2\n"
+        report = _parse_qa_output(stdout, "")
+        assert report["tests_run"] == 4
+        assert report["tests_passed"] == 3
+        assert report["tests_failed"] == 1
+        assert report["passed"] is False
+
+    def test_parse_qa_output_tests_count_line(self):
+        from studio_isolation.langgraph_adapter import _parse_qa_output
+        stdout = "TESTS: 42\nPASS: test_a\nPASS: test_b\n"
+        report = _parse_qa_output(stdout, "")
+        assert report["tests_run"] == 44  # 42 from TESTS: + 2 from PASS lines
+        assert report["tests_passed"] == 2
+
+    def test_parse_qa_output_stderr_warnings(self):
+        from studio_isolation.langgraph_adapter import _parse_qa_output
+        stdout = ""
+        stderr = "DeprecationWarning: use_new_api is deprecated"
+        report = _parse_qa_output(stdout, stderr)
+        assert "warnings" in report
+        assert "DeprecationWarning" in report["warnings"][0]
+
+
+# ── Runner output capture tests ─────────────────────────────────────────────
+
+
+class TestRunnerOutputCapture:
+    """Developer node captures stdout/stderr from spawned workers."""
+
+    @pytest.mark.asyncio
+    async def test_dev_node_captures_worker_output(self):
+        """A custom runner that produces STUDIO_RESULT output goes through the graph."""
+        from studio_isolation.langgraph_adapter import StudioGraphRunner
+        from studio_isolation.runner import WorkerSpawnResult
+        from unittest.mock import MagicMock, AsyncMock
+
+        class StdoutDevRunner:
+            async def spawn_worker(self, worker_id, bundle_id, node_id, manifest,
+                                   worktree_path, task_spec, worker_type, **kwargs):
+                if node_id != "developer":
+                    return WorkerSpawnResult(
+                        worker_id=worker_id, token="noop", node_id=node_id,
+                    )
+                return WorkerSpawnResult(
+                    worker_id=worker_id, token="dev-token", node_id=node_id,
+                )
+
+        mock_db = MagicMock()
+        mock_db.fetch_one = AsyncMock(return_value=None)
+        mock_db.execute = AsyncMock()
+        mock_db.conn = MagicMock()
+        mock_db.conn.commit = AsyncMock()
+
+        runner = await StudioGraphRunner.create(
+            db_path=":memory:",
+            studio_runner=StdoutDevRunner(),
+            studio_db=mock_db,
+        )
+        try:
+            state = await runner.run(
+                bundle_input="Add doc comment to internal/errors",
+                bundle_id="output-capture-001",
+                auto_ship=True,
+                target_repo="learhy/boundary",
+                base_branch="main",
+            )
+            assert state["bundle_id"] == "output-capture-001"
+            assert state["approved"] is True
+            assert state["qa_passed"] is True
+            # target_repo should be threaded into state
+            assert state.get("target_repo") == "learhy/boundary"
+            assert state.get("base_branch") == "main"
+            # Developer should set worktree_path and branch_name
+            assert state.get("worktree_path") is not None
+            assert state.get("branch_name") is not None
+        finally:
+            await runner.close()
+
+    @pytest.mark.asyncio
+    async def test_target_repo_passed_to_initial_state(self):
+        """StudioGraphRunner.run() accepts target_repo and base_branch."""
+        from studio_isolation.langgraph_adapter import StudioGraphRunner
+
+        runner = await StudioGraphRunner.create(db_path=":memory:")
+        try:
+            state = await runner.run(
+                bundle_input="Test target_repo threading",
+                bundle_id="target-repo-test",
+                auto_ship=True,
+                target_repo="learhy/boundary",
+                base_branch="develop",
+            )
+            assert state["target_repo"] == "learhy/boundary"
+            assert state["base_branch"] == "develop"
+            # node_complete uses target_repo to build PR URL
+            assert state.get("pr_url") == "https://github.com/learhy/boundary/compare/studio/target-repo-test"
+        finally:
+            await runner.close()

@@ -492,17 +492,19 @@ async def node_approval_gate(state: StudioGraphState) -> dict[str, Any]:
                  else f"Rejected: {approval.get('reason', 'no reason given')}",
     }
 
-
 async def node_developer(state: StudioGraphState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """Developer node: implements the task using a Studio worker.
 
     With a runner in config: spawns a real isolated developer worker via the
-    Studio isolation layer, waits for it to complete, and returns results.
+    Studio isolation layer, captures stdout/stderr, and returns structured
+    results (changed_files, commit_sha, test_results).
+
     Without a runner: returns placeholder state for testing.
     """
     runner, db = _get_runner_and_db(config)
     bundle_id = state.get("bundle_id", "unknown")
     node_id = "developer"
+    target_repo = state.get("target_repo", "")
     worktree_path = f"/tmp/studio-{bundle_id}"
 
     if runner is None or db is None:
@@ -546,6 +548,7 @@ async def node_developer(state: StudioGraphState, config: Optional[RunnableConfi
         "objective": state.get("bundle_input", ""),
         "task_dag": state.get("task_dag", {}),
         "approval_reason": state.get("approval_reason", ""),
+        "target_repo": target_repo,
     }
 
     logger.info(f"[developer] Spawning worker for bundle {bundle_id}")
@@ -567,25 +570,56 @@ async def node_developer(state: StudioGraphState, config: Optional[RunnableConfi
             "branch_name": f"studio/{bundle_id}",
         }
 
-    # Wait for worker to complete (process handle)
-    if result.process and hasattr(result.process, "wait"):
+    # Capture worker output (stdout + stderr) via communicate()
+    stdout_text = ""
+    stderr_text = ""
+    exit_code = -1
+    has_process = (
+        result.process is not None
+        and (hasattr(result.process, "communicate") or hasattr(result.process, "wait"))
+    )
+    if has_process and hasattr(result.process, "communicate"):
+        try:
+            stdout, stderr = await result.process.communicate()
+            stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
+            stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+            exit_code = result.process.returncode or 0
+            logger.info(f"[developer] Worker exited with code {exit_code}, "
+                        f"stdout={len(stdout_text)}B, stderr={len(stderr_text)}B")
+        except Exception as e:
+            logger.error(f"[developer] Worker communicate failed: {e}")
+            stderr_text = str(e)
+    elif has_process and hasattr(result.process, "wait"):
         try:
             exit_code = await result.process.wait()
             logger.info(f"[developer] Worker exited with code {exit_code}")
         except Exception as e:
             logger.error(f"[developer] Worker wait failed: {e}")
+    else:
+        # No real process (e.g., test-mode NoopWorkerRunner) — treat as success
+        exit_code = 0
+
+    # Parse worker output for structured results
+    changed_files, commit_sha, test_results = _parse_developer_output(
+        stdout_text, stderr_text, exit_code,
+    )
 
     return {
-        "changed_files": [],
+        "changed_files": changed_files,
         "branch_name": f"studio/{bundle_id}",
         "worktree_path": worktree_path,
+        "commit_sha": commit_sha,
+        "test_results": test_results,
+        "error": "" if exit_code == 0 else (stderr_text[:500] if stderr_text else f"Exit code {exit_code}"),
     }
 
 
 async def node_qa_verification(state: StudioGraphState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """QA verification node: runs tests and reports results.
 
-    With a runner in config: spawns a QA worker that runs pytest/go test/etc.
+    With a runner in config: spawns a QA worker that runs pytest/go test/etc,
+    captures stdout/stderr, and parses structured results.
+
     Without a runner: returns placeholder state for testing.
     """
     logger.info(f"[qa] Running verification for bundle {state.get('bundle_id', 'unknown')}")
@@ -632,21 +666,54 @@ async def node_qa_verification(state: StudioGraphState, config: Optional[Runnabl
             task_spec=task_spec,
             worker_type="qa",
         )
-        if result.process and hasattr(result.process, "wait"):
+
+        # Capture QA worker output
+        stdout_text = ""
+        stderr_text = ""
+        exit_code = -1
+        has_process = (
+            result.process is not None
+            and (hasattr(result.process, "communicate") or hasattr(result.process, "wait"))
+        )
+        if has_process and hasattr(result.process, "communicate"):
+            try:
+                stdout, stderr = await result.process.communicate()
+                stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
+                stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+                exit_code = result.process.returncode or 0
+                logger.info(f"[qa] QA worker exited with code {exit_code}, "
+                            f"stdout={len(stdout_text)}B, stderr={len(stderr_text)}B")
+            except Exception as e:
+                logger.error(f"[qa] QA communicate failed: {e}")
+                stderr_text = str(e)
+                exit_code = 1
+        elif has_process and hasattr(result.process, "wait"):
             try:
                 exit_code = await result.process.wait()
                 logger.info(f"[qa] QA worker exited with code {exit_code}")
-                if exit_code != 0:
-                    return {
-                        "qa_passed": False,
-                        "qa_report": {
-                            "tests_run": 0,
-                            "tests_passed": 0,
-                            "summary": f"QA worker exited with code {exit_code}",
-                        },
-                    }
             except Exception as e:
                 logger.error(f"[qa] QA wait failed: {e}")
+                exit_code = 1
+        else:
+            # No real process (e.g., test-mode NoopWorkerRunner) — treat as pass
+            exit_code = 0
+
+        if exit_code != 0:
+            return {
+                "qa_passed": False,
+                "qa_report": {
+                    "tests_run": 0,
+                    "tests_passed": 0,
+                    "summary": (stderr_text or f"QA worker exited with code {exit_code}")[:500],
+                },
+            }
+
+        # Parse QA output for structured results
+        qa_report = _parse_qa_output(stdout_text, stderr_text)
+        return {
+            "qa_passed": qa_report.get("passed", True),
+            "qa_report": qa_report,
+        }
 
     return {
         "qa_passed": True,
@@ -656,6 +723,53 @@ async def node_qa_verification(state: StudioGraphState, config: Optional[Runnabl
             "summary": "QA verification completed (placeholder)",
         },
     }
+
+
+def _parse_qa_output(stdout: str, stderr: str) -> dict[str, Any]:
+    """Parse QA worker output into a structured report.
+
+    Recognizes ``STUDIO_RESULT:`` JSON lines and conventional test report
+    markers (``PASS:``, ``FAIL:``, ``TESTS:``).
+    """
+    import json as _json
+
+    report: dict[str, Any] = {
+        "tests_run": 0,
+        "tests_passed": 0,
+        "tests_failed": 0,
+        "passed": True,
+        "summary": "QA verification completed",
+    }
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("STUDIO_RESULT:"):
+            try:
+                payload = _json.loads(line.split("STUDIO_RESULT:", 1)[1].strip())
+                if "qa_report" in payload:
+                    report.update(payload["qa_report"])
+                if "qa_passed" in payload:
+                    report["passed"] = payload["qa_passed"]
+            except (_json.JSONDecodeError, ValueError):
+                pass
+        elif line.startswith("PASS:"):
+            report["tests_passed"] += 1
+            report["tests_run"] += 1
+        elif line.startswith("FAIL:"):
+            report["tests_failed"] += 1
+            report["tests_run"] += 1
+            report["passed"] = False
+        elif line.startswith("TESTS:"):
+            try:
+                report["tests_run"] = int(line.split("TESTS:", 1)[1].strip())
+            except ValueError:
+                pass
+
+    # If stderr has content, surface it
+    if stderr.strip():
+        report.setdefault("warnings", []).append(stderr.strip()[:500])
+
+    return report
 
 
 async def node_complete(state: StudioGraphState) -> dict[str, Any]:
@@ -677,16 +791,88 @@ async def node_complete(state: StudioGraphState) -> dict[str, Any]:
 
     # Build PR URL from available state
     pr_url = ""
-    if commit_sha and target:
-        # gh CLI format: https://github.com/{repo}/pull/{pr_number}
-        # Without PR number, surface the branch for manual PR creation
-        pr_url = f"https://github.com/{target}/compare/{branch}" if branch else ""
+    if target and branch:
+        # Compare view: useful before a PR is created (branch exists but no commit_sha yet)
+        pr_url = f"https://github.com/{target}/compare/{branch}"
+    elif commit_sha and target:
+        # Commit available but no branch name — link to the commit directly
+        pr_url = f"https://github.com/{target}/commit/{commit_sha}"
 
     return {
         "pr_url": state.get("pr_url", pr_url),
         "commit_sha": commit_sha,
         "changed_files": changed,
     }
+
+
+# ── Output parsing ─────────────────────────────────────────────────────────────
+
+
+def _parse_developer_output(
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+) -> tuple[list[str], str, dict[str, Any]]:
+    """Parse developer worker output into structured state fields.
+
+    Extracts changed_files, commit_sha, and test_results from worker stdout.
+    Workers signal results via JSON lines prefixed with ``STUDIO_RESULT:``,
+    or through conventional markers (``CHANGED:``, ``COMMIT:``, ``TEST:``).
+
+    Args:
+        stdout: Captured stdout from the worker process.
+        stderr: Captured stderr.
+        exit_code: Worker exit code.
+
+    Returns:
+        (changed_files, commit_sha, test_results) tuple.
+    """
+    import json as _json
+
+    changed_files: list[str] = []
+    commit_sha = ""
+    test_results: dict[str, Any] = {}
+
+    # Try parsing STUDIO_RESULT JSON lines
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("STUDIO_RESULT:"):
+            try:
+                payload = _json.loads(line.split("STUDIO_RESULT:", 1)[1].strip())
+                if "changed_files" in payload:
+                    changed_files.extend(payload["changed_files"])
+                if "commit_sha" in payload:
+                    commit_sha = payload["commit_sha"]
+                if "test_results" in payload:
+                    test_results = payload["test_results"]
+            except (_json.JSONDecodeError, ValueError):
+                logger.debug(f"[parse] Ignoring unparseable STUDIO_RESULT line")
+
+    # Fallback: conventional markers in stdout
+    if not changed_files:
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("CHANGED:"):
+                fname = line.split("CHANGED:", 1)[1].strip()
+                if fname:
+                    changed_files.append(fname)
+
+    if not commit_sha:
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("COMMIT:"):
+                commit_sha = line.split("COMMIT:", 1)[1].strip()
+                break
+
+    # If worker exited non-zero, surface stderr in test_results
+    if exit_code != 0 and stderr and not test_results:
+        test_results = {
+            "failed": True,
+            "exit_code": exit_code,
+            "stderr_preview": stderr[:500],
+        }
+
+    return changed_files, commit_sha, test_results
 
 
 # ── Conditional routing ────────────────────────────────────────────────────────
@@ -773,6 +959,8 @@ class StudioGraphRunner:
         bundle_input: str,
         bundle_id: str = "bundle-001",
         auto_ship: bool = True,
+        target_repo: str = "",
+        base_branch: str = "main",
     ) -> StudioGraphState:
         """Run the graph to completion with no human-in-the-loop pause.
 
@@ -780,12 +968,16 @@ class StudioGraphRunner:
             bundle_input: The user's intent / task description.
             bundle_id: Unique thread ID for checkpointing.
             auto_ship: If True, the approval gate auto-approves.
+            target_repo: Target repository (e.g., 'learhy/boundary').
+            base_branch: Base branch for worktree creation (default 'main').
         """
         config = self.config_for(bundle_id)
         initial_state: StudioGraphState = {
             "bundle_input": bundle_input,
             "bundle_id": bundle_id,
             "auto_ship": auto_ship,
+            "target_repo": target_repo,
+            "base_branch": base_branch,
         }
         return await self.graph.ainvoke(initial_state, config)
 
