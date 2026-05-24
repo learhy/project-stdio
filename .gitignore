@@ -20,6 +20,10 @@ htmlcov/
 *.db-wal
 *.db-shm
 
+# Test fixtures (cloned repos)
+boundary-repo/
+boundary/
+
 # Settings (contains local secrets)
 settings.json
 .claude/settings.json
