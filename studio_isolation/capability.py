@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import Any
 
-from studio_isolation.models import CapabilityManifest
+from .models import CapabilityManifest
 
 
 # ── Subset checking ──────────────────────────────────────────────────────────

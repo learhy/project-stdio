@@ -12,9 +12,9 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Awaitable
 
-from studio_isolation.artifact import glob_match
-from studio_isolation.capability import check_op, _rpc_method_covered
-from studio_isolation.models import (
+from .artifact import glob_match
+from .capability import check_op, _rpc_method_covered
+from .models import (
     BundleState,
     NodeState,
     WorkerState,
@@ -35,8 +35,8 @@ from studio_isolation.models import (
 )
 
 if TYPE_CHECKING:
-    from typing import Any as Database  # Database handle is injected at runtime, not imported
-    from studio_isolation.artifact import ArtifactStore, SecretStore
+    from .db import Database
+    from .artifact import ArtifactStore, SecretStore
 
 # ── JSON-RPC error codes ──────────────────────────────────────────────────────
 

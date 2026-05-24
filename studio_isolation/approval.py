@@ -11,10 +11,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from studio_isolation.models import ApprovalTier
+from .models import ApprovalTier
 
 if TYPE_CHECKING:
-    from studio_isolation.models import BundleProposal
+    from .models import BundleProposal
 
 logger = logging.getLogger(__name__)
 

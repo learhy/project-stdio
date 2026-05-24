@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 import blake3
 
 if TYPE_CHECKING:
-    from typing import Any as Database  # Database handle is injected at runtime, not imported
+    from .db import Database
 
 logger = logging.getLogger(__name__)
 

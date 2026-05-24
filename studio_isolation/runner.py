@@ -14,14 +14,42 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import asyncssh
-import docker as docker_lib
+from .models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost, K8sRunnerSettings, DockerRunnerSettings, FirecrackerSettings, RunnerSelectorSettings
+from . import tls as tls_helpers
 
-from studio_isolation.models import WorkerState, NodeState, CapabilityManifest, EgressProxySettings, RemoteFleetSettings, FleetHost, K8sRunnerSettings, DockerRunnerSettings, FirecrackerSettings, RunnerSelectorSettings
-from studio_isolation import tls as tls_helpers
+# Heavy optional dependencies — imported lazily so the library is usable
+# without Docker, Kubernetes, or SSH infrastructure installed.
+asyncssh = None
+docker_lib = None
+kubernetes = None
+
+def _ensure_asyncssh():
+    global asyncssh
+    if asyncssh is None:
+        import asyncssh as _a
+        asyncssh = _a
+
+def _ensure_docker():
+    global docker_lib
+    if docker_lib is None:
+        import docker as _d
+        docker_lib = _d
+
+def _ensure_k8s():
+    global kubernetes
+    if kubernetes is None:
+        import kubernetes_asyncio as k8s
+        import kubernetes_asyncio.client as k8s_client
+        import kubernetes_asyncio.config as k8s_config
+        kubernetes = type("_k8s_module", (), {
+            "client": k8s_client,
+            "config": k8s_config,
+            "asyncio": k8s,
+        })()
 
 if TYPE_CHECKING:
-    from typing import Any as Database  # Database handle is injected at runtime, not imported
+    from .db import Database
+    import asyncssh as _asyncssh_type
 
 logger = logging.getLogger(__name__)
 
@@ -269,9 +297,6 @@ class LocalBwrapWorkerRunner:
         self.token_expiry_minutes = token_expiry_minutes
         self.ca_cert_path = ca_cert_path
         self.ca_key_path = ca_key_path
-        # repo_path: directory of the git repo to create worktrees from.
-        # When empty (default), git worktree commands run in the current
-        # working directory.  Set this to a local clone path for reproducibility.
         self.repo_path = repo_path
         self._bwrap_available: bool | None = None  # cached
         # Track proxy processes for cleanup
@@ -553,22 +578,17 @@ class LocalBwrapWorkerRunner:
     async def _create_worktree(self, path: str, branch: str, base_branch: str) -> None:
         """Create a git worktree at path on branch, based off base_branch.
 
-        Uses self.repo_path as the git repository root. When repo_path is
-        empty (default), runs in the current working directory.
-
         After creation, strips any inherited remote and configures local-only
         git identity so workers cannot accidentally push to the host's remotes.
         """
         import os as _os
         _os.makedirs(_os.path.dirname(path) if _os.path.dirname(path) else path, exist_ok=True)
 
-        repo_root = self.repo_path or None  # None → subprocess uses CWD
         proc = await asyncio.create_subprocess_exec(
             "git", "worktree", "add", path, "-b", branch,
             f"origin/{base_branch}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=repo_root,
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
@@ -805,7 +825,7 @@ class RemoteWorkerHandle:
 
     def __init__(
         self,
-        conn: asyncssh.SSHClientConnection,
+        conn: "_asyncssh_type.SSHClientConnection",
         remote_pid: int,
         host: FleetHost,
         workdir: str,
@@ -907,7 +927,7 @@ class RemoteSSHWorkerRunner:
                 return host
         return None
 
-    async def _preflight(self, conn: asyncssh.SSHClientConnection) -> list[str]:
+    async def _preflight(self, conn: "_asyncssh_type.SSHClientConnection") -> list[str]:
         """Verify required binaries exist on the remote host. Returns list of missing items."""
         missing: list[str] = []
         for binary in ["bwrap", "studio-worker", "studio-proxy"]:
@@ -929,6 +949,7 @@ class RemoteSSHWorkerRunner:
         worker_type: str = "developer",
     ) -> WorkerSpawnResult:
         """Spawn a worker on a remote fleet host via SSH + bubblewrap."""
+        _ensure_asyncssh()
         token = _generate_token()
         token_expires_at = self.now() + (self.token_expiry_minutes * 60)
 
@@ -1613,6 +1634,7 @@ class K8sJobWorkerRunner:
         worker_type: str = "developer",
     ) -> WorkerSpawnResult:
         """Spawn a worker as a Kubernetes Job in the configured namespace."""
+        _ensure_k8s()
         token = _generate_token()
         token_expires_at = self.now() + (self.token_expiry_minutes * 60)
         namespace = self.settings.namespace
@@ -2258,6 +2280,7 @@ class DockerWorkerRunner:
 
     async def close(self) -> None:
         """Close the Docker client."""
+        _ensure_docker()
         if self._client:
             await asyncio.to_thread(self._client.close)
             self._client = None
