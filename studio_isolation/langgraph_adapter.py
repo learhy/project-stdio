@@ -73,6 +73,8 @@ class StudioGraphState(TypedDict, total=False):
     # Input
     bundle_input: str
     bundle_id: str
+    target_repo: str
+    base_branch: str
 
     # Bundler output
     proposal: dict[str, Any]

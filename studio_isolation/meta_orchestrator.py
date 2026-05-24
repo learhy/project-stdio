@@ -61,6 +61,8 @@ class DecomposedIntent:
         return {
             "bundle_input": self.bundle_input,
             "bundle_id": self.bundle_id,
+            "target_repo": self.target_repo,
+            "base_branch": self.target_branch or "main",
             "proposal": self.proposal,
             "task_dag": self.task_dag,
             "auto_ship": self.auto_ship,
