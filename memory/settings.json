@@ -1,0 +1,46 @@
+{
+  "llm": {
+    "primary": "deepinfra",
+    "providers": {
+      "deepinfra": {
+        "base_url": "https://api.deepinfra.com/v1",
+        "models": {
+          "research": "deepseek-ai/DeepSeek-V4-Flash",
+          "engineering": "openai/gpt-oss-120b",
+          "orchestrator": "meta-llama/Llama-3.3-70B-Instruct",
+          "qa": "meta-llama/Llama-3.1-8B-Instruct"
+        }
+      },
+      "fireworks": {
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "models": {
+          "reasoning": "accounts/fireworks/models/minimax-m2-7"
+        }
+      },
+      "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "models": {
+          "frontier": "anthropic/claude-sonnet-4"
+        }
+      },
+      "ollama_cloud": {
+        "base_url": "https://ollama.com/v1",
+        "models": {
+          "fallback": "deepseek-v4-pro:cloud"
+        }
+      }
+    }
+  },
+  "egress_proxy": {
+    "enabled": false
+  },
+  "github": {
+    "app_id": "3728222",
+    "installation_id": "132706546",
+    "private_key_path": "/home/dan.rohan/.config/studio/github-app.pem",
+    "webhook_secret": "26bc2694d05f5297fe139eed0271721ff240d82f023594c5751b2ecc934f6fdc",
+    "enabled": true,
+    "owner": "learhy",
+    "repo": "project-stdio"
+  }
+}
